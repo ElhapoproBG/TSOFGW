@@ -16,3 +16,16 @@
 
 ## Niveles de confianza de módulos
 Oficial · Certificado por terceros (auditado) · Sin firma (explícito y visible).
+
+## Estado de implementación (0.1.0)
+Implementado en `tsofgw-pack` y probado:
+- **Manifiesto de módulo** con nombre, versión, permisos y SHA-256 del payload; formato estricto (claves desconocidas, duplicadas o faltantes se rechazan).
+- **Niveles de confianza** (oficial, certificado, sin firma) y política de permisos por nivel; los módulos sin firma solo cargan con una bandera explícita y nunca reciben `accounts`, `system` ni `disk_write`.
+- **Verificación** de hash, firma y revocación. Un firmante desconocido o una firma inválida se rechazan: no se degrada en silencio a "sin firma".
+- **Coherencia de permisos:** un nodo no puede usar permisos que su manifiesto no declaró.
+- **Herramienta** `tsofgw pack` y `tsofgw verify`; las claves se leen de archivo, nunca de la línea de comandos.
+
+Pendiente:
+- **Firmas asimétricas (Ed25519).** Hoy solo hay HMAC con clave compartida, adecuado para pruebas y redes privadas pero no para distribución pública. Se añadirá con una dependencia auditada.
+- **Sandbox en tiempo de ejecución (WebAssembly)** que aplique los permisos declarados.
+- **Builds reproducibles, SBOM y firmas de release con varios firmantes.**

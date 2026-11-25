@@ -2,6 +2,7 @@
 name = "tsofgw-core"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 description = "TSOFGW: grafo de interdependencias con apagado selectivo de nodos"
 

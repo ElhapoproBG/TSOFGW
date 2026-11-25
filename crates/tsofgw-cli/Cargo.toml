@@ -1,0 +1,18 @@
+[package]
+name = "tsofgw-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Herramienta de línea de comandos de TSOFGW"
+
+[[bin]]
+name = "tsofgw"
+path = "src/main.rs"
+
+[dependencies]
+tsofgw-core = { path = "../tsofgw-core" }
+tsofgw-world = { path = "../tsofgw-world" }
+tsofgw-net = { path = "../tsofgw-net" }
+tsofgw-hal = { path = "../tsofgw-hal" }
+tsofgw-pack = { path = "../tsofgw-pack" }

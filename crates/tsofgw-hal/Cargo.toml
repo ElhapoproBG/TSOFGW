@@ -1,0 +1,10 @@
+[package]
+name = "tsofgw-hal"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "TSOFGW: capa de abstracción de hardware (gráficos, XR, entrada) y perfiles de plataforma"
+
+[dependencies]
+tsofgw-core = { path = "../tsofgw-core" }

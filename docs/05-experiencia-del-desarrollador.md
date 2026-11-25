@@ -2,7 +2,7 @@
 
 TSOFGW no exige una aplicación propia para trabajar. Se ofrece por capas, de la más simple a la más ambiciosa, y cada capa es útil sin la siguiente.
 
-## Capa 1: biblioteca (disponible desde H1)
+## Capa 1: biblioteca (disponible)
 El desarrollador crea su proyecto en Rust, añade `tsofgw-core` como dependencia y escribe sus nodos implementando el contrato (`Node`): puertos tipados, permisos, costo y estado.
 
 ```rust
@@ -13,18 +13,27 @@ let render = grafo.add(
     &[Link { from: fisica, output: "pos", input: "pos" }],
 )?;
 grafo.set_demanded(render, true);
-loop { grafo.tick(); }
+loop { grafo.tick(); }  // o grafo.tick_parallel(4)
+
+// Para casos simples, un nodo se define con una función:
+let doble = fn_node(
+    Contract::new("doble", (1, 0)).input("x", DataType::Float).output("y", DataType::Float),
+    |io| io.set_output("y", Value::Float(io.float("x").unwrap_or(0.0) * 2.0)),
+);
 ```
 
 Referencia: el modelo de Bevy, que funciona como biblioteca sin editor.
 
-## Capa 2: herramienta de línea de comandos `tsofgw` (objetivo: H2)
-- `tsofgw new`: crea un proyecto con la estructura estándar.
-- `tsofgw run` y `tsofgw build`: ejecutar y compilar, con perfiles `vr`, `pc` y `consola`.
-- `tsofgw pack` y `tsofgw sign`: empaquetar y firmar módulos.
-- `tsofgw add`: instalar módulos oficiales o certificados, verificando firma y permisos (ver documento 03).
+## Capa 2: herramienta de línea de comandos `tsofgw` (disponible desde 0.1.0)
+- `tsofgw new <nombre>`: crea un proyecto con un grafo de ejemplo que compila y corre.
+- `tsofgw demo [--profile vr|vr-120|pc|consola] [--entities N] [--players N] [--ticks N]`: escenario MMO mínimo medible (grafo + mundo + red + HAL).
+- `tsofgw dot`: el grafo de la demo en formato Graphviz.
+- `tsofgw hash <archivo>`: SHA-256.
+- `tsofgw pack` y `tsofgw verify`: manifiestos de módulo con hash, permisos y firma (ver documento 03).
 
-## Capa 3: inspector del grafo (objetivo: H3)
+Pendiente: `tsofgw run` y `tsofgw build` con perfiles, y `tsofgw add` para instalar módulos desde un registro.
+
+## Capa 3: inspector del grafo (objetivo: H3; la exportación DOT ya existe)
 Vista en vivo del grafo: nodos activos e hibernados, costos, permisos, conexiones y errores de contrato. Es una herramienta necesaria, no un lujo: depurar un grafo grande sin ella es impracticable.
 
 ## Capa 4: editor visual (solo cuando haya demanda)

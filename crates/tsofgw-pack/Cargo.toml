@@ -1,0 +1,10 @@
+[package]
+name = "tsofgw-pack"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "TSOFGW: manifiestos de módulo, SHA-256, firmas y política de confianza"
+
+[dependencies]
+tsofgw-core = { path = "../tsofgw-core" }
