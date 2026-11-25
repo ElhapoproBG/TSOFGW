@@ -459,3 +459,315 @@ fn bots_con_otra_clave_no_entran() {
     assert!(srv.contains("jugadores 0"), "{srv}");
     assert!(!srv.contains("jugadores 3"));
 }
+
+#[test]
+fn loadtest_de_cluster_simulado_y_sobre_udp_real() {
+    let d = temp("cluster-lt");
+    // Red simulada: determinista y rápida.
+    let o = tsofgw(
+        &d,
+        &[
+            "loadtest",
+            "--shards",
+            "2x1",
+            "--clients",
+            "12",
+            "--patrol",
+            "8",
+            "--npcs",
+            "800",
+            "--seconds",
+            "10",
+        ],
+    );
+    let t = text(&o.stdout);
+    assert!(o.status.success(), "{}", text(&o.stderr));
+    assert!(t.contains("Cluster TSOFGW: 2×1 = 2 shards"), "{t}");
+    assert!(t.contains("NPC: 0 perdidos, 0 duplicados de 800"), "{t}");
+    assert!(
+        t.contains("jugadores: 0 perdidos, 0 duplicados de 12"),
+        "{t}"
+    );
+    assert!(
+        t.contains("entidades que faltaban: 0 | entidades inexistentes: 0"),
+        "{t}"
+    );
+    assert!(
+        !t.contains("traspasos de jugador: 0 iniciados"),
+        "debe haber cruzado el borde:\n{t}"
+    );
+
+    // Sockets UDP reales de este equipo, con el bus entre shards autenticado.
+    let o = tsofgw(
+        &d,
+        &[
+            "loadtest",
+            "--shards",
+            "2x1",
+            "--udp",
+            "--clients",
+            "12",
+            "--patrol",
+            "8",
+            "--npcs",
+            "800",
+            "--seconds",
+            "12",
+        ],
+    );
+    let t = text(&o.stdout);
+    assert!(o.status.success(), "{}{}", t, text(&o.stderr));
+    assert!(t.contains("UDP real"), "{t}");
+    assert!(t.contains("datagramas rechazados: 0"), "{t}");
+    assert!(t.contains("NPC: 0 perdidos, 0 duplicados de 800"), "{t}");
+    assert!(
+        t.contains("jugadores: 0 perdidos, 0 duplicados de 12"),
+        "{t}"
+    );
+    assert!(
+        t.contains("entidades que faltaban: 0 | entidades inexistentes: 0"),
+        "{t}"
+    );
+    assert!(
+        !t.contains("traspasos de jugador: 0 iniciados"),
+        "debe haber cruzado el borde:\n{t}"
+    );
+}
+
+#[test]
+fn opciones_de_cluster_incoherentes_se_rechazan() {
+    let d = temp("cluster-err");
+    assert!(tsofgw(&d, &["keygen", "-o", "m.key"]).status.success());
+    assert!(tsofgw(&d, &["keygen", "-o", "c.key"]).status.success());
+    let fails = |args: &[&str], needle: &str| {
+        let o = tsofgw(&d, args);
+        assert!(!o.status.success(), "{args:?} debía fallar");
+        let e = text(&o.stderr);
+        assert!(e.contains(needle), "{args:?}: {e}");
+    };
+    // Opciones de cluster sin --shard.
+    fails(
+        &["serve", "--master-file", "m.key", "--grid", "2x2"],
+        "solo tiene sentido con --shard",
+    );
+    // Faltan datos del cluster.
+    fails(
+        &["serve", "--master-file", "m.key", "--shard", "0"],
+        "falta --grid",
+    );
+    fails(
+        &[
+            "serve",
+            "--master-file",
+            "m.key",
+            "--shard",
+            "0",
+            "--grid",
+            "2x1",
+        ],
+        "falta --peers",
+    );
+    fails(
+        &[
+            "serve",
+            "--master-file",
+            "m.key",
+            "--shard",
+            "0",
+            "--grid",
+            "2x1",
+            "--peers",
+            "127.0.0.1:7001,127.0.0.1:7002",
+        ],
+        "falta --cluster-key-file",
+    );
+    // Direcciones que no cuadran con la rejilla, shard inexistente, rejilla imposible.
+    let base = [
+        "serve",
+        "--master-file",
+        "m.key",
+        "--cluster-key-file",
+        "c.key",
+        "--bind",
+        "127.0.0.1:0",
+    ];
+    let with = |extra: &[&'static str]| -> Vec<&'static str> {
+        let mut v: Vec<&str> = base.to_vec();
+        v.extend_from_slice(extra);
+        v
+    };
+    fails(
+        &with(&[
+            "--shard",
+            "0",
+            "--grid",
+            "2x2",
+            "--peers",
+            "127.0.0.1:7001,127.0.0.1:7002",
+        ]),
+        "debe tener 4 direcciones",
+    );
+    fails(
+        &with(&[
+            "--shard",
+            "5",
+            "--grid",
+            "2x1",
+            "--peers",
+            "127.0.0.1:7001,127.0.0.1:7002",
+        ]),
+        "la rejilla 2x1 tiene 2 shards",
+    );
+    fails(
+        &with(&["--shard", "0", "--grid", "0x2", "--peers", "127.0.0.1:7001"]),
+        "entre 1 y 256",
+    );
+    fails(
+        &with(&["--shard", "0", "--grid", "dos", "--peers", "127.0.0.1:7001"]),
+        "COLUMNASxFILAS",
+    );
+    // Una clave de cluster demasiado corta.
+    std::fs::write(d.join("short.key"), "corta\n").unwrap();
+    fails(
+        &[
+            "serve",
+            "--master-file",
+            "m.key",
+            "--cluster-key-file",
+            "short.key",
+            "--shard",
+            "0",
+            "--grid",
+            "1x1",
+            "--peers",
+            "127.0.0.1:7001",
+        ],
+        "al menos 16 bytes",
+    );
+    // loadtest.
+    fails(&["loadtest", "--shards", "0x3"], "entre 1 y 256");
+    fails(&["loadtest", "--shards", "x"], "COLUMNASxFILAS");
+    fails(
+        &["loadtest", "--shards", "2x2", "--bus-loss", "2"],
+        "--bus-loss",
+    );
+}
+
+#[test]
+fn un_cluster_de_procesos_reales_traspasa_jugadores_entre_shards() {
+    let d = temp("cluster-proc");
+    assert!(tsofgw(&d, &["keygen", "-o", "m.key"]).status.success());
+    assert!(tsofgw(&d, &["keygen", "-o", "c.key"]).status.success());
+    // Cuatro puertos libres: clientes y bus de cada uno de los dos shards.
+    let ports: Vec<u16> = {
+        let socks: Vec<_> = (0..4)
+            .map(|_| std::net::UdpSocket::bind("127.0.0.1:0").unwrap())
+            .collect();
+        socks
+            .iter()
+            .map(|s| s.local_addr().unwrap().port())
+            .collect()
+    };
+    let (c0, c1, b0, b1) = (ports[0], ports[1], ports[2], ports[3]);
+    let peers = format!("127.0.0.1:{b0},127.0.0.1:{b1}");
+    let spawn = |shard: u16, bind: u16| {
+        Command::new(env!("CARGO_BIN_EXE_tsofgw"))
+            .current_dir(&d)
+            .args([
+                "serve",
+                "--master-file",
+                "m.key",
+                "--cluster-key-file",
+                "c.key",
+                "--shard",
+                &shard.to_string(),
+                "--grid",
+                "2x1",
+                "--peers",
+                &peers,
+                "--bind",
+                &format!("127.0.0.1:{bind}"),
+                "--npcs",
+                "1000",
+                "--spawn-half",
+                "40",
+                "--duration",
+                "17",
+            ])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap()
+    };
+    let s0 = spawn(0, c0);
+    // El segundo shard arranca un poco más tarde: sus ticks no coinciden con los del primero.
+    std::thread::sleep(std::time::Duration::from_millis(700));
+    let s1 = spawn(1, c1);
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let shards = format!("127.0.0.1:{c0},127.0.0.1:{c1}");
+    let bots = tsofgw(
+        &d,
+        &[
+            "bots",
+            "--master-file",
+            "m.key",
+            "--connect",
+            &format!("127.0.0.1:{c0}"),
+            "--shards",
+            &shards,
+            "--count",
+            "10",
+            "--patrol",
+            "8",
+            "--patrol-ms",
+            "4000",
+            "--duration",
+            "11",
+        ],
+    );
+    let bots_out = text(&bots.stdout);
+    assert!(bots.status.success(), "{}", text(&bots.stderr));
+    let (o0, o1) = (
+        s0.wait_with_output().unwrap(),
+        s1.wait_with_output().unwrap(),
+    );
+    let (t0, t1) = (text(&o0.stdout), text(&o1.stdout));
+    assert!(
+        o0.status.success() && o1.status.success(),
+        "{}{}",
+        text(&o0.stderr),
+        text(&o1.stderr)
+    );
+    assert!(
+        t0.contains("shard 0 de 2") && t1.contains("shard 1 de 2"),
+        "{t0}\n{t1}"
+    );
+    // Los bots cruzaron de un shard a otro sin un solo fallo.
+    assert!(bots_out.contains("jugando 10/10"), "{bots_out}");
+    assert!(bots_out.contains("(0 fallidos)"), "{bots_out}");
+    assert!(!bots_out.contains("cambios de shard 0 "), "{bots_out}");
+    // Los dos shards intercambiaron jugadores y el bus no rechazó nada legítimo.
+    let last = |t: &str| -> String {
+        t.lines()
+            .rev()
+            .find(|l| l.contains("cluster:"))
+            .expect(t)
+            .to_string()
+    };
+    let (l0, l1) = (last(&t0), last(&t1));
+    for l in [&l0, &l1] {
+        assert!(l.contains("bus: rechazados 0, mal formados 0"), "{l}");
+        assert!(
+            !l.contains("(cancelados 1") && !l.contains("(cancelados 2"),
+            "{l}"
+        );
+    }
+    assert!(
+        !l0.contains("traspasos de jugador 0/0"),
+        "el shard 0 no entregó a nadie:\n{t0}"
+    );
+    assert!(
+        !l1.contains("llegadas 0)"),
+        "el shard 1 no recibió a nadie:\n{t1}"
+    );
+}

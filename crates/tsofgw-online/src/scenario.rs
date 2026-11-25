@@ -22,6 +22,9 @@ pub struct Scenario {
     pub game: GameConfig,
     pub step_ms: u64,
     pub master: Vec<u8>,
+    /// Calcula una huella de todos los paquetes que cruzan la red simulada (para comprobar que dos
+    /// ejecuciones, por ejemplo con distinto número de hilos, producen exactamente lo mismo).
+    pub digest: bool,
 }
 
 impl Default for Scenario {
@@ -40,6 +43,7 @@ impl Default for Scenario {
             game: GameConfig::default(),
             step_ms: 10,
             master: b"loadtest-master-key".to_vec(),
+            digest: false,
         }
     }
 }
@@ -88,6 +92,14 @@ pub struct Report {
 
     pub net_sent: u64,
     pub net_dropped: u64,
+    /// Huella (FNV-1a) de todos los paquetes enviados, si se pidió `digest`.
+    pub net_digest: u64,
+    /// Hilos que usó el servidor para replicar.
+    pub threads: usize,
+    /// Huella de lo que ve cada cliente al final (entidades y posiciones, sin los números de tick).
+    pub final_view_digest: u64,
+    /// Con `digest`, lo que veía cada cliente al final: `(entidad, posición, tipo)`, ordenado por id.
+    pub final_views: Vec<Vec<(u64, [i32; 3], u16)>>,
     pub server_transport: tsofgw_transport::TransportStats,
     pub game: crate::GameStats,
 }
@@ -99,10 +111,7 @@ fn traffic(server: &GameServer<SimLink>, bots: &[Bot<SimLink>]) -> Traffic {
     let ts = server.transport_stats();
     let up = bots
         .iter()
-        .map(|b| {
-            let t = b.client.transport_stats();
-            (t.bytes_out, t.packets_out)
-        })
+        .map(|b| b.client.traffic_out())
         .fold((0, 0), |a, b| (a.0 + b.0, a.1 + b.1));
     (ts.bytes_out, ts.packets_out, up.0, up.1)
 }
@@ -136,6 +145,10 @@ pub fn run(s: &Scenario) -> Report {
     let measure_from = (s.duration_ms / 3).min(5000);
     let moving_until = s.duration_ms;
     let total = s.duration_ms + s.settle_ms;
+    let mut digest = 0xcbf2_9ce4_8422_2325u64;
+    if s.digest {
+        net.start_log();
+    }
     let mut window_start: Option<(u64, Traffic)> = None;
     let mut window_end: Option<(u64, Traffic)> = None;
     let mut now = 0u64;
@@ -162,6 +175,20 @@ pub fn run(s: &Scenario) -> Report {
         if window_start.is_none() && now >= measure_from {
             window_start = Some((now, traffic(&server, &bots)));
         }
+        if s.digest {
+            for (from, to, data) in net.take_log() {
+                for b in from
+                    .0
+                    .to_le_bytes()
+                    .iter()
+                    .chain(&to.0.to_le_bytes())
+                    .chain(&data)
+                {
+                    digest = (digest ^ *b as u64).wrapping_mul(0x0000_0100_0000_01b3);
+                }
+                digest = (digest ^ data.len() as u64).wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        }
     }
 
     let g = server.stats().clone();
@@ -180,6 +207,8 @@ pub fn run(s: &Scenario) -> Report {
         snapshots_delta: g.snapshots_delta,
         net_sent: net.stats().sent,
         net_dropped: net.stats().dropped,
+        net_digest: digest,
+        threads: crate::par::resolve_threads(s.game.threads),
         server_transport: ts.clone(),
         game: g.clone(),
         ..Default::default()
@@ -213,6 +242,29 @@ pub fn run(s: &Scenario) -> Report {
             r.up_kbps_with_headers = kbps(b.2 - a.2, b.3 - a.3, true);
         }
     }
+
+    let mut vd = 0xcbf2_9ce4_8422_2325u64;
+    let mut mix = |v: u64| vd = (vd ^ v).wrapping_mul(0x0000_0100_0000_01b3);
+    for b in &bots {
+        mix(u64::MAX);
+        let mut view = Vec::new();
+        if let Some(cl) = b.client.latest_snapshot() {
+            for (id, e) in &cl.entities {
+                if s.digest {
+                    view.push((*id, e.pos, e.data));
+                }
+                mix(*id);
+                for c in e.pos {
+                    mix(c as u32 as u64);
+                }
+                mix(e.data as u64);
+            }
+        }
+        if s.digest {
+            r.final_views.push(view);
+        }
+    }
+    r.final_view_digest = vd;
 
     let mut rtts = Vec::new();
     let (mut corr_n, mut corr_sum, mut corr_max) = (0u64, 0u64, 0u32);
@@ -287,17 +339,19 @@ impl Report {
 Clientes: {playing}/{clients} jugando | NPC: {npcs} | entidades en el mundo: {entities}
 Tiempo simulado: {sim:.1} s (CPU real: {wall:.1} s)
 
-Servidor (simulación + snapshots, un solo hilo)
+Servidor (simulación + snapshots, {threads} hilo(s))
   ticks: {ticks}, media {avg:.0} µs, máximo {max} µs, presupuesto {budget} µs ({used:.1} % usado de media)
   NPC simulados de media: {sim_avg:.0} de {npcs} ({sim_pct:.1} %) → el resto está apagado por no haber jugadores cerca
 
 Reparto del tiempo de tick (media por tick)
-  inputs {pi:.0} µs | NPC {pn:.0} µs | interés {pint:.0} µs | construir snapshots {pb:.0} µs | codificar {pe:.0} µs | enviar (MAC + red) {ps:.0} µs
+  inputs {pi:.0} µs | NPC {pn:.0} µs | replicación {pr:.0} µs de pared | enviar (MAC + red) {ps:.0} µs
+  la replicación suma {pcpu:.0} µs de CPU entre los hilos: interés {pint:.0} + construir snapshots {pb:.0} + codificar {pe:.0}
 
 Interés y snapshots
   entidades visibles por jugador: {vis:.0} de media
   snapshots: {full} completos + {delta} delta ({dshare:.1} % delta)
   tamaño medio de mensaje: completo {fb:.0} B, delta {db:.0} B (el delta ocupa {ratio:.1}× menos)
+  mayor snapshot: {pmax} B | LOD: {held:.1} entidades sujetas por snapshot de media | presupuesto: {trimmed} snapshots recortados
 
 Red (tramo estable, por cliente; carga UDP / con cabeceras IP+UDP)
   bajada: {down:.1} kbps / {downh:.1} kbps
@@ -323,6 +377,15 @@ Defensas del servidor
             wall = self.wall_seconds,
             pi = per_tick(self.game.phase_inputs_us),
             pn = per_tick(self.game.phase_npc_us),
+            threads = self.threads,
+            pr = per_tick(self.game.phase_repl_wall_us),
+            pcpu = per_tick(
+                self.game.phase_interest_us + self.game.phase_build_us + self.game.phase_encode_us
+            ),
+            pmax = self.game.snapshot_payload_max,
+            held = self.game.lod_held as f64
+                / (self.snapshots_full + self.snapshots_delta).max(1) as f64,
+            trimmed = self.game.budget_trimmed,
             pint = per_tick(self.game.phase_interest_us),
             pb = per_tick(self.game.phase_build_us),
             pe = per_tick(self.game.phase_encode_us),

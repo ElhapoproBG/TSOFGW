@@ -6,6 +6,7 @@
 //! INPUT     (C→S) 3 | primera_seq(4) | n(1) | n × dirección(3×i8)
 //! SNAP_FULL (S→C) 4 | último_input(4) | snapshot completo
 //! SNAP_DELTA(S→C) 5 | último_input(4) | snapshot delta contra una línea base confirmada
+//! REDIRECT  (S→C) 6 | shard(2)       «sigue jugando en ese shard» (cluster: traspaso de jugador)
 //! ```
 
 use tsofgw_net::Header;
@@ -20,6 +21,7 @@ pub const WELCOME: u8 = 2;
 pub const INPUT: u8 = 3;
 pub const SNAP_FULL: u8 = 4;
 pub const SNAP_DELTA: u8 = 5;
+pub const REDIRECT: u8 = 6;
 
 pub fn frame(header: Header, kind: u8, body: &[u8]) -> Vec<u8> {
     let mut v = Vec::with_capacity(Header::SIZE + 1 + body.len());
@@ -105,6 +107,14 @@ pub fn parse_input(b: &[u8]) -> Option<(u32, Vec<Input>)> {
     Some((first, inputs))
 }
 
+pub fn redirect_body(shard: u16) -> Vec<u8> {
+    shard.to_le_bytes().to_vec()
+}
+
+pub fn parse_redirect(b: &[u8]) -> Option<u16> {
+    (b.len() == 2).then(|| u16::from_le_bytes([b[0], b[1]]))
+}
+
 pub fn snapshot_body(last_input: u32, encoded: &[u8]) -> Vec<u8> {
     let mut v = Vec::with_capacity(4 + encoded.len());
     v.extend_from_slice(&last_input.to_le_bytes());
@@ -158,6 +168,9 @@ mod tests {
             Some((4, &b"xy"[..]))
         );
         assert_eq!(parse_join(&join_body()), Some(PROTOCOL_VERSION));
+        assert_eq!(parse_redirect(&redirect_body(513)), Some(513));
+        assert_eq!(parse_redirect(&[1]), None);
+        assert_eq!(parse_redirect(&[1, 2, 3]), None);
     }
 
     #[test]

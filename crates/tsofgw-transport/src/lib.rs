@@ -32,7 +32,7 @@ mod server;
 pub mod wire;
 
 pub use client::{ClientConfig, ClientEvent, SecureClient};
-pub use crypto::{Authority, Credentials};
+pub use crypto::{Authority, Credentials, ReplayWindow};
 pub use entropy::{DeterministicEntropy, Entropy, OsEntropy};
 pub use link::{Link, PeerAddr, SimAddr, SimConfig, SimLink, SimNet, SimStats, UdpLink};
 pub use server::{SecureServer, ServerConfig, ServerEvent};

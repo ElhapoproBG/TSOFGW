@@ -10,3 +10,4 @@ description = "TSOFGW: protocolo de juego en línea, servidor autoritativo con i
 tsofgw-net = { path = "../tsofgw-net" }
 tsofgw-world = { path = "../tsofgw-world" }
 tsofgw-transport = { path = "../tsofgw-transport" }
+tsofgw-pack = { path = "../tsofgw-pack" }

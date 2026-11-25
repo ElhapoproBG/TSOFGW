@@ -1,5 +1,29 @@
 # Cambios
 
+## 0.4.0 — Escala
+**Servidor (`tsofgw-online`)**
+- **Replicación en paralelo** (`--threads N`, 0 = núcleos disponibles): interés, snapshot y codificación por jugador en varios hilos, recogidos en orden. El resultado es idéntico: la huella de todos los paquetes coincide con 1, 2, 3 y 8 hilos, también con LOD y presupuesto. Con 2 núcleos, 500 jugadores densos pasan de 22,7 ms a 14,8 ms por tick.
+- **Niveles de detalle por distancia** (`--lod`): lo lejano se refresca a 10 y 5 Hz sujetando el último valor *enviado*; el propio jugador siempre va al día. −27 % de ancho de banda con 500 jugadores densos.
+- **Presupuesto de ancho de banda por snapshot** (`--budget B`): lo que no cabe se retrasa (lo más lejano primero), nunca se pierde; el tamaño de lo recortado se calcula sin codificar.
+- **Vecindad compartida** (`--share-min N`): en multitudes (`--spawn-half`) los jugadores de una misma celda comparten una sola consulta de interés; mismos bytes, −18 % de tiempo de tick con 300 jugadores en 60×60 u.
+- `tsofgw-net`: `varint_len` y `zigzag_len`. `tsofgw-transport`: `ReplayWindow` pública.
+
+**Clúster de shards (nuevo; documento 09)**
+- El mundo se reparte en una rejilla de regiones, una por shard (`Partition`). **Entidades fantasma** de solo lectura en los bordes, **traspaso de NPC** (estado completo, reenvío hasta acuse, sin adopciones dobles) y **traspaso de jugadores** dirigido por el cliente, con una única transferencia de autoridad, histéresis, cancelación y recuperación.
+- **Bus entre shards** (`PeerBus`): `SimBus` determinista para pruebas y `UdpBus` real, con HMAC-SHA256/128, anti-replay, frescura de reloj (±30 s), resumen de configuración (shards con otro mundo se rechazan) y sin respuestas (no amplifica). Todo mensaje cabe en un datagrama.
+- Cliente: cambio de shard con un `Connector`; tolera la numeración de ticks distinta de cada shard.
+- CLI: `serve --shard I --grid CxF --peers … --cluster-key-file K`, `bots --shards … --patrol`, `loadtest --shards CxF [--udp] [--patrol …]`. `loadtest --shards` falla si el reparto final no es exacto (sirve de prueba de humo en la CI), y la ayuda documenta las opciones nuevas.
+- Con 400 jugadores y 40 000 NPC, un clúster 2×2 usa 8,7 ms de media por tick en el shard más cargado frente a 28,2 ms de un servidor único (la suma casi no cambia).
+
+**Pruebas:** 226 → ver la cifra final en la verificación; nuevas: reparto sin pérdida, con pérdida, con un bus muy malo, bus caído, mensajes hostiles, un shard ≡ servidor suelto, determinismo, ticks distintos entre shards, resumen de configuración, 3×2 con 60 clientes y 6 000 NPC; bus UDP (formato, anti-replay, reinicio, reloj, flood); clúster sobre UDP real (reparto, intruso, clave distinta); procesos reales por CLI; equivalencia entre hilos, de la vecindad compartida y del recorte con la versión lenta.
+
+**Correcciones**
+- **Cliente congelado al cambiar a un shard con la cuenta de ticks atrasada** (descartaba todos sus snapshots). Lo encontró una prueba endurecida a propósito.
+- Dos optimizaciones del propio 0.4.0 empezaron costando CPU y se corrigieron tras medirlas: el LOD (recorrido en paralelo de dos listas ordenadas en lugar de una búsqueda por entidad) y el presupuesto (tamaños exactos sin recodificar).
+- La ayuda de `tsofgw` ahora documenta `serve --shard` y `bots --shards`.
+
+**Límites conocidos:** sin cifrado (jugadores ni bus), sin persistencia (un shard reiniciado pierde su estado), reparto estático, sin directorio de sesiones entre shards, la clave de clúster es un punto único de confianza, el clúster solo se probó en una máquina (bucle local), todo medido en un sandbox de 2 núcleos; la aleatoriedad en Windows (FFI a `BCryptGenRandom`) no se pudo compilar aquí.
+
 ## 0.3.0
 **Red en línea**
 - `tsofgw-transport` (nuevo): UDP autenticado con handshake HELLO/CHALLENGE/AUTH/ACCEPT y cookie atada a la dirección, MAC por paquete (HMAC-SHA256/128) con clave por sentido, ventana anti-replay de 128, fragmentación hasta ~18 KB, sesiones con timeout y mantenimiento, límites por sesión; `UdpLink` y una red simulada determinista (`SimNet`: latencia, jitter, pérdida, duplicados). Sin cifrado todavía (ver documento 08).

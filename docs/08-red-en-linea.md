@@ -1,6 +1,6 @@
 # Red en línea: transporte, servidor autoritativo y pruebas de carga
 
-Esta capa (versión 0.3.0) convierte los bloques del documento 06 en algo que se puede ejecutar de extremo a extremo: un servidor, clientes y bots hablando por UDP real, o por una red simulada con pérdida y latencia para pruebas reproducibles.
+Esta capa (introducida en 0.3.0 y ampliada en 0.4.0) convierte los bloques del documento 06 en algo que se puede ejecutar de extremo a extremo: un servidor, clientes y bots hablando por UDP real, o por una red simulada con pérdida y latencia para pruebas reproducibles. La versión 0.4.0 añade el reparto del trabajo entre hilos, los niveles de detalle, el presupuesto de ancho de banda y el clúster de shards (documento 09).
 
 ```
  GameClient / Bot ─┐                                       ┌─ GameServer
@@ -41,53 +41,111 @@ Esta capa (versión 0.3.0) convierte los bloques del documento 06 en algo que se
 - **Interés:** cada jugador recibe lo que está dentro de su radio (con histéresis), con un tope de 256 entidades (las más cercanas).
 - **Snapshots delta:** contra la última línea base que el propio jugador confirmó; si se perdió o es muy vieja, el servidor se repliega solo a un snapshot completo. Las confirmaciones viajan en la cabecera seq/ack de cada mensaje y solo se confirma lo que se decodificó con éxito.
 
+### Escala dentro de un servidor (0.4.0)
+
+El tick tiene dos partes: simular (inputs y NPC) y **replicar** (por cada jugador: interés → snapshot → codificación). Lo segundo es lo que crece con los jugadores y es independiente entre jugadores, así que se reparte:
+
+- **Replicación en paralelo (`--threads N`).** 1 = un solo hilo (por defecto en `loadtest`), 0 = los núcleos disponibles (tope 16; es lo que usa `serve`). Cada hilo toma jugadores distintos y los resultados se recogen **en el orden de los jugadores**; el envío (firma + red) sigue en un solo hilo. **No cambia el resultado**: una prueba compara la huella de *todos* los paquetes que cruzan la red con 1, 2, 3 y 8 hilos, y es idéntica (también con LOD y presupuesto activos).
+- **Vecindad compartida (`--share-min N`, 8 por defecto).** Si en una celda hay al menos N jugadores (una multitud), su vecindad se reúne una sola vez y se comparte en lugar de consultarse por jugador. Tampoco cambia ni un byte (hay una prueba con 0, 2 y 4 hilos). Para probar multitudes: `--spawn-half 30` hace que todos aparezcan en un área de ±30 u.
+- **Niveles de detalle por distancia (`--lod`).** Lo cercano (hasta el 50 % del radio de interés) se actualiza en cada tick (20 Hz), hasta el 80 % cada 2 ticks (10 Hz) y el resto cada 4 (5 Hz). Lo que se sujeta es **el último valor que se *envió* a ese cliente**, no el de la línea base, así que el cliente reconstruye exactamente lo que el servidor registró; lo que el cliente aún no tiene se envía siempre y **el propio jugador siempre va al día**. Con el mundo quieto, el estado final es idéntico al de no usar LOD.
+- **Presupuesto de ancho de banda (`--budget B`).** Máximo de bytes por snapshot codificado (64–60 000; 0 = sin límite). Lo que no cabe se **retrasa, lo más lejano primero** (el propio jugador va siempre primero), nunca se descarta: llega en snapshots siguientes. El tamaño de cada candidato se calcula sin codificarlo (`varint_len`/`zigzag_len`), con una única codificación al final; una prueba aleatoria (400 rondas × 11 presupuestos) comprueba que el resultado es idéntico al de la versión lenta que codifica cada candidato.
+
 ## 3. Cliente (`GameClient`)
 - **Predicción:** aplica sus inputs al instante y, al llegar el estado del servidor, reaplica los pendientes. Cada input se reenvía en los 4 mensajes siguientes para tolerar pérdidas sin retransmisión.
 - **Interpolación:** `view(now)` dibuja a los demás entre los dos snapshots que rodean `now` menos 2 ticks, y a mi jugador con la posición predicha.
+- **Cambio de shard (0.4.0):** en un clúster, el servidor puede redirigir al cliente a otro shard (documento 09). El cliente abre una segunda conexión con su propia clave de cuenta mediante un `Connector` y, cuando el nuevo shard lo recibe, cambia sin perder predicción ni vista. Como cada shard cuenta sus ticks desde que arrancó, al cambiar se descarta el historial de snapshots para no tratar como «viejo» lo que simplemente tiene otra numeración.
 
 ## 4. Herramientas
 
 ```
-tsofgw keygen -o master.key                      # clave maestra aleatoria (no sobrescribe; 0600 en Unix)
+tsofgw keygen -o master.key                      # clave aleatoria (no sobrescribe; 0600 en Unix)
 tsofgw token --master-file master.key --player 7 # clave de la cuenta 7
-tsofgw serve --master-file master.key --bind 0.0.0.0:7777 --npcs 20000
+tsofgw serve --master-file master.key --bind 0.0.0.0:7777 --npcs 20000 [--threads N] [--lod] [--budget B]
 tsofgw bots  --master-file master.key --connect 127.0.0.1:7777 --count 50 --duration 60
 tsofgw loadtest --clients 200 --npcs 20000 --seconds 20 [--loss 0.05 --latency 40 --jitter 10] [--udp]
+                [--threads N] [--lod] [--budget B] [--spawn-half H] [--share-min N]
+tsofgw loadtest --shards 2x2 --clients 200 --patrol 100 [--udp] [--bus-loss P --bus-latency MS --bus-jitter MS]
 ```
-`loadtest` ejecuta servidor y bots en un proceso. Sin `--udp` usa la red simulada, así que el resultado (todo salvo los tiempos de CPU) es reproducible; con `--udp` usa sockets reales de este equipo. Al final deja a los bots quietos y sin pérdida y comprueba que la posición predicha coincide con la del servidor y que la vista del cliente reconstruida desde deltas es idéntica a lo que el servidor envió.
+`loadtest` ejecuta servidor y bots en un proceso. Sin `--udp` usa la red simulada, así que el resultado (todo salvo los tiempos de CPU) es reproducible; con `--udp` usa sockets reales de este equipo. Al final deja a los bots quietos y sin pérdida y comprueba que la posición predicha coincide con la del servidor y que la vista del cliente reconstruida desde deltas es idéntica a lo que el servidor envió. Con `--shards CxF` reparte el mundo entre C×F shards y comprueba además que no se perdió ni se duplicó ningún NPC ni jugador. `serve --shard` y `bots --shards` ponen en marcha un clúster de procesos reales (documento 09).
 
 ## 5. Mediciones
 
-Entorno: sandbox de 2 núcleos, **servidor de un solo hilo**, compilación `--release`, 20 000 NPC, 2 % de pérdida, 30 ± 10 ms de latencia por sentido, todos los bots caminando, jugadores repartidos en 300 × 300 unidades.
+Entorno: sandbox de **2 núcleos** (con ruido de ±15–30 % de una ejecución a otra: compara solo cifras tomadas una tras otra), compilación `--release`, 20 000 NPC, 2 % de pérdida, 30 ± 10 ms de latencia por sentido, todos los bots caminando, jugadores repartidos en 300 × 300 unidades. Cada cifra es la mediana de 3 ejecuciones de 20 s. Presupuesto de tick: 50 ms (20 Hz).
+
+### Un servidor, un hilo
 
 | Jugadores | Tick medio | Tick máximo | Bajada por cliente* | Subida por cliente* | Convergencia final |
 |---:|---:|---:|---:|---:|---|
-| 50 | 3,0 ms | 4,4 ms | 83 kbps | 14 kbps | 50/50 exactas |
-| 100 | 4,9 ms | 9,5 ms | 88 kbps | 14 kbps | 100/100 exactas |
-| 200 | 10,4 ms | 17,5 ms | 92 kbps | 14 kbps | 200/200 exactas |
-| 300 | 18,2 ms | 34,7 ms | 95 kbps | 14 kbps | 300/300 exactas |
-| 500 | 34,3 ms | 66,4 ms | 97 kbps | 14 kbps | 500/500 exactas |
+| 50 | 2,5 ms | 8,7 ms | 87 kbps | 14 kbps | 50/50 exactas |
+| 100 | 4,7 ms | 8,5 ms | 91 kbps | 14 kbps | 100/100 exactas |
+| 200 | 8,6 ms | 15,1 ms | 94 kbps | 14 kbps | 200/200 exactas |
+| 300 | 13,5 ms | 22,4 ms | 97 kbps | 14 kbps | 300/300 exactas |
+| 500 | 22,7 ms | 37,9 ms | 99 kbps | 14 kbps | 500/500 exactas |
 
-\* Con cabeceras IPv4+UDP (28 B por paquete). Presupuesto de tick: 50 ms (20 Hz).
+\* Con cabeceras IPv4+UDP (28 B por paquete).
 
-Cómo leerlo:
-- Con un solo hilo el servidor cabe en su presupuesto hasta unos 600–700 jugadores de esta densidad **en esta máquina**; con 500 el tick máximo ya lo supera. Es el motivo de repartir el trabajo entre hilos y shards, que es el siguiente paso.
-- El coste crece casi linealmente con los jugadores (~60–70 µs por jugador y tick). La firma de paquetes y el envío cuestan ~1 ms de cada tick (2–3 %): la seguridad no es el cuello de botella.
-- El tope de 256 entidades visibles está activo en este escenario (hay más de 256 a la vista), por eso la bajada casi no varía.
-- Con ~257 entidades visibles moviéndose a 20 Hz, un snapshot delta pesa ~450–510 B y uno completo ~1,7–1,9 KB (el delta ocupa 3,5–3,8 veces menos). Es el peor caso: todo lo que se ve se mueve. Un siguiente paso evidente es enviar menos a menudo las entidades lejanas.
+- Con un solo hilo el servidor cabe en su presupuesto con 500 jugadores densos, incluso en el peor tick medido. Con la 0.3.0 medida a la misma hora, 500 jugadores costaban 44–47 ms de media.
+- El coste crece casi linealmente: ~45 µs por jugador y tick. La firma de paquetes y el envío son ~2 ms de cada tick (≈ 10 %): la seguridad no es el cuello de botella; lo es el interés (~46 % de la CPU).
+- El tope de 256 entidades visibles está activo en este escenario, por eso la bajada casi no varía con los jugadores.
 - El RTT que se informa es el tiempo hasta recibir la confirmación dentro de un snapshot, por lo que incluye la espera al siguiente tick (hasta 50 ms); no es una medida pura de red.
-- Los inputs "repetidos" que informa el servidor son en su mayoría las copias redundantes que el cliente envía a propósito.
 
-**Cómo se optimizó y qué se aprendió.** La primera versión gastaba 47 ms por tick con 200 jugadores. El perfil por fases (`loadtest` lo imprime) mostró dónde estaba el tiempo: interés 38 %, construcción de snapshots 33 %, codificación 18 %. Se pasó a 10–14 ms con: hash rápido en los mapas del mundo, listas ordenadas en lugar de conjuntos en el interés, estado cuantizado de los NPC calculado una vez al moverse, construcción de snapshots por lotes y codificación delta en una sola pasada. Cada cambio tiene una prueba que lo compara con la versión simple (consultas contra fuerza bruta, interés contra una referencia con conjuntos durante 300 ticks, `encode_delta` byte a byte).
+### Hilos
 
-## 6. Defectos encontrados al construirlo
+| Jugadores | 1 hilo (medio / máx) | 2 hilos (medio / máx) | Aceleración del tick |
+|---:|---|---|---:|
+| 200 | 8,6 / 15,1 ms | 6,0 / 12,4 ms | 1,4× |
+| 500 | 22,7 / 37,9 ms | 14,8 / 26,9 ms | 1,5× |
+
+Con 2 hilos la replicación pasa de 18,6 ms a 10,7 ms de pared en el caso de 500 jugadores. Lo que sigue en un solo hilo (NPC, envío con firma, inputs) explica por qué no es 2×. **Solo hay 2 núcleos aquí**: el comportamiento con más núcleos no está medido.
+
+### Niveles de detalle y presupuesto (500 jugadores, 1 hilo, medidos uno tras otro)
+
+| Configuración | Tick medio | Bajada* | Qué ocurre |
+|---|---:|---:|---|
+| sin LOD ni presupuesto | 25–27 ms | 98,5 kbps | referencia (dos mediciones) |
+| `--lod` | 28,2 ms | **72,2 kbps (−27 %)** | 73,6 entidades sujetas por snapshot en promedio |
+| `--budget 1200` | 24,7 ms | 99,3 kbps | casi nunca recorta (2 205 snapshots en 20 s) |
+| `--budget 800` | 33,4 ms | 94,3 kbps | recorta 75 236 snapshots: es trabajo real de elegir qué retrasar |
+
+Con 2 hilos y `--lod`, el tick medio con 500 jugadores es 14,7 ms (14,8 ms sin LOD): el LOD ahorra un 27 % de ancho de banda sin costo medible de CPU. Un presupuesto muy ajustado cuesta CPU (elegir qué retrasar); uno holgado no se nota.
+
+### Multitudes
+
+300 jugadores aparecen en un área de ±30 u (`--spawn-half 30`), 1 hilo: con la vecindad compartida desactivada (`--share-min 0`) el tick medio es **16,0–16,3 ms** (interés 8,5 ms); con ella (`--share-min 8`, el valor por defecto) es **13,3 ms** (interés 5,1 ms). Los bytes de la red son idénticos (137,6 kbps de bajada en ambos).
+
+### Un clúster frente a un servidor
+
+400 jugadores y 40 000 NPC, todos aparecen a ±40 u del punto donde se juntan las cuatro regiones y la mitad patrulla cruzando bordes: el **peor caso para el tráfico de fantasmas**. Simulado en un proceso; los tiempos son los de cada shard.
+
+| | Un servidor | Clúster 2×2 (4 shards) |
+|---|---:|---:|
+| Tick medio del shard más cargado | 28,2 ms (máx 40,5) | **8,7 ms** (máx 19,1) |
+| Presupuesto de 50 ms usado | 56 % | 17 % |
+| Suma de los ticks de todos los shards | 28,2 ms | 29,2 ms |
+| Jugadores por shard | 400 | 82 · 111 · 87 · 120 |
+| Bus entre shards | — | 1,1 MB/s en total, 28 190 mensajes en 24 s |
+| Traspasos de jugador | — | 428 de 428 completados, 0 cancelados, 0 cambios fallidos |
+| Reparto final | — | 0 NPC y 0 jugadores perdidos o duplicados; 0 entidades que faltaran o sobraran en las vistas |
+
+El trabajo total se conserva (la suma casi no cambia: el costo de los fantasmas es de ~3,5 %), y en máquinas separadas el límite lo marca el shard más cargado: aquí **3,2 veces menos por máquina con 4 shards**. El desequilibrio entre shards (82 frente a 120 jugadores) es el del reparto estático en rejilla (documento 09).
+
+## 6. Cómo se optimizó y qué se aprendió
+
+**0.3.0.** La primera versión gastaba 47 ms por tick con 200 jugadores. El perfil por fases (`loadtest` lo imprime) mostró dónde estaba el tiempo: interés 38 %, construcción de snapshots 33 %, codificación 18 %. Se pasó a 10–14 ms con: hash rápido en los mapas del mundo, listas ordenadas en lugar de conjuntos en el interés, estado cuantizado de los NPC calculado una vez al moverse, construcción de snapshots por lotes y codificación delta en una sola pasada. Cada cambio tiene una prueba que lo compara con la versión simple (consultas contra fuerza bruta, interés contra una referencia con conjuntos durante 300 ticks, `encode_delta` byte a byte).
+
+**0.4.0.** Dos funciones nuevas empezaron costando más CPU de la que ahorraban en red, y el perfil por fases lo mostró antes de darlas por buenas:
+- **LOD:** la fase de construcción de snapshots pasó de 4,8 a 11,9 ms por tick porque buscaba el valor anterior de cada entidad con una búsqueda binaria. Como las dos listas están ordenadas por id, se recorren a la vez (una pasada): 11,9 → ~7 ms. Queda ~3 ms por encima de no usar LOD, que se compensan en parte con menos codificación y envío; el tick total solo sube 1–3 ms (en el ruido de la medición) y con 2 hilos no se distingue.
+- **Presupuesto:** para saber cuántos cambios caben, cada intento reconstruía y codificaba el snapshot (búsqueda binaria sobre el tamaño). Ahora el tamaño exacto de cada candidato se calcula sin codificar (`varint_len`/`zigzag_len`) y solo se codifica una vez; la fase de codificación bajó de 16,6 a 11–12 ms con el presupuesto más ajustado. Una prueba aleatoria de 400 rondas × 11 presupuestos comprueba que el resultado es idéntico al de la versión lenta.
+
+## 7. Defectos encontrados al construirlo
 - **Movimiento:** al normalizar y escalar en dos pasos, una diagonal podía avanzar un 0,2 % más que un eje. La prueba exhaustiva lo detectó; ahora se calcula en un solo paso redondeando el denominador hacia arriba.
 - **Memoria en `Endpoint`:** los paquetes perdidos nunca se olvidaban, así que con pérdida sostenida el conjunto de paquetes en vuelo crecía hasta ~65 000 entradas por conexión. Ahora se descartan los de más de 64 puestos atrás.
+- **Cliente congelado tras cambiar de shard (0.4.0):** al pasar a un shard con la cuenta de ticks atrasada, el cliente descartaba todos sus snapshots como «viejos». Lo encontró una prueba endurecida a propósito (documento 09, sección 8).
 
-## 7. Pendiente
-- **Cifrado AEAD** de los datos y credenciales asimétricas (Ed25519) emitidas por la autoridad.
-- **Multihilo del tick** (interés, construcción y codificación de snapshots por jugador son independientes) y **entidades fantasma** entre shards.
-- **Menor frecuencia para entidades lejanas** y límite de ancho de banda por cliente.
+## 8. Pendiente
+- **Cifrado AEAD** de los datos y del bus entre shards, y credenciales asimétricas (Ed25519) emitidas por la autoridad.
+- **Simulación de NPC en paralelo** (hoy solo la replicación usa varios hilos) y medir el escalado con más de 2 núcleos.
 - **Migración de dirección** del cliente y control de congestión.
+- **Persistencia** y recuperación de shards (documento 09).
 - Probar en Windows y macOS (la entropía de Windows usa FFI a `BCryptGenRandom` y no se ha podido compilar aquí).
-- Medir en hardware real y con latencias de internet reales; todo lo anterior es simulación y loopback.
+- Medir en hardware real y con latencias de internet reales; todo lo anterior es simulación y bucle local.

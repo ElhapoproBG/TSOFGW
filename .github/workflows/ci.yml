@@ -28,6 +28,13 @@ jobs:
         run: cargo test --all
       - name: Prueba de carga (humo)
         run: cargo run --release -p tsofgw-cli -- loadtest --clients 30 --npcs 2000 --seconds 6
+      - name: Prueba de carga con hilos, LOD y presupuesto (humo)
+        run: cargo run --release -p tsofgw-cli -- loadtest --clients 40 --npcs 2000 --seconds 6 --threads 2 --lod --budget 1200
+      - name: Clúster de shards simulado (humo; falla si algo se pierde o se duplica)
+        run: cargo run --release -p tsofgw-cli -- loadtest --shards 2x1 --clients 20 --npcs 2000 --seconds 10 --patrol 10
+      - name: Clúster de shards sobre UDP real (humo)
+        if: runner.os == 'Linux'
+        run: cargo run --release -p tsofgw-cli -- loadtest --shards 2x1 --clients 20 --npcs 2000 --seconds 12 --patrol 10 --udp
 
   sin-c:
     name: pruebas con respaldo en Rust (sin compilador de C)

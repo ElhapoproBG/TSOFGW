@@ -467,3 +467,191 @@ fn dos_jugadores_se_ven_y_dejan_de_verse() {
         b.predicted_position().unwrap()[0]
     );
 }
+
+// ---------------------------------------------------------------- varios hilos, LOD y presupuesto
+
+fn busy_scenario(game: GameConfig, seed: u64) -> Scenario {
+    Scenario {
+        clients: 60,
+        duration_ms: 6000,
+        settle_ms: 2500,
+        net: SimConfig {
+            latency_ms: 30,
+            jitter_ms: 15,
+            loss: 0.05,
+            duplicate: 0.03,
+            seed,
+        },
+        game: GameConfig {
+            npc_count: 4000,
+            spawn_half_extent: 60.0, // todos cerca: mucho interés y mucho que repartir
+            ..game
+        },
+        digest: true,
+        ..Scenario::default()
+    }
+}
+
+#[test]
+fn el_resultado_no_depende_del_numero_de_hilos() {
+    // La prueba más estricta posible: la huella de TODOS los paquetes que cruzan la red debe ser la misma.
+    let base = run(&busy_scenario(GameConfig::default(), 3));
+    assert_ne!(
+        base.net_digest, 0xcbf2_9ce4_8422_2325,
+        "se registró tráfico"
+    );
+    assert!(base.snapshots_delta > 1000);
+    for threads in [2usize, 3, 8] {
+        let r = run(&busy_scenario(
+            GameConfig {
+                threads,
+                ..GameConfig::default()
+            },
+            3,
+        ));
+        assert_eq!(r.threads, threads);
+        assert_eq!(
+            r.net_digest, base.net_digest,
+            "con {threads} hilos salen otros paquetes"
+        );
+        assert_eq!(r.final_view_digest, base.final_view_digest);
+        assert_eq!(r.game.bytes_delta, base.game.bytes_delta);
+        assert_eq!(r.game.bytes_full, base.game.bytes_full);
+        assert_eq!(r.game.snapshots_full, base.game.snapshots_full);
+        assert_eq!(r.final_exact, base.final_exact);
+    }
+}
+
+#[test]
+fn con_lod_y_presupuesto_tambien_es_independiente_de_los_hilos() {
+    let game = |threads| GameConfig {
+        threads,
+        lod: default_lod(),
+        snapshot_budget: 400,
+        ..GameConfig::default()
+    };
+    let a = run(&busy_scenario(game(1), 5));
+    let b = run(&busy_scenario(game(4), 5));
+    assert!(a.game.lod_held > 0, "el LOD debe estar actuando");
+    assert!(
+        a.game.budget_trimmed > 0,
+        "el presupuesto debe estar actuando"
+    );
+    assert_eq!(a.net_digest, b.net_digest);
+    assert_eq!(a.final_view_digest, b.final_view_digest);
+    assert_eq!(a.game.lod_held, b.game.lod_held);
+    assert_eq!(a.game.budget_trimmed, b.game.budget_trimmed);
+}
+
+#[test]
+fn el_lod_ahorra_ancho_de_banda_y_todo_converge() {
+    let off = run(&busy_scenario(GameConfig::default(), 11));
+    let on = run(&busy_scenario(
+        GameConfig {
+            lod: default_lod(),
+            ..GameConfig::default()
+        },
+        11,
+    ));
+    assert_eq!(on.playing, 60);
+    assert!(on.game.lod_held > 0);
+    assert_eq!(off.game.lod_held, 0);
+    assert!(
+        on.avg_delta_bytes < off.avg_delta_bytes * 0.90,
+        "el LOD debía ahorrar al menos un 10 %: {:.0} B frente a {:.0} B",
+        on.avg_delta_bytes,
+        off.avg_delta_bytes
+    );
+    // El LOD retrasa lo lejano, pero lo que se registra es lo que el cliente reconstruye: coincide.
+    assert_eq!(on.view_matches, on.view_compared);
+    assert!(on.view_compared >= 55);
+    // Y la posición de mi propio jugador no depende del LOD (siempre va al día).
+    assert_eq!(on.final_exact, 60);
+}
+
+#[test]
+fn el_presupuesto_limita_cada_snapshot() {
+    let r = run(&busy_scenario(
+        GameConfig {
+            snapshot_budget: 350,
+            ..GameConfig::default()
+        },
+        13,
+    ));
+    assert_eq!(r.playing, 60);
+    assert!(r.game.budget_trimmed > 0, "debía haber recortes");
+    assert!(
+        r.game.snapshot_payload_max <= 350,
+        "snapshot de {} B con presupuesto 350",
+        r.game.snapshot_payload_max
+    );
+    // Recortar no desincroniza: el cliente reconstruye exactamente lo que el servidor registró…
+    assert_eq!(r.view_matches, r.view_compared);
+    // …y su propio jugador (siempre el primero en prioridad) sigue exacto.
+    assert_eq!(r.final_exact, 60);
+}
+
+#[test]
+fn con_presupuesto_o_lod_el_mundo_quieto_acaba_igual_que_sin_ellos() {
+    // Con el mundo quieto y los bots detenidos, lo retrasado acaba llegando: la vista final es la misma.
+    let still = |game: GameConfig| {
+        let mut s = busy_scenario(
+            GameConfig {
+                npc_speed: 0.0,
+                ..game
+            },
+            17,
+        );
+        // Sin azar en la red: el presupuesto cambia cuántos paquetes se fragmentan y, con pérdida,
+        // el generador aleatorio compartido daría trayectorias distintas a los bots entre una ejecución
+        // y otra. Aquí se quiere comparar el mismo mundo, no el mismo azar.
+        s.net = SimConfig {
+            latency_ms: 30,
+            jitter_ms: 0,
+            loss: 0.0,
+            duplicate: 0.0,
+            seed: 17,
+        };
+        s.settle_ms = 4000;
+        run(&s)
+    };
+    let plain = still(GameConfig::default());
+    let budget = still(GameConfig {
+        snapshot_budget: 250,
+        ..GameConfig::default()
+    });
+    let lod = still(GameConfig {
+        lod: default_lod(),
+        ..GameConfig::default()
+    });
+    let both = still(GameConfig {
+        lod: default_lod(),
+        snapshot_budget: 250,
+        ..GameConfig::default()
+    });
+    assert!(budget.game.budget_trimmed > 0);
+    assert_eq!(budget.final_view_digest, plain.final_view_digest);
+    assert_eq!(lod.final_view_digest, plain.final_view_digest);
+    assert_eq!(both.final_view_digest, plain.final_view_digest);
+}
+
+#[test]
+fn compartir_la_vecindad_no_cambia_ni_un_byte() {
+    let with = |share, threads| {
+        run(&busy_scenario(
+            GameConfig {
+                interest_share_min: share,
+                threads,
+                ..GameConfig::default()
+            },
+            23,
+        ))
+    };
+    let off = with(0, 1);
+    let on = with(2, 1);
+    let on_threads = with(2, 4);
+    assert_eq!(off.net_digest, on.net_digest);
+    assert_eq!(off.net_digest, on_threads.net_digest);
+    assert_eq!(off.final_view_digest, on.final_view_digest);
+    assert!(on.game.snapshots_delta > 1000);
+}

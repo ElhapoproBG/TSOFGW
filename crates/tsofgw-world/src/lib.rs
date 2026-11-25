@@ -93,10 +93,23 @@ pub struct CellMove {
     pub to: Cell,
 }
 
+/// Ficha de una entidad: dónde está y en qué hueco de la lista de su celda.
+#[derive(Clone, Copy)]
+struct Rec {
+    pos: Vec3,
+    cell: Cell,
+    slot: u32,
+}
+
+/// El mundo: una rejilla de celdas. Cada celda guarda sus entidades **con su posición**, de modo que una
+/// consulta por radio recorre memoria contigua en lugar de hacer una búsqueda hash por candidato.
 pub struct World {
     cell_size: f32,
-    cells: FastMap<Cell, Vec<EntityId>>,
-    entities: FastMap<EntityId, (Vec3, Cell)>,
+    cells: FastMap<Cell, Vec<(EntityId, Vec3)>>,
+    entities: FastMap<EntityId, Rec>,
+    /// Cota (solo crece) de las capas verticales que alguna vez tuvieron entidades. En un mundo casi plano
+    /// recorta las consultas a una capa en lugar de decenas; nunca excluye una celda ocupada.
+    y_layers: (i32, i32),
 }
 
 impl World {
@@ -106,11 +119,22 @@ impl World {
             cell_size,
             cells: FastMap::default(),
             entities: FastMap::default(),
+            y_layers: (i32::MAX, i32::MIN),
         }
     }
 
     pub fn cell_size(&self) -> f32 {
         self.cell_size
+    }
+
+    /// Recorta un rango de capas verticales a las que alguna vez tuvieron entidades (vacío: `(0, -1)`).
+    fn clamp_y(&self, lo: i32, hi: i32) -> (i32, i32) {
+        let (lo, hi) = (lo.max(self.y_layers.0), hi.min(self.y_layers.1));
+        if lo > hi {
+            (0, -1)
+        } else {
+            (lo, hi)
+        }
     }
 
     pub fn cell_of(&self, p: Vec3) -> Cell {
@@ -129,13 +153,41 @@ impl World {
         self.entities.is_empty()
     }
     pub fn position(&self, id: EntityId) -> Option<Vec3> {
-        self.entities.get(&id).map(|e| e.0)
+        self.entities.get(&id).map(|e| e.pos)
     }
     pub fn cell_count(&self) -> usize {
         self.cells.len()
     }
-    pub fn entities_in(&self, cell: Cell) -> &[EntityId] {
-        self.cells.get(&cell).map_or(&[], |v| v.as_slice())
+    /// Entidades de una celda (sin orden concreto).
+    pub fn entities_in(&self, cell: Cell) -> impl Iterator<Item = EntityId> + '_ {
+        self.cells
+            .get(&cell)
+            .into_iter()
+            .flat_map(|v| v.iter().map(|e| e.0))
+    }
+
+    /// Añade `(id, pos)` a la lista de `cell` y devuelve el hueco que ocupa.
+    fn push_to_cell(&mut self, cell: Cell, id: EntityId, pos: Vec3) -> u32 {
+        self.y_layers = (self.y_layers.0.min(cell.y), self.y_layers.1.max(cell.y));
+        let v = self.cells.entry(cell).or_default();
+        v.push((id, pos));
+        (v.len() - 1) as u32
+    }
+
+    /// Quita el hueco `slot` de la lista de `cell`; la última entidad ocupa su sitio y se actualiza su ficha.
+    fn remove_from_cell(&mut self, cell: Cell, slot: u32) {
+        let Some(v) = self.cells.get_mut(&cell) else {
+            return;
+        };
+        v.swap_remove(slot as usize);
+        if let Some(&(moved, _)) = v.get(slot as usize) {
+            if let Some(r) = self.entities.get_mut(&moved) {
+                r.slot = slot;
+            }
+        }
+        if v.is_empty() {
+            self.cells.remove(&cell); // las celdas vacías no ocupan memoria
+        }
     }
 
     /// Crea una entidad. Devuelve `false` si el id ya existe.
@@ -144,26 +196,15 @@ impl World {
             return false;
         }
         let cell = self.cell_of(pos);
-        self.entities.insert(id, (pos, cell));
-        self.cells.entry(cell).or_default().push(id);
+        let slot = self.push_to_cell(cell, id, pos);
+        self.entities.insert(id, Rec { pos, cell, slot });
         true
-    }
-
-    fn remove_from_cell(&mut self, id: EntityId, cell: Cell) {
-        if let Some(v) = self.cells.get_mut(&cell) {
-            if let Some(i) = v.iter().position(|&e| e == id) {
-                v.swap_remove(i);
-            }
-            if v.is_empty() {
-                self.cells.remove(&cell); // las celdas vacías no ocupan memoria
-            }
-        }
     }
 
     pub fn despawn(&mut self, id: EntityId) -> bool {
         match self.entities.remove(&id) {
-            Some((_, cell)) => {
-                self.remove_from_cell(id, cell);
+            Some(r) => {
+                self.remove_from_cell(r.cell, r.slot);
                 true
             }
             None => false,
@@ -173,15 +214,21 @@ impl World {
     /// Mueve una entidad. Devuelve `Some` solo si cambió de celda.
     pub fn move_to(&mut self, id: EntityId, pos: Vec3) -> Option<CellMove> {
         let new_cell = self.cell_of(pos);
-        let (p, cell) = self.entities.get_mut(&id)?;
-        *p = pos;
-        if *cell == new_cell {
+        let r = self.entities.get_mut(&id)?;
+        r.pos = pos;
+        if r.cell == new_cell {
+            let (cell, slot) = (r.cell, r.slot);
+            if let Some(v) = self.cells.get_mut(&cell) {
+                v[slot as usize].1 = pos;
+            }
             return None;
         }
-        let from = *cell;
-        *cell = new_cell;
-        self.remove_from_cell(id, from);
-        self.cells.entry(new_cell).or_default().push(id);
+        let (from, old_slot) = (r.cell, r.slot);
+        self.remove_from_cell(from, old_slot);
+        let slot = self.push_to_cell(new_cell, id, pos);
+        let r = self.entities.get_mut(&id)?;
+        r.cell = new_cell;
+        r.slot = slot;
         Some(CellMove {
             id,
             from,
@@ -201,13 +248,14 @@ impl World {
     /// (evita repetir la búsqueda de posiciones). Ordenado por id.
     pub fn query_radius_d2(&self, center: Vec3, r: f32) -> Vec<(EntityId, f32)> {
         let r2 = r * r;
-        let lo = self.cell_of(Vec3::new(center.x - r, center.y - r, center.z - r));
-        let hi = self.cell_of(Vec3::new(center.x + r, center.y + r, center.z + r));
+        let mut lo = self.cell_of(Vec3::new(center.x - r, center.y - r, center.z - r));
+        let mut hi = self.cell_of(Vec3::new(center.x + r, center.y + r, center.z + r));
+        (lo.y, hi.y) = self.clamp_y(lo.y, hi.y);
         let span = (hi.x - lo.x + 1) as i64 * (hi.y - lo.y + 1) as i64 * (hi.z - lo.z + 1) as i64;
         let mut out = Vec::new();
-        let mut visit = |ids: &[EntityId]| {
-            for &id in ids {
-                let d2 = self.entities[&id].0.dist2(center);
+        let mut visit = |items: &[(EntityId, Vec3)]| {
+            for &(id, p) in items {
+                let d2 = p.dist2(center);
                 if d2 <= r2 {
                     out.push((id, d2));
                 }
@@ -237,8 +285,9 @@ impl World {
     pub fn active_cells(&self, spheres: &[(Vec3, f32)]) -> CellSet {
         let mut set = CellSet::default();
         for &(c, r) in spheres {
-            let lo = self.cell_of(Vec3::new(c.x - r, c.y - r, c.z - r));
-            let hi = self.cell_of(Vec3::new(c.x + r, c.y + r, c.z + r));
+            let mut lo = self.cell_of(Vec3::new(c.x - r, c.y - r, c.z - r));
+            let mut hi = self.cell_of(Vec3::new(c.x + r, c.y + r, c.z + r));
+            (lo.y, hi.y) = self.clamp_y(lo.y, hi.y);
             let span =
                 (hi.x - lo.x + 1) as i64 * (hi.y - lo.y + 1) as i64 * (hi.z - lo.z + 1) as i64;
             if span > self.cells.len() as i64 {
@@ -268,12 +317,96 @@ impl World {
 
     /// Entidades que están en las celdas dadas (las únicas que hace falta simular), ordenadas.
     pub fn entities_in_cells(&self, cells: &CellSet) -> Vec<EntityId> {
-        let mut v: Vec<EntityId> = cells
-            .iter()
-            .flat_map(|c| self.entities_in(*c).iter().copied())
-            .collect();
+        let mut v: Vec<EntityId> = cells.iter().flat_map(|c| self.entities_in(*c)).collect();
         v.sort_unstable();
         v
+    }
+}
+
+/// Las entidades que rodean una celda, reunidas **una sola vez** para todos los observadores que están en
+/// ella (en una multitud, decenas de jugadores comparten casi la misma vecindad).
+///
+/// Cada observador solo tiene que filtrar por distancia una lista contigua que ya está ordenada por id,
+/// así que se ahorran las consultas a la rejilla y la ordenación por observador. El resultado es
+/// exactamente el de [`Interest::step`].
+pub struct Neighborhood {
+    cell: Cell,
+    cell_size: f32,
+    reach: f32,
+    /// `(id, posición)` ordenado por id.
+    items: Vec<(EntityId, Vec3)>,
+}
+
+impl World {
+    /// Reúne las entidades que pueden estar a menos de `reach` de cualquier punto de `cell`
+    /// (con un margen de una celda extra, para que el redondeo de coma flotante no importe).
+    pub fn neighborhood(&self, cell: Cell, reach: f32) -> Neighborhood {
+        let k = (reach / self.cell_size).ceil() as i32 + 1;
+        let mut items: Vec<(EntityId, Vec3)> = Vec::new();
+        for x in cell.x - k..=cell.x + k {
+            let (y0, y1) = self.clamp_y(cell.y - k, cell.y + k);
+            for y in y0..=y1 {
+                for z in cell.z - k..=cell.z + k {
+                    if let Some(v) = self.cells.get(&Cell { x, y, z }) {
+                        items.extend_from_slice(v);
+                    }
+                }
+            }
+        }
+        items.sort_unstable_by_key(|e| e.0);
+        Neighborhood {
+            cell,
+            cell_size: self.cell_size,
+            reach,
+            items,
+        }
+    }
+}
+
+impl Neighborhood {
+    pub fn cell(&self) -> Cell {
+        self.cell
+    }
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    /// Lo mismo que [`Interest::step`], a partir de la vecindad ya reunida. Devuelve `None` si esta
+    /// vecindad no sirve para ese observador (no está en la celda, o su radio con histéresis supera
+    /// el alcance reunido); entonces hay que usar `Interest::step`.
+    pub fn visible(
+        &self,
+        hysteresis: f32,
+        observer: EntityId,
+        pos: Vec3,
+        radius: f32,
+        prev: &[EntityId],
+    ) -> Option<Vec<EntityId>> {
+        let rq = radius * hysteresis;
+        let f = |v: f32| (v / self.cell_size).floor() as i32;
+        let here = Cell {
+            x: f(pos.x),
+            y: f(pos.y),
+            z: f(pos.z),
+        };
+        if rq > self.reach || here != self.cell {
+            return None;
+        }
+        let (r2, rq2) = (radius * radius, rq * rq);
+        let mut out = Vec::with_capacity(prev.len() + 16);
+        for &(id, p) in &self.items {
+            if id == observer {
+                continue;
+            }
+            let d2 = p.dist2(pos);
+            if d2 <= r2 || (d2 <= rq2 && prev.binary_search(&id).is_ok()) {
+                out.push(id);
+            }
+        }
+        Some(out)
     }
 }
 
@@ -312,6 +445,29 @@ impl Interest {
         self.seen.get(&observer).map_or(&[], |v| v.as_slice())
     }
 
+    /// Núcleo puro de una actualización: lo que `observer` (en `pos`) ve ahora, dado lo que veía antes.
+    ///
+    /// No toca ningún estado compartido: solo lee `world`. Por eso puede ejecutarse a la vez para muchos
+    /// observadores en hilos distintos y el resultado es el mismo que en un solo hilo. `prev` y la
+    /// salida están ordenados por id.
+    pub fn step(
+        world: &World,
+        hysteresis: f32,
+        observer: EntityId,
+        pos: Vec3,
+        radius: f32,
+        prev: &[EntityId],
+    ) -> Vec<EntityId> {
+        let r2 = radius * radius;
+        // Los candidatos salen ordenados por id, así que el resultado también lo está.
+        world
+            .query_radius_d2(pos, radius * hysteresis)
+            .into_iter()
+            .filter(|&(id, d2)| id != observer && (d2 <= r2 || prev.binary_search(&id).is_ok()))
+            .map(|(id, _)| id)
+            .collect()
+    }
+
     /// Recalcula la visibilidad de cada `(observador, radio)` y devuelve los cambios.
     /// Los observadores que ya no están en la lista (o en el mundo) se olvidan.
     pub fn update(
@@ -328,14 +484,7 @@ impl Interest {
                 continue;
             };
             let prev = self.seen.remove(&obs).unwrap_or_default();
-            let r2 = radius * radius;
-            // Los candidatos salen ordenados por id, así que `now` también lo está.
-            let now: Vec<EntityId> = world
-                .query_radius_d2(pos, radius * self.hysteresis)
-                .into_iter()
-                .filter(|&(id, d2)| id != obs && (d2 <= r2 || prev.binary_search(&id).is_ok()))
-                .map(|(id, _)| id)
-                .collect();
+            let now = Interest::step(world, self.hysteresis, obs, pos, radius, &prev);
             let (enter, leave) = diff_sorted(&prev, &now);
             self.seen.insert(obs, now);
             deltas.insert(obs, InterestDelta { enter, leave });
@@ -438,6 +587,14 @@ impl Rng {
     pub fn new(seed: u64) -> Self {
         Rng(seed.max(1))
     }
+    /// Estado interno (nunca es 0): permite llevar un generador a otro servidor y que siga igual.
+    pub fn state(&self) -> u64 {
+        self.0
+    }
+    /// Reconstruye un generador a partir de [`Rng::state`].
+    pub fn from_state(state: u64) -> Self {
+        Rng(state.max(1))
+    }
     pub fn next_u64(&mut self) -> u64 {
         let mut x = self.0;
         x ^= x >> 12;
@@ -507,7 +664,7 @@ mod tests {
         assert_eq!(w.move_to(1, Vec3::new(5.0, 0.0, 0.0)), None);
         let mv = w.move_to(1, Vec3::new(15.0, 0.0, 0.0)).unwrap();
         assert_eq!((mv.from.x, mv.to.x), (0, 1));
-        assert_eq!(w.entities_in(Cell { x: 0, y: 0, z: 0 }), &[] as &[EntityId]);
+        assert_eq!(w.entities_in(Cell { x: 0, y: 0, z: 0 }).count(), 0);
         assert_eq!(w.move_to(99, Vec3::default()), None);
     }
 
@@ -763,6 +920,199 @@ mod tests {
                 assert!(d.leave.iter().all(|l| !want.contains(l)));
             }
         }
+    }
+
+    impl World {
+        /// Comprueba que cada ficha apunta a su hueco y que no sobra ni falta nada en las celdas.
+        fn check_invariants(&self) {
+            let mut in_cells = 0usize;
+            for (cell, v) in &self.cells {
+                assert!(!v.is_empty(), "celda vacía sin liberar");
+                for (slot, &(id, pos)) in v.iter().enumerate() {
+                    let r = self
+                        .entities
+                        .get(&id)
+                        .expect("entidad en celda pero sin ficha");
+                    assert_eq!(r.cell, *cell, "celda de {id}");
+                    assert_eq!(r.slot as usize, slot, "hueco de {id}");
+                    assert_eq!(r.pos, pos, "posición duplicada de {id}");
+                    assert_eq!(self.cell_of(pos), *cell, "{id} fuera de su celda");
+                }
+                in_cells += v.len();
+            }
+            assert_eq!(in_cells, self.entities.len());
+        }
+    }
+
+    #[test]
+    fn la_rejilla_mantiene_sus_invariantes_bajo_miles_de_operaciones() {
+        let mut rng = Rng::new(77);
+        let mut w = World::new(8.0);
+        let mut alive: Vec<u64> = Vec::new();
+        let mut next = 0u64;
+        for step in 0..20_000 {
+            match rng.next_u64() % 10 {
+                0..=2 => {
+                    // Muchas entidades en pocas celdas, para que los huecos se reordenen a menudo.
+                    let p = Vec3::new(rng.range(-20.0, 20.0), 0.0, rng.range(-20.0, 20.0));
+                    assert!(w.spawn(next, p));
+                    alive.push(next);
+                    next += 1;
+                }
+                3 if !alive.is_empty() => {
+                    let i = (rng.next_u64() as usize) % alive.len();
+                    assert!(w.despawn(alive.swap_remove(i)));
+                }
+                _ if !alive.is_empty() => {
+                    let id = alive[(rng.next_u64() as usize) % alive.len()];
+                    let p = Vec3::new(rng.range(-22.0, 22.0), 0.0, rng.range(-22.0, 22.0));
+                    w.move_to(id, p);
+                    assert_eq!(w.position(id), Some(p));
+                }
+                _ => {}
+            }
+            if step % 500 == 0 {
+                w.check_invariants();
+                // Y las consultas siguen coincidiendo con la fuerza bruta.
+                let c = Vec3::new(rng.range(-20.0, 20.0), 0.0, rng.range(-20.0, 20.0));
+                let r = rng.range(1.0, 25.0);
+                let mut brute: Vec<u64> = alive
+                    .iter()
+                    .copied()
+                    .filter(|&id| w.position(id).unwrap().dist2(c) <= r * r)
+                    .collect();
+                brute.sort_unstable();
+                assert_eq!(w.query_radius(c, r), brute, "paso {step}");
+            }
+        }
+        w.check_invariants();
+        assert_eq!(w.len(), alive.len());
+        assert!(!w.despawn(u64::MAX));
+    }
+
+    #[test]
+    fn la_vecindad_compartida_da_exactamente_lo_mismo_que_la_consulta_directa() {
+        let mut rng = Rng::new(31);
+        let mut w = World::new(16.0);
+        for id in 0..1500u64 {
+            // Algunas entidades pegadas a los bordes de celda y a distintas alturas.
+            let (mut x, mut z) = (rng.range(-120.0, 120.0), rng.range(-120.0, 120.0));
+            let y = rng.range(-20.0, 20.0);
+            if rng.next_u64().is_multiple_of(5) {
+                x = (x / 16.0).round() * 16.0;
+            }
+            if rng.next_u64().is_multiple_of(5) {
+                z = (z / 16.0).round() * 16.0;
+            }
+            w.spawn(id, Vec3::new(x, y, z));
+        }
+        let hysteresis = 1.25f32;
+        let mut checked = 0;
+        let mut prev_sets: HashMap<u64, Vec<u64>> = HashMap::new();
+        for round in 0..4 {
+            for obs in 0..60u64 {
+                let pos = w.position(obs).unwrap();
+                let cell = w.cell_of(pos);
+                let radius = 18.0 + (obs % 5) as f32 * 4.0;
+                let hood = w.neighborhood(cell, radius * hysteresis);
+                let prev = prev_sets.get(&obs).cloned().unwrap_or_default();
+                let direct = Interest::step(&w, hysteresis, obs, pos, radius, &prev);
+                let shared = hood
+                    .visible(hysteresis, obs, pos, radius, &prev)
+                    .expect("la vecindad debe servir");
+                assert_eq!(shared, direct, "ronda {round} observador {obs}");
+                prev_sets.insert(obs, direct);
+                checked += 1;
+            }
+            // Las entidades se mueven y cambian de celda entre rondas.
+            for id in 0..1500u64 {
+                let p = w.position(id).unwrap();
+                w.move_to(
+                    id,
+                    Vec3::new(p.x + rng.range(-9.0, 9.0), p.y, p.z + rng.range(-9.0, 9.0)),
+                );
+            }
+        }
+        assert_eq!(checked, 240);
+        // No sirve (y lo dice) si el observador está en otra celda o si pide más alcance del reunido.
+        let pos = w.position(3).unwrap();
+        let hood = w.neighborhood(w.cell_of(pos), 20.0);
+        assert!(hood.visible(1.25, 3, pos, 20.0, &[]).is_none(), "25 > 20");
+        let far = Vec3::new(pos.x + 100.0, pos.y, pos.z);
+        assert!(
+            hood.visible(1.25, 3, far, 10.0, &[]).is_none(),
+            "otra celda"
+        );
+        assert!(hood.visible(1.25, 3, pos, 10.0, &[]).is_some());
+        assert!(!hood.is_empty() && hood.len() > 1);
+    }
+
+    #[test]
+    fn el_generador_se_puede_trasladar_con_su_estado() {
+        let mut a = Rng::new(77);
+        for _ in 0..10 {
+            a.next_u64();
+        }
+        let mut b = Rng::from_state(a.state());
+        for _ in 0..100 {
+            assert_eq!(a.next_u64(), b.next_u64());
+        }
+        assert_ne!(Rng::from_state(0).state(), 0, "el estado 0 se evita");
+    }
+
+    #[test]
+    fn el_recorte_vertical_nunca_excluye_entidades() {
+        // Mundo vacío: ninguna consulta debe fallar ni desbordar.
+        let mut w = World::new(16.0);
+        assert!(w.query_radius(Vec3::new(0.0, 0.0, 0.0), 50.0).is_empty());
+        assert!(w
+            .active_cells(&[(Vec3::new(0.0, 0.0, 0.0), 50.0)])
+            .is_empty());
+        assert!(w.neighborhood(Cell { x: 0, y: 0, z: 0 }, 30.0).is_empty());
+        // Entidades a alturas muy distintas, también negativas.
+        w.spawn(1, Vec3::new(1.0, 0.0, 1.0));
+        w.spawn(2, Vec3::new(2.0, 90.0, 2.0));
+        w.spawn(3, Vec3::new(3.0, -90.0, 3.0));
+        assert_eq!(w.query_radius(Vec3::new(0.0, 0.0, 0.0), 5.0), vec![1]);
+        assert_eq!(w.query_radius(Vec3::new(0.0, 90.0, 0.0), 5.0), vec![2]);
+        assert_eq!(w.query_radius(Vec3::new(0.0, -90.0, 0.0), 5.0), vec![3]);
+        assert_eq!(
+            w.query_radius(Vec3::new(0.0, 0.0, 0.0), 200.0),
+            vec![1, 2, 3]
+        );
+        // Aunque se vacíen las capas, las consultas siguen siendo correctas.
+        w.despawn(2);
+        w.despawn(3);
+        assert_eq!(
+            w.query_radius(Vec3::new(0.0, 90.0, 0.0), 5.0),
+            Vec::<u64>::new()
+        );
+        assert_eq!(w.query_radius(Vec3::new(0.0, 0.0, 0.0), 200.0), vec![1]);
+        let hood = w.neighborhood(w.cell_of(Vec3::new(1.0, 0.0, 1.0)), 20.0);
+        assert_eq!(hood.len(), 1);
+    }
+
+    #[test]
+    fn step_es_puro_y_aplica_la_histeresis() {
+        let mut w = World::new(16.0);
+        for (id, x) in [(1u64, 0.0f32), (2, 9.0), (3, 11.0), (4, 14.0), (5, 40.0)] {
+            w.spawn(id, Vec3::new(x, 0.0, 0.0));
+        }
+        let o = Vec3::new(0.0, 0.0, 0.0);
+        // Sin pasado: solo lo que está dentro del radio (10), sin contarse a sí mismo.
+        let now = Interest::step(&w, 1.5, 1, o, 10.0, &[]);
+        assert_eq!(now, vec![2]);
+        // Con pasado: lo que ya se veía sigue visible hasta radio × histéresis (15).
+        let now = Interest::step(&w, 1.5, 1, o, 10.0, &[3, 4, 5]);
+        assert_eq!(now, vec![2, 3, 4], "5 está fuera incluso con histéresis");
+        // Mismas entradas, misma salida (no hay estado oculto).
+        assert_eq!(now, Interest::step(&w, 1.5, 1, o, 10.0, &[3, 4, 5]));
+        // Y `update` usa exactamente este núcleo.
+        let mut im = Interest::new(1.5);
+        im.update(&w, &[(1, 10.0)]);
+        assert_eq!(im.visible_ids(1), &[2][..]);
+        im.update(&w, &[(1, 10.0)]);
+        assert_eq!(im.visible_ids(1), &[2][..]);
     }
 
     #[test]

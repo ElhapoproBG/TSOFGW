@@ -29,7 +29,7 @@ Escenario: 50 000 entidades en un mundo de 10 km × 10 km, 100 jugadores con rad
 Son cifras de un entorno concreto: sirven para comparar perfiles y detectar regresiones, no como promesa de rendimiento en producción.
 
 ## Límites conocidos
-- No hay entidades fantasma en las fronteras de shard: un jugador cerca del borde todavía no ve lo que está al otro lado si está en otro servidor.
+- Las entidades fantasma y el traspaso entre servidores existen desde 0.4.0 (documento 09), pero el clúster usa una **rejilla geométrica fija** (`Partition`) y no el `ShardMap` con rendezvous hashing de este documento; unir ambos (reparto flexible que se reequilibra al añadir o quitar shards) está pendiente.
 - El transporte real está en el documento 08 (UDP autenticado, sin cifrado todavía); este documento describe los bloques de codificación.
 - Las posiciones se cuantizan con un rango de ±33 millones de unidades por eje.
 - El costo declarado de los nodos es una declaración, no una medición. En la demo con 100 000 entidades y 200 jugadores, el tiempo real supera el presupuesto del perfil de consola aunque el costo declarado quepa. La medición del costo real y su comparación con el declarado es una tarea pendiente.

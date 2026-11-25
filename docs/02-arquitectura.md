@@ -9,10 +9,11 @@
 | `tsofgw-net` | Codificación binaria, snapshots completos y delta, cabecera con seq/ack, predicción y reconciliación | Implementado y probado (sin transporte) |
 | `tsofgw-hal` | Interfaces de gráficos, XR y entrada; perfiles `vr`, `vr-120`, `pc`, `consola`; backends headless | Interfaces y headless; sin backends reales |
 | `tsofgw-transport` | Transporte UDP autenticado: handshake con cookie, MAC por paquete, anti-replay, fragmentación, sesiones, red simulada | Implementado y probado; sin cifrado |
-| `tsofgw-online` | Protocolo de juego, servidor autoritativo (créditos de input, regiones activas, interés, snapshots delta), cliente con predicción, bots, banco de pruebas | Implementado y probado; un solo hilo |
+| `tsofgw-online` | Protocolo de juego, servidor autoritativo (créditos de input, regiones activas, interés, snapshots delta; replicación en varios hilos, niveles de detalle y presupuesto de ancho de banda), cliente con predicción, bots, **clúster de shards** (fantasmas, traspaso de NPC y de jugadores, bus UDP autenticado), banco de pruebas | Implementado y probado |
 | `tsofgw-pack` | SHA-256, HMAC, manifiestos de módulo, niveles de confianza, política de permisos, revocación | Implementado; firmas asimétricas pendientes |
 | `tsofgw-sys` | FFI a C con respaldo en Rust puro | Implementado |
-| `tsofgw-cli` | Herramienta `tsofgw`: demo, dot, render, hash, pack, verify, new, keygen, token, serve, bots, loadtest | Implementado |
+| `tsofgw-soft` | Rasterizador por software (recorte, z-buffer, perspectiva), PNG y comparación de imágenes | Implementado y probado |
+| `tsofgw-cli` | Herramienta `tsofgw`: demo, dot, render, hash, pack, verify, new, keygen, token, serve (también como shard de un clúster), bots, loadtest | Implementado |
 
 ## Capas
 1. **Hardware (HAL):** wgpu/Vulkan/Metal/D3D12, OpenXR, audio, entrada. Rust; C vía `tsofgw-sys`.
@@ -52,7 +53,7 @@ Cada plataforma es un **backend de la capa HAL**, expuesto como nodos intercambi
 **Consolas y código abierto.** Los SDK de consola (PlayStation, Xbox, Nintendo) están bajo NDA y no pueden publicarse. El núcleo y los contratos de backend son abiertos, y los backends de consola los desarrollan y mantienen en privado quienes tengan licencia de desarrollador de cada fabricante, usando la misma interfaz HAL. Apache-2.0 lo permite. Esos backends seguirán la política de firmas y certificación del documento 04.
 
 ## Cliente y servidor
-El mismo grafo se particiona: el planificador decide qué subgrafo corre en cada servidor y en el visor. El mundo, la red y los shards están descritos en el documento 06.
+El mismo grafo se particiona: el planificador decide qué subgrafo corre en cada servidor y en el visor. El mundo y la red están descritos en el documento 06; la red en línea en el 08 y el reparto del mundo entre servidores en el 09. Hoy el servidor autoritativo y el clúster son código de `tsofgw-online` (no nodos del grafo todavía): convertir su canalización en nodos, de modo que se pueda apagar selectivamente cada fase, es trabajo pendiente.
 
 ## Hitos
 - **H0 (hecho):** grafo + apagado selectivo + FFI a C.
@@ -60,8 +61,9 @@ El mismo grafo se particiona: el planificador decide qué subgrafo corre en cada
 - **H1.5 (hecho, versión 0.1.0):** flujo de datos entre nodos, ejecución paralela por capas, exportación DOT, mundo con interés y shards, red con snapshots delta, HAL con perfiles y backends headless, módulos con manifiesto y confianza, herramienta `tsofgw`, demo medible, CI.
 - **H2a (hecho, versión 0.2.0):** matemática de render (`Mat4`, cámaras, fov asimétrico de XR), escena y mallas, rasterizador por software (`tsofgw-soft`, verificado) con salida PNG y comparación de imágenes, comando `tsofgw render`. Backend de GPU con wgpu escrito (`gpu/`), **sin compilar todavía** con el wgpu real.
 - **H2c (hecho, versión 0.3.0):** transporte UDP autenticado, servidor autoritativo con cliente y bots, banco de pruebas de carga, optimización guiada por perfil. Ver documento 08.
+- **H2d (hecho, versión 0.4.0):** escala. Replicación del tick en varios hilos con resultado idéntico, niveles de detalle y presupuesto de ancho de banda, vecindad compartida para multitudes, y clúster de shards (mundo repartido en rejilla, entidades fantasma, traspaso de NPC y de jugadores, bus UDP autenticado), todo con banco de pruebas y CLI. Ver documentos 08 y 09.
 - **H2b (pendiente):** confirmar y ajustar el backend wgpu; ventana y presentación; backend OpenXR; sandbox WebAssembly; firmas Ed25519; cifrado AEAD del transporte.
-- **H3 (pendiente):** inspector gráfico en vivo; ejecución distribuida del grafo entre servidores; entidades fantasma en fronteras de shard.
+- **H3 (pendiente):** inspector gráfico en vivo; ejecución distribuida **del grafo** entre servidores (hoy lo que se reparte es el mundo, no los nodos); persistencia y equilibrado dinámico de regiones en el clúster.
 - **H4 (pendiente):** identidad federada entre juegos, interfaz HAL congelada para backends de terceros, certificación.
 
 El estado detallado, con lo que está verificado y lo que no, está en el documento 07.

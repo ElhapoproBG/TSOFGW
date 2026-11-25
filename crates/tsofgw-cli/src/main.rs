@@ -30,9 +30,19 @@ USO:
 RED (servidor autoritativo, UDP autenticado):
   tsofgw keygen -o master.key                   Clave maestra aleatoria (no sobrescribe)
   tsofgw token --master-file K --player ID      Clave de una cuenta
-  tsofgw serve --master-file K [--bind IP:PUERTO] [--npcs N] [--duration S]
+  tsofgw serve --master-file K [--bind IP:PUERTO] [--npcs N] [--duration S] [--threads N] [--lod] [--budget B]
+               [--shard I --grid CxF --peers DIR0,DIR1,.. --cluster-key-file K [--bus-bind DIR]]
+                                                Un shard de un cluster: mundo repartido en C×F regiones (--peers: el bus de
+                                                cada shard, en orden; la misma rejilla, lista y clave en todos)
   tsofgw bots --master-file K --connect IP:PUERTO [--count N] [--duration S]
+              [--shards DIR0,DIR1,..] [--patrol N] [--patrol-ms MS]
+                                                En un cluster: la dirección de jugadores de cada shard, para seguir los
+                                                traspasos; N bots patrullan cruzando bordes
   tsofgw loadtest [--clients N] [--npcs N] [--seconds S] [--loss P] [--latency MS] [--jitter MS] [--udp]
+                  [--threads N] [--lod] [--budget B]   (hilos de replicación; niveles de detalle; bytes máx. por snapshot)
+                  [--spawn-half H] [--share-min N]     (aparecer en un área de ±H: multitud; vecindad compartida desde N jugadores/celda)
+                  [--shards CxF] [--patrol N] [--patrol-ms MS] [--bus-loss P] [--bus-latency MS] [--bus-jitter MS]
+                                                (cluster: mundo repartido en C×F shards; N clientes patrullan cruzando bordes)
                                                 Servidor + bots; informe medido
 ";
 

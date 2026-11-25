@@ -125,8 +125,8 @@ pub(crate) fn tag(key: &HmacKey, signed: &[u8]) -> [u8; TAG_LEN] {
 }
 
 /// Ventana de 128 contadores: rechaza repetidos y los demasiado viejos.
-#[derive(Default)]
-pub(crate) struct ReplayWindow {
+#[derive(Default, Debug, Clone)]
+pub struct ReplayWindow {
     max: u64,
     bits: u128,
     any: bool,

@@ -25,6 +25,14 @@ Cubre A5 en el lado del servidor y añade amenazas de red; detalle en el documen
 - **Inundación:** límite de paquetes por segundo y por sesión, de sesiones y de sesiones pendientes.
 - **No cubierto aún:** confidencialidad (no hay cifrado), credenciales asimétricas, ataques volumétricos de red (eso se mitiga fuera del motor), trampas que no alteran el protocolo (por ejemplo, ayudas de puntería) y atestación del cliente.
 
+## Clúster de shards (0.4.0)
+Añade un segundo canal de red, el **bus entre shards**, y con él nuevas amenazas; detalle en el documento 09.
+- **Intruso en el bus** (forja, altera o repite datagramas): todos llevan HMAC-SHA256/128 con una clave derivada de la clave de clúster, ventana anti-replay por origen y una marca de reloj con tolerancia de ±30 s; un intruso sin la clave no consigue nada y queda registrado (probado sobre sockets reales). El bus nunca responde a lo que recibe y solo envía a las direcciones configuradas, así que no sirve para amplificar ni reflejar.
+- **Shard mal configurado o con otro mundo:** cada datagrama lleva una huella de la configuración que debe coincidir (rejilla, tick, radios, NPC, semilla); si no coincide se rechaza y se cuenta aparte.
+- **Cliente que intenta aprovechar un traspaso:** el estado del jugador lo envía el shard de origen, nunca el cliente; el destino solo adopta un `HANDOVER` del mismo shard que lo preparó, para esa cuenta, y después de que el cliente se autenticara con su propia clave. La autoridad cambia en un único mensaje.
+- **Reinicio de un shard con capturas antiguas:** el contador del bus parte del reloj, así que sigue creciendo tras un reinicio y las capturas previas no se aceptan.
+- **No cubierto aún:** confidencialidad del bus (no hay cifrado; usar solo en una red privada), **la clave de clúster es un punto único de confianza** (quien la tenga puede suplantar a cualquier shard), no hay directorio de sesiones entre shards (una cuenta podría abrir dos sesiones en shards distintos), ni persistencia que permita recuperar un shard comprometido o reiniciado.
+
 ## Estado de implementación del sistema de módulos (0.1.0)
 Implementado en `tsofgw-pack` y probado:
 - **Manifiesto de módulo** con nombre, versión, permisos y SHA-256 del payload; formato estricto (claves desconocidas, duplicadas o faltantes se rechazan).
