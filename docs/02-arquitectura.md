@@ -25,3 +25,18 @@ El mismo grafo se particiona: el planificador decide qué subgrafo corre en cada
 - H2: nodo wgpu (triángulo) + nodo de red.
 - H3: MMO mínimo, 200–500 jugadores en mundo continuo con celdas espaciales e interest management.
 - H4: módulos firmados, sandbox WASM, identidad federada.
+
+## Plataformas (VR primero, sin dejar fuera PC y consolas)
+Cada plataforma es un **backend de la capa HAL**, expuesto como nodos intercambiables: el código de juego no cambia, cambian los nodos de salida y entrada.
+
+| Plataforma | Salida / entrada | Notas |
+|---|---|---|
+| VR (prioridad) | OpenXR, render estéreo | 90–120 Hz estables; presupuesto de latencia estricto |
+| PC (Windows/Linux/macOS) | Vulkan / D3D12 / Metal vía wgpu; teclado, ratón, gamepad | Mismo grafo, render en pantalla plana |
+| Consolas | SDK propietario de cada fabricante | Ver abajo |
+
+**Perfiles de ejecución:** un perfil (`vr`, `pc`, `consola`) fija presupuestos de frame, calidad y qué nodos se hibernan. El apagado selectivo ayuda aquí: en consola y en visores autónomos se apagan los nodos que no caben en el presupuesto.
+
+**Consolas y código abierto:** los SDK de consola (PlayStation, Xbox, Nintendo) están bajo NDA y no pueden publicarse. Por eso el núcleo y los contratos de backend son abiertos, y los backends de consola los desarrollan y mantienen en privado quienes tengan licencia de desarrollador de cada fabricante, usando la misma interfaz HAL. Apache-2.0 lo permite. Los backends de consola privados seguirán la política de firmas y certificación del documento 04.
+
+**Hitos:** H2 añade backend PC (wgpu) y OpenXR; la interfaz HAL se congela antes de H3 para que terceros puedan escribir backends de consola.
