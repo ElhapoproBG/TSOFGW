@@ -1,0 +1,12 @@
+# Finales de línea: el repositorio guarda LF y las copias de trabajo también, sea cual sea el sistema.
+# Así la integración continua en Windows ve los mismos bytes que en Linux y macOS, y `git add` en Windows no
+# avisa de «LF will be replaced by CRLF».
+* text=auto eol=lf
+
+# Los scripts de PowerShell se quedan con CRLF: Windows PowerShell 5 los lee mejor así.
+*.ps1 text eol=crlf
+
+# Binarios: Git no debe tocarlos.
+*.png binary
+*.jpg binary
+*.gif binary

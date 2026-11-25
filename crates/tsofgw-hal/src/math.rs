@@ -218,13 +218,9 @@ mod tests {
             ),
         };
         let id = view_matrix(&t).mul(&model_matrix(&t));
-        for i in 0..4 {
-            for j in 0..4 {
-                assert!(
-                    cerca(id.0[i][j], Mat4::IDENTITY.0[i][j]),
-                    "[{i}][{j}] = {}",
-                    id.0[i][j]
-                );
+        for (i, (fila, esperada)) in id.0.iter().zip(Mat4::IDENTITY.0).enumerate() {
+            for (j, (obtenido, esperado)) in fila.iter().zip(esperada).enumerate() {
+                assert!(cerca(*obtenido, esperado), "[{i}][{j}] = {obtenido}");
             }
         }
     }

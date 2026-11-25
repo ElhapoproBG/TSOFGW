@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "tsofgw-cli"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "tsofgw-core",
  "tsofgw-hal",
@@ -18,25 +18,25 @@ dependencies = [
 
 [[package]]
 name = "tsofgw-core"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "tsofgw-sys",
 ]
 
 [[package]]
 name = "tsofgw-hal"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "tsofgw-core",
 ]
 
 [[package]]
 name = "tsofgw-net"
-version = "0.4.1"
+version = "0.4.2"
 
 [[package]]
 name = "tsofgw-online"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "tsofgw-net",
  "tsofgw-pack",
@@ -46,14 +46,14 @@ dependencies = [
 
 [[package]]
 name = "tsofgw-pack"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "tsofgw-core",
 ]
 
 [[package]]
 name = "tsofgw-soft"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "tsofgw-core",
  "tsofgw-hal",
@@ -61,15 +61,15 @@ dependencies = [
 
 [[package]]
 name = "tsofgw-sys"
-version = "0.4.1"
+version = "0.4.2"
 
 [[package]]
 name = "tsofgw-transport"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "tsofgw-pack",
 ]
 
 [[package]]
 name = "tsofgw-world"
-version = "0.4.1"
+version = "0.4.2"

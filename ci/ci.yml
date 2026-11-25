@@ -43,8 +43,8 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - name: Compilador de Rust
@@ -52,13 +52,14 @@ jobs:
         run: |
           rustup toolchain install "$RUST_FIJA" --profile minimal --component rustfmt --component clippy --no-self-update
           rustup default "$RUST_FIJA"
-          python ci/annotate.py "Versiones (${{ matrix.os }})" --notice-tail 14 -- bash -c 'rustc --version --verbose; cargo --version; cargo clippy --version'
+          # No se usa `bash -c`: en Windows `bash` es el lanzador de WSL (véase ci/versiones.py).
+          python ci/annotate.py "Versiones (${{ matrix.os }})" --notice-tail 14 -- python ci/versiones.py
       - name: Formato
         if: ${{ !cancelled() && steps.rust.outcome == 'success' }}
         run: python ci/annotate.py "Formato" -- cargo fmt --all -- --check
       - name: Clippy
         if: ${{ !cancelled() && steps.rust.outcome == 'success' }}
-        run: python ci/annotate.py "Clippy" --json -- cargo clippy --all-targets -- -D warnings
+        run: python ci/annotate.py "Clippy" --json -- cargo clippy --all-targets --keep-going -- -D warnings
       - name: Pruebas
         if: ${{ !cancelled() && steps.rust.outcome == 'success' }}
         run: python ci/annotate.py "Pruebas (${{ matrix.os }})" --notice-grep '^test result:' -- cargo test --all
@@ -82,8 +83,8 @@ jobs:
     env:
       TSOFGW_NO_C: "1"
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - name: Compilador de Rust
@@ -99,8 +100,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - name: Compilador de Rust
@@ -119,8 +120,8 @@ jobs:
     continue-on-error: true
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - name: Compilador de Rust
@@ -128,13 +129,13 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal --component rustfmt --component clippy --no-self-update
           rustup default stable
-          python ci/annotate.py "Versiones (estable más reciente)" --notice-tail 14 -- bash -c 'rustc --version --verbose; cargo --version; cargo clippy --version'
+          python ci/annotate.py "Versiones (estable más reciente)" --notice-tail 14 -- python ci/versiones.py
       - name: Formato
         if: ${{ !cancelled() && steps.rust.outcome == 'success' }}
         run: python ci/annotate.py "Formato (estable)" -- cargo fmt --all -- --check
       - name: Clippy
         if: ${{ !cancelled() && steps.rust.outcome == 'success' }}
-        run: python ci/annotate.py "Clippy (estable)" --json -- cargo clippy --all-targets -- -D warnings
+        run: python ci/annotate.py "Clippy (estable)" --json -- cargo clippy --all-targets --keep-going -- -D warnings
       - name: Pruebas
         if: ${{ !cancelled() && steps.rust.outcome == 'success' }}
         run: python ci/annotate.py "Pruebas (estable)" --notice-grep '^test result:' -- cargo test --all
@@ -146,8 +147,8 @@ jobs:
     env:
       TSOFGW_REQUIRE_GPU: "1"
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - name: Compilador de Rust

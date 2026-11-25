@@ -98,8 +98,10 @@ pub fn parse_input(b: &[u8]) -> Option<(u32, Vec<Input>)> {
     if first == 0 || n == 0 || n > MAX_INPUTS_PER_MESSAGE || b.len() != 5 + 3 * n {
         return None;
     }
-    let inputs = b[5..]
-        .chunks_exact(3)
+    // La longitud exacta (5 + 3·n) ya se comprobó: al agrupar de 3 en 3 no sobra ningún byte.
+    let (grupos, _) = b[5..].as_chunks::<3>();
+    let inputs = grupos
+        .iter()
         .map(|c| Input {
             dir: [c[0] as i8, c[1] as i8, c[2] as i8],
         })

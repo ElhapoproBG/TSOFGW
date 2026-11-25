@@ -15,6 +15,11 @@ leerlos sin credenciales y sin abrir el registro.
 
 Con `--json` el comando debe empezar por `cargo <subcomando>`: se le añade `--message-format=json`.
 El código de salida es el del comando. Solo usa la biblioteca estándar de Python.
+
+El comando se ejecuta directamente, sin intérprete de órdenes, y por eso **no debe ser `bash`**: en Windows
+`bash` resuelve a `C:\\Windows\\System32\\bash.exe` (el lanzador de WSL), no a Git Bash. Para varias órdenes seguidas
+se usa un script de Python (véase `ci/versiones.py`). Si el comando es `python`, se usa el mismo intérprete que
+ejecuta este script.
 """
 
 import argparse
@@ -170,6 +175,8 @@ def main():
         if len(comando) < 2 or comando[0] != "cargo":
             sys.exit("--json exige un comando `cargo <subcomando> ...`")
         comando = [comando[0], comando[1], "--message-format=json"] + comando[2:]
+    if comando[0] in ("python", "python3"):
+        comando = [sys.executable] + comando[1:]
 
     for flujo in (sys.stdout, sys.stderr):
         try:

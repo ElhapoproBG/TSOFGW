@@ -1,5 +1,29 @@
 # Cambios
 
+## 0.4.2 — Lo que encontró la CI
+Segunda lectura real de la integración continua (la ejecución de la 0.4.1, commit `ad315f2`). Esta versión no añade funciones: corrige lo que esa ejecución encontró, y deja para después —a propósito— todo lo nuevo hasta ver la CI en verde.
+
+**Resultado de la ejecución de la 0.4.1**
+- **En verde:** Linux y macOS con el compilador fijado (1.97.0): formato, Clippy sin avisos, **228 pruebas** y las pruebas de humo (cargas, clúster simulado y, en Linux, clúster sobre UDP real: 8 traspasos de jugador y 0 jugadores o NPC perdidos o duplicados); el trabajo sin compilador de C; y el compilador mínimo declarado (1.90).
+- **El rojo de Clippy de la 0.4.0 era el compilador:** con el estable más reciente (1.100.0) Clippy marca 7 avisos nuevos; con el compilador fijado, ninguno. Las pruebas con el 1.100.0 pasan.
+- **En rojo:** Windows (el trabajo murió a los 23 s, sin ejecutar pruebas) y wgpu (un error de tipos al compilar).
+
+**CI**
+- **Windows:** el paso «Versiones» ejecutaba `bash -c '…'` desde `ci/annotate.py`; en Windows `bash` resuelve a `C:\Windows\System32\bash.exe` (el lanzador de WSL), no a Git Bash, y fallaba con «no hay distribuciones instaladas». Ahora lo hace `ci/versiones.py`, que llama a `rustc` y `cargo` directamente. `annotate.py` usa el mismo Python que lo ejecuta y su ayuda avisa de no usar `bash`.
+- Clippy corre con `--keep-going`: un error en un crate ya no oculta los avisos de los demás.
+- `actions/checkout` y `actions/setup-python` pasan de v4/v5 a v7 (Node 24): GitHub avisaba de que las de Node 20 se están retirando.
+- `.gitattributes` nuevo: el repositorio y las copias de trabajo usan LF en cualquier sistema (CRLF solo en `*.ps1`), para que Windows vea los mismos bytes que Linux y macOS.
+
+**wgpu (`gpu/tsofgw-wgpu`)**
+- `VertexState::buffers` es `&[Option<VertexBufferLayout>]` en wgpu 30.0.2: se envuelve en `Some(...)`. Es el error de compilación que encontró la CI.
+- Se contrastaron con el **código fuente** de wgpu 30.0.2 todas las estructuras y métodos que usa el crate (descriptor de la tubería, pase de render y sus adjuntos, copia de textura a búfer y las firmas de `Device`, `Buffer`, `BufferSlice`, `Queue` y `RenderPass`), y la maqueta con la que se comprueban los tipos ahora refleja esas definiciones (antes no tenía el `Option`, y por eso la comprobación local no vio el error).
+
+**Clippy 1.100 (7 avisos, sin cambio de comportamiento)**
+- `chunks_exact_to_as_chunks` (5): `parse_input`, `SoftGraphics::clear`, `SoftGraphics::draw_mesh` y `compare::diff` usan `as_chunks` / `as_chunks_mut` (estables desde Rust 1.88, por debajo del mínimo declarado, 1.90).
+- `needless_range_loop` (2): una prueba de matrices recorre con iteradores.
+
+**Pendiente de confirmar con la CI:** que Windows (cuyas pruebas nunca se han ejecutado con la suite actual) y wgpu (compilación y comparación de imagen) pasen, y que el estable más reciente quede sin avisos.
+
 ## 0.4.1 — Verificación externa
 Primera lectura real de la integración continua de GitHub. Resultado: **corría, y estaba en rojo desde la 0.3.0** (la 0.1.0 pasó en verde). En la 0.4.0 los tres sistemas fallaban en Clippy antes de llegar a las pruebas, y el trabajo de wgpu fallaba al compilar. Esta versión no añade funciones: arregla lo que se pudo arreglar sin ver los registros, y cambia la CI para que los registros no hagan falta.
 
@@ -19,11 +43,11 @@ Primera lectura real de la integración continua de GitHub. Resultado: **corría
 - README: aviso al principio, en español e inglés, de que **no es apto para exponerse a internet** (sin cifrado en los dos canales, la clave de clúster permite suplantar a cualquier shard, sin persistencia, sin directorio de sesiones).
 - `SECURITY.md` nuevo: qué protege y qué no cada canal, uso seguro mientras tanto, plan y cómo avisar de una vulnerabilidad.
 - `tsofgw serve` avisa por la salida de error cuando algún canal (jugadores o bus) escucha fuera del bucle local, que incluye la dirección por defecto `0.0.0.0`.
-- `.gitignore` excluye `*.key`, `*.pem` y `*.secret` (un `git add -A` subía la clave que crea `tsofgw keygen -o master.key` en la carpeta del repositorio) `target/` en cualquier carpeta (el de `gpu/` no estaba cubierto) y los `desktop.ini`/`Thumbs.db`/`.DS_Store` que crean los sistemas operativos (había un `desktop.ini` subido por error).
+- `.gitignore` excluye `*.key`, `*.pem` y `*.secret` (un `git add -A` subía la clave que crea `tsofgw keygen -o master.key` en la carpeta del repositorio), `target/` en cualquier carpeta (el de `gpu/` no estaba cubierto) y los `desktop.ini`/`Thumbs.db`/`.DS_Store` que crean los sistemas operativos (había un `desktop.ini` subido por error).
 
 **Sin cambio de comportamiento:** `varint_len` se reescribió con la misma cuenta por otra fórmula (`(70 - ceros) / 7`) y una aserción de `partition.rs` usa `is_empty()`; ambas por prudencia ante lints nuevos, cubiertas por las pruebas de tamaño exacto que ya existían.
 
-**Pendiente de confirmar con la CI:** que Clippy quede en verde, que las pruebas pasen en Windows y macOS (nunca se ejecutaron allí), que wgpu compile y que su imagen coincida con la del software.
+**Pendiente de confirmar con la CI:** que Clippy quede en verde, que las pruebas pasen en Windows y macOS (nunca se ejecutaron allí), que wgpu compile y que su imagen coincida con la del software. *(Resultado: véase la 0.4.2.)*
 
 ## 0.4.0 — Escala
 **Servidor (`tsofgw-online`)**

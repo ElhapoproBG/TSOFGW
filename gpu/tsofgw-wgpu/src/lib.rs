@@ -7,11 +7,12 @@
 //!
 //! # Estado
 //! **Este crate todavía no se ha compilado contra la biblioteca real de wgpu en el entorno donde se escribió**
-//! (sin acceso a descargar paquetes). La primera integración continua lo comprobó y falló por dos nombres que
-//! habían cambiado en wgpu 30: `PollType::wait()` ya no existe (hoy es `wait_indefinitely()`) y
-//! `BufferSlice::get_mapped_range()` devuelve un `Result`. Ambos se corrigieron leyendo las firmas en docs.rs
-//! (wgpu 30.0.2) y el ejemplo `hello_triangle` de esa versión, y se comprobaron contra una maqueta de la API
-//! actualizada; **la prueba definitiva sigue siendo la CI** (trabajo `gpu`, con Vulkan por software).
+//! (sin acceso a descargar paquetes): quien lo compila de verdad es la integración continua (trabajo `gpu`, con
+//! Vulkan por software), y cada ronda ha encontrado una diferencia entre lo que yo creía de wgpu 30 y lo que
+//! es: `PollType::wait()` ya no existe (hoy es `wait_indefinitely()`), `BufferSlice::get_mapped_range()`
+//! devuelve un `Result` y `VertexState::buffers` es `&[Option<VertexBufferLayout>]`. Cada diferencia se
+//! corrigió leyendo el **código fuente** de wgpu 30.0.2, y todas las estructuras y métodos que usa este archivo
+//! se contrastaron una por una con él, pero **la prueba definitiva sigue siendo la CI**.
 //!
 //! # Qué hace y qué no
 //! Hace: mallas con búfer de vértices e índices, una matriz MVP por objeto, prueba de profundidad, lectura de
@@ -107,11 +108,12 @@ impl WgpuGraphics {
                 module: &shader,
                 entry_point: Some("vs_main"),
                 compilation_options: Default::default(),
-                buffers: &[wgpu::VertexBufferLayout {
+                // En wgpu 30 cada ranura de vértices es un `Option` (`None` la deja sin usar).
+                buffers: &[Some(wgpu::VertexBufferLayout {
                     array_stride: VERTEX_STRIDE,
                     step_mode: wgpu::VertexStepMode::Vertex,
                     attributes: &VERTEX_ATTRIBUTES,
-                }],
+                })],
             },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,

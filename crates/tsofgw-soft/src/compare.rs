@@ -28,10 +28,14 @@ pub fn diff(a: &[u8], b: &[u8], threshold: u8) -> Result<Diff, String> {
         ));
     }
     let (mut suma, mut sobre, mut max) = (0u64, 0usize, 0u8);
-    for (p, q) in a.chunks_exact(4).zip(b.chunks_exact(4)) {
+    // Las dos imágenes miden lo mismo y es múltiplo de 4 (se comprobó arriba): no sobra ningún byte.
+    let (pixeles_a, _) = a.as_chunks::<4>();
+    let (pixeles_b, _) = b.as_chunks::<4>();
+    for (p, q) in pixeles_a.iter().zip(pixeles_b) {
         let mut peor = 0u8;
-        for k in 0..3 {
-            let d = p[k].abs_diff(q[k]);
+        // Solo R, G y B: el canal alfa no cuenta.
+        for (x, y) in p[..3].iter().zip(&q[..3]) {
+            let d = x.abs_diff(*y);
             suma += d as u64;
             peor = peor.max(d);
         }

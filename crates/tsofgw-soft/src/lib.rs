@@ -78,9 +78,9 @@ impl SoftGraphics {
 
     fn clear(&mut self, c: [f32; 4]) {
         let px = [to_u8(c[0]), to_u8(c[1]), to_u8(c[2]), to_u8(c[3])];
-        for p in self.color.chunks_exact_mut(4) {
-            p.copy_from_slice(&px);
-        }
+        // `color` mide ancho·alto·4 bytes: se recorre de 4 en 4 sin resto.
+        let (pixeles, _) = self.color.as_chunks_mut::<4>();
+        pixeles.fill(px);
         self.depth.fill(1.0);
     }
 
@@ -97,7 +97,9 @@ impl SoftGraphics {
                     color: v.color,
                 })
                 .collect();
-            for tri in m.indices.chunks_exact(3) {
+            // Los índices forman triángulos completos (lo exige `create_mesh`): no sobra ninguno.
+            let (triangulos, _) = m.indices.as_chunks::<3>();
+            for tri in triangulos {
                 let poly = vec![
                     verts[tri[0] as usize],
                     verts[tri[1] as usize],
