@@ -41,7 +41,9 @@ impl Writer {
 
 /// Bytes que ocupa `v` como varint (1–10), sin codificarlo.
 pub fn varint_len(v: u64) -> usize {
-    (64 - (v | 1).leading_zeros() as usize).div_ceil(7)
+    // Cada byte lleva 7 bits: bytes = ceil(bits / 7) con bits = 64 - ceros_a_la_izquierda = (70 - ceros) / 7.
+    // `| 1` evita el caso 0 (que también ocupa un byte).
+    (70 - (v | 1).leading_zeros() as usize) / 7
 }
 
 /// Bytes que ocupa `v` como zigzag + varint, sin codificarlo.

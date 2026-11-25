@@ -1,1 +1,12 @@
 target/
+
+# Claves y secretos: nunca deben llegar al repositorio. `tsofgw keygen -o master.key` los crea en la carpeta
+# actual, y `git add -A` los subiría.
+*.key
+*.pem
+*.secret
+/keys/
+
+# Imágenes que escribe `gpu_render` en la carpeta actual.
+/gpu.png
+/software.png

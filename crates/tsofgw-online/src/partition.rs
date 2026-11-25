@@ -210,7 +210,7 @@ mod tests {
         let p = Partition::grid(2, 2, 512.0).unwrap();
         assert_eq!(p.shard_count(), 4);
         assert_eq!(p.neighbors(0).len(), 3, "en 2×2 todos se tocan");
-        assert_eq!(Partition::single(512.0).neighbors(0).len(), 0);
+        assert!(Partition::single(512.0).neighbors(0).is_empty());
         assert_eq!(Partition::grid(3, 3, 512.0).unwrap().neighbors(4).len(), 8);
         assert_eq!(Partition::grid(3, 3, 512.0).unwrap().neighbors(0).len(), 3);
 

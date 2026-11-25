@@ -1,4 +1,4 @@
-# Estado verificado y pendientes (versión 0.4.0)
+# Estado verificado y pendientes (versión 0.4.1)
 
 Este documento separa lo que está probado de lo que no, para no confundir intención con realidad.
 
@@ -17,8 +17,8 @@ Este documento separa lo que está probado de lo que no, para no confundir inten
 - **Portabilidad:** todo pasa con la librería C y con el respaldo en Rust puro (`TSOFGW_NO_C=1`); `cargo fmt` y `cargo clippy` sin avisos.
 
 ## No verificado o no implementado
-- **Windows y macOS:** la CI está escrita para Linux, Windows y macOS, pero aún no ha corrido en GitHub. Todo se probó en Linux.
-- **Backend wgpu (`gpu/tsofgw-wgpu`):** escrito siguiendo la documentación de wgpu 30.0.2, pero **no se ha compilado ni ejecutado con el wgpu real** (el entorno donde se escribió no podía descargar paquetes). Solo se comprobó que su lógica, tipos y préstamos son correctos contra una maqueta de la API que escribí yo, lo que no demuestra que los nombres coincidan con la biblioteca real. Puntos con más riesgo: `PollType::wait()`, el tipo de retorno de `request_adapter` y `DeviceDescriptor::default()`. La CI incluye un trabajo que lo compila y compara su imagen con la del rasterizador por software.
+- **Integración continua.** La CI de GitHub sí corre (se leyó el 2026-11-25): la 0.1.0 pasó en verde en Linux, Windows y macOS; con la 0.3.0 y la 0.4.0 falló. En la 0.4.0, los tres sistemas fallaban en el paso de **Clippy** (el formato pasaba), así que **las pruebas nunca llegaron a ejecutarse en Windows ni en macOS**; el trabajo «sin compilador de C» sí pasó todas las pruebas, y el de wgpu falló al compilar. La causa más probable del fallo de Clippy son avisos nuevos de un Clippy más reciente que el 1.97 con el que se desarrolla (no confirmado: GitHub solo enseña el texto de los registros a quien ha iniciado sesión). La 0.4.1 reescribe la CI: compilador fijado (1.97.0), compilador mínimo declarado (1.90) y, sin bloquear, el estable más reciente; cada paso sigue aunque falle el anterior; y los errores se publican como anotaciones legibles sin iniciar sesión (`ci/annotate.py`). **El resultado de esa ejecución está pendiente de leer.**
+- **Backend wgpu (`gpu/tsofgw-wgpu`):** la CI de la 0.4.0 lo compiló por primera vez contra el wgpu real y falló. Leyendo la documentación de la versión 30.0.2 aparecieron dos errores seguros: `PollType::wait()` ya no existe (hoy `wait_indefinitely()`) y `get_mapped_range()` devuelve un `Result`. Corregidos en la 0.4.1 y comprobados contra una maqueta con las firmas reales, más un plazo de espera en la lectura de píxeles para que un controlador roto no cuelgue la prueba. **Falta ver su resultado en la CI**: la compilación y, sobre todo, que la imagen de la GPU coincida con la del rasterizador por software.
 - **OpenXR:** no empezado; la HAL tiene la interfaz y un backend headless.
 - **Ventana y presentación en pantalla:** no hay; el render actual es fuera de pantalla.
 - **Sandbox de módulos:** los permisos se declaran, se verifican al cargar y se auditan, pero no hay aislamiento en tiempo de ejecución (WebAssembly pendiente).
@@ -36,8 +36,8 @@ La primera versión del módulo en C (`hash.c`) tenía la constante inicial de F
 **0.4.0.** Un cliente que cambiaba a un shard cuya cuenta de ticks iba por detrás descartaba todos sus snapshots y el mundo se quedaba quieto (documento 09, sección 8). Lo encontró una prueba endurecida a propósito, no la primera versión. Además, dos optimizaciones del propio 0.4.0 empezaron costando más CPU de la que ahorraban en red (el LOD con una búsqueda por entidad y el presupuesto recodificando cada candidato); las mediciones lo mostraron y se corrigieron con un recorrido en paralelo de dos listas ordenadas y con el cálculo exacto de tamaños (documento 08).
 
 ## Siguientes pasos sugeridos
-1. Confirmar la CI en Windows y macOS.
-2. Compilar `gpu/tsofgw-wgpu` con el wgpu real (ver `gpu/README.md`), corregir lo que falle, y añadir ventana; después backend OpenXR.
+1. Dejar la CI en verde en Linux, Windows y macOS, y leer cada fallo que aparezca (los de Windows y macOS son los primeros que se ven de verdad).
+2. Confirmar `gpu/tsofgw-wgpu` en la CI (compilación y comparación de imagen), y añadir ventana; después backend OpenXR.
 3. Medir el costo real de cada nodo y compararlo con el declarado.
 4. Sandbox WebAssembly y firmas Ed25519.
 5. Cifrado AEAD del transporte y del bus (biblioteca auditada) y credenciales Ed25519.

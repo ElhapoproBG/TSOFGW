@@ -1,5 +1,8 @@
 name: CI
 
+# Copia este archivo a `.github/workflows/ci.yml` (la carpeta `ci/` guarda la fuente porque `.github` no se
+# puede escribir desde donde se genera el proyecto).
+
 on:
   push:
   pull_request:
@@ -7,56 +10,158 @@ on:
 permissions:
   contents: read
 
+# Una ejecución nueva sobre la misma rama cancela la anterior que siga en marcha.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# Todos los pasos usan bash (también en Windows) y el compilador sin colores, para que los registros y las
+# anotaciones salgan limpios.
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_TERM_COLOR: never
+  PYTHONUTF8: "1"
+  # Compilador con el que se desarrolla y se verifica. Subirlo es una decisión consciente: el trabajo
+  # «ultima-estable» avisa con antelación de lo que cambiaría (sobre todo avisos nuevos de Clippy).
+  RUST_FIJA: "1.97.0"
+  # Debe coincidir con `rust-version` del Cargo.toml.
+  RUST_MINIMA: "1.90.0"
+
+# Cada paso pasa por `ci/annotate.py`: si falla, publica el error como anotación, que se puede leer sin
+# iniciar sesión en GitHub (los registros completos solo los ve quien ha iniciado sesión).
+
 jobs:
-  test:
+  pruebas:
     name: pruebas (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
         with:
-          components: rustfmt, clippy
+          python-version: "3.12"
+      - name: Compilador de Rust
+        id: rust
+        run: |
+          rustup toolchain install "$RUST_FIJA" --profile minimal --component rustfmt --component clippy --no-self-update
+          rustup default "$RUST_FIJA"
+          python ci/annotate.py "Versiones (${{ matrix.os }})" --notice-tail 14 -- bash -c 'rustc --version --verbose; cargo --version; cargo clippy --version'
       - name: Formato
-        run: cargo fmt --all -- --check
+        if: ${{ !cancelled() && steps.rust.outcome == 'success' }}
+        run: python ci/annotate.py "Formato" -- cargo fmt --all -- --check
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        if: ${{ !cancelled() && steps.rust.outcome == 'success' }}
+        run: python ci/annotate.py "Clippy" --json -- cargo clippy --all-targets -- -D warnings
       - name: Pruebas
-        run: cargo test --all
+        if: ${{ !cancelled() && steps.rust.outcome == 'success' }}
+        run: python ci/annotate.py "Pruebas (${{ matrix.os }})" --notice-grep '^test result:' -- cargo test --all
       - name: Prueba de carga (humo)
-        run: cargo run --release -p tsofgw-cli -- loadtest --clients 30 --npcs 2000 --seconds 6
+        if: ${{ !cancelled() && steps.rust.outcome == 'success' }}
+        run: python ci/annotate.py "Carga (${{ matrix.os }})" --notice-tail 33 -- cargo run --release -p tsofgw-cli -- loadtest --clients 30 --npcs 2000 --seconds 6
       - name: Prueba de carga con hilos, LOD y presupuesto (humo)
-        run: cargo run --release -p tsofgw-cli -- loadtest --clients 40 --npcs 2000 --seconds 6 --threads 2 --lod --budget 1200
+        if: ${{ !cancelled() && steps.rust.outcome == 'success' }}
+        run: python ci/annotate.py "Carga con hilos (${{ matrix.os }})" --notice-tail 33 -- cargo run --release -p tsofgw-cli -- loadtest --clients 40 --npcs 2000 --seconds 6 --threads 2 --lod --budget 1200
       - name: Clúster de shards simulado (humo; falla si algo se pierde o se duplica)
-        run: cargo run --release -p tsofgw-cli -- loadtest --shards 2x1 --clients 20 --npcs 2000 --seconds 10 --patrol 10
+        if: ${{ !cancelled() && steps.rust.outcome == 'success' }}
+        run: python ci/annotate.py "Clúster simulado (${{ matrix.os }})" --notice-tail 30 -- cargo run --release -p tsofgw-cli -- loadtest --shards 2x1 --clients 20 --npcs 2000 --seconds 10 --patrol 10
       - name: Clúster de shards sobre UDP real (humo)
-        if: runner.os == 'Linux'
-        run: cargo run --release -p tsofgw-cli -- loadtest --shards 2x1 --clients 20 --npcs 2000 --seconds 12 --patrol 10 --udp
+        if: ${{ !cancelled() && steps.rust.outcome == 'success' && runner.os == 'Linux' }}
+        run: python ci/annotate.py "Clúster UDP (${{ matrix.os }})" --notice-tail 30 -- cargo run --release -p tsofgw-cli -- loadtest --shards 2x1 --clients 20 --npcs 2000 --seconds 12 --patrol 10 --udp
 
   sin-c:
     name: pruebas con respaldo en Rust (sin compilador de C)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     env:
       TSOFGW_NO_C: "1"
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - run: cargo test --all
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Compilador de Rust
+        run: |
+          rustup toolchain install "$RUST_FIJA" --profile minimal --no-self-update
+          rustup default "$RUST_FIJA"
+      - name: Pruebas
+        run: python ci/annotate.py "Pruebas sin C" --notice-grep '^test result:' -- cargo test --all
+
+  # Comprueba que `rust-version` del Cargo.toml es verdad: compila y prueba con el compilador mínimo.
+  version-minima:
+    name: compilador mínimo declarado
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Compilador de Rust
+        run: |
+          rustup toolchain install "$RUST_MINIMA" --profile minimal --no-self-update
+          rustup default "$RUST_MINIMA"
+          rustc --version
+      - name: Pruebas
+        run: python ci/annotate.py "Pruebas con el compilador mínimo" --notice-grep '^test result:' -- cargo test --all
+
+  # Informativo (no puede romper la integración): con el Rust estable más reciente, para enterarse de los
+  # avisos nuevos de Clippy y de cambios del compilador antes de subir `RUST_FIJA`.
+  ultima-estable:
+    name: Rust estable más reciente (informativo)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Compilador de Rust
+        id: rust
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt --component clippy --no-self-update
+          rustup default stable
+          python ci/annotate.py "Versiones (estable más reciente)" --notice-tail 14 -- bash -c 'rustc --version --verbose; cargo --version; cargo clippy --version'
+      - name: Formato
+        if: ${{ !cancelled() && steps.rust.outcome == 'success' }}
+        run: python ci/annotate.py "Formato (estable)" -- cargo fmt --all -- --check
+      - name: Clippy
+        if: ${{ !cancelled() && steps.rust.outcome == 'success' }}
+        run: python ci/annotate.py "Clippy (estable)" --json -- cargo clippy --all-targets -- -D warnings
+      - name: Pruebas
+        if: ${{ !cancelled() && steps.rust.outcome == 'success' }}
+        run: python ci/annotate.py "Pruebas (estable)" --notice-grep '^test result:' -- cargo test --all
 
   gpu:
     name: backend wgpu (Vulkan por software con lavapipe)
     runs-on: ubuntu-latest
+    timeout-minutes: 40
     env:
       TSOFGW_REQUIRE_GPU: "1"
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Compilador de Rust
+        run: |
+          rustup toolchain install "$RUST_FIJA" --profile minimal --no-self-update
+          rustup default "$RUST_FIJA"
       - name: Controlador Vulkan por software
         run: sudo apt-get update && sudo apt-get install -y mesa-vulkan-drivers libvulkan1
       - name: Compilar
-        run: cargo build --release --manifest-path gpu/tsofgw-wgpu/Cargo.toml --all-targets
+        id: compilar
+        run: python ci/annotate.py "Compilar wgpu" --json -- cargo build --release --manifest-path gpu/tsofgw-wgpu/Cargo.toml --all-targets
       - name: Pruebas (GPU contra software)
-        run: cargo test --release --manifest-path gpu/tsofgw-wgpu/Cargo.toml -- --nocapture
+        if: ${{ !cancelled() && steps.compilar.outcome == 'success' }}
+        run: python ci/annotate.py "Pruebas wgpu" --notice-tail 25 -- cargo test --release --manifest-path gpu/tsofgw-wgpu/Cargo.toml -- --nocapture
+      - name: Imagen de GPU contra imagen de software
+        if: ${{ !cancelled() && steps.compilar.outcome == 'success' }}
+        run: python ci/annotate.py "Imagen wgpu" --notice-tail 6 -- cargo run --release --manifest-path gpu/tsofgw-wgpu/Cargo.toml --bin gpu_render -- --scene mixta --size 320x240

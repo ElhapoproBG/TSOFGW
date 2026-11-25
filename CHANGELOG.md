@@ -1,5 +1,30 @@
 # Cambios
 
+## 0.4.1 — Verificación externa
+Primera lectura real de la integración continua de GitHub. Resultado: **corría, y estaba en rojo desde la 0.3.0** (la 0.1.0 pasó en verde). En la 0.4.0 los tres sistemas fallaban en Clippy antes de llegar a las pruebas, y el trabajo de wgpu fallaba al compilar. Esta versión no añade funciones: arregla lo que se pudo arreglar sin ver los registros, y cambia la CI para que los registros no hagan falta.
+
+**CI (`ci/ci.yml`, se copia a `.github/workflows/ci.yml`)**
+- Reescrita. El compilador de los trabajos que bloquean está **fijado a 1.97.0** (el mismo con el que se desarrolla); un trabajo aparte prueba el **compilador mínimo declarado** (1.90) y otro, **informativo y sin bloquear**, el **estable más reciente** para enterarse de avisos nuevos de Clippy antes de subir la versión fijada. Solo se usan acciones de `actions/*` y `rustup`: ninguna acción de terceros.
+- Cada paso corre aunque el anterior falle (antes, un Clippy en rojo ocultaba las pruebas de Windows y macOS), con plazos para que nada se cuelgue horas.
+- **`ci/annotate.py`**: ejecuta cada paso y, si falla, publica el error como **anotación** (con archivo y línea para Clippy y el compilador, y un resumen con todos los diagnósticos, las líneas de pánico y el final del registro). GitHub solo enseña el texto de los registros a quien ha iniciado sesión; las anotaciones se leen sin credenciales por la API. Los pasos de humo y de pruebas publican además un resumen de lo que midieron.
+- El trabajo de wgpu ahora también ejecuta `gpu_render` y publica la diferencia entre la imagen de la GPU y la del rasterizador.
+
+**wgpu (`gpu/tsofgw-wgpu`): dos errores de compilación seguros**, encontrados leyendo la documentación de wgpu 30.0.2:
+- `PollType::wait()` ya no existe; se usa `wait_indefinitely()`.
+- `BufferSlice::get_mapped_range()` devuelve `Result`; se maneja y el búfer se desmapea pase lo que pase.
+- Además: la espera de la lectura de píxeles tiene un plazo (30 s) en vez de poder colgarse; las mallas sin índices no se dibujan (wgpu 30 no admite búferes vacíos en `set_*_buffer`).
+- La maqueta con la que se comprobaba este crate asumía las firmas viejas, por eso no los detectó: ahora refleja las firmas verificadas en docs.rs.
+
+**Seguridad visible**
+- README: aviso al principio, en español e inglés, de que **no es apto para exponerse a internet** (sin cifrado en los dos canales, la clave de clúster permite suplantar a cualquier shard, sin persistencia, sin directorio de sesiones).
+- `SECURITY.md` nuevo: qué protege y qué no cada canal, uso seguro mientras tanto, plan y cómo avisar de una vulnerabilidad.
+- `tsofgw serve` avisa por la salida de error cuando algún canal (jugadores o bus) escucha fuera del bucle local, que incluye la dirección por defecto `0.0.0.0`.
+- `.gitignore` excluye `*.key`, `*.pem` y `*.secret` (un `git add -A` subía la clave que crea `tsofgw keygen -o master.key` en la carpeta del repositorio) `target/` en cualquier carpeta (el de `gpu/` no estaba cubierto) y los `desktop.ini`/`Thumbs.db`/`.DS_Store` que crean los sistemas operativos (había un `desktop.ini` subido por error).
+
+**Sin cambio de comportamiento:** `varint_len` se reescribió con la misma cuenta por otra fórmula (`(70 - ceros) / 7`) y una aserción de `partition.rs` usa `is_empty()`; ambas por prudencia ante lints nuevos, cubiertas por las pruebas de tamaño exacto que ya existían.
+
+**Pendiente de confirmar con la CI:** que Clippy quede en verde, que las pruebas pasen en Windows y macOS (nunca se ejecutaron allí), que wgpu compile y que su imagen coincida con la del software.
+
 ## 0.4.0 — Escala
 **Servidor (`tsofgw-online`)**
 - **Replicación en paralelo** (`--threads N`, 0 = núcleos disponibles): interés, snapshot y codificación por jugador en varios hilos, recogidos en orden. El resultado es idéntico: la huella de todos los paquetes coincide con 1, 2, 3 y 8 hilos, también con LOD y presupuesto. Con 2 núcleos, 500 jugadores densos pasan de 22,7 ms a 14,8 ms por tick.

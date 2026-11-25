@@ -1,6 +1,9 @@
 # Sube TSOFGW a git. Pensado para ejecutarse cada medianoche con el Programador de tareas.
 $ErrorActionPreference = "Stop"
 Set-Location "C:\TSOFGW"
+# La fuente del flujo de trabajo de la CI vive en ci\ci.yml (la carpeta .github no se puede escribir desde donde se
+# genera el proyecto): se copia aqui para que la subida automatica deje la misma CI que la manual.
+if (Test-Path "ci\ci.yml") { New-Item -ItemType Directory -Force ".github\workflows" | Out-Null; Copy-Item "ci\ci.yml" ".github\workflows\ci.yml" -Force }
 if (-not (Test-Path ".git")) { git init -b main | Out-Null }
 git add -A
 git diff --cached --quiet

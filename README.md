@@ -3,6 +3,17 @@
 Motor dinámico y open source para mundos inmersivos de realidad virtual a gran escala (MMO).
 No es un juego: es la base sobre la que se programa, construida como un **grafo de interdependencias**.
 
+> ## ⚠️ No apto para exponerse a internet
+> *Not suitable for exposure to the internet.* TSOFGW 0.4 es un prototipo para desarrollo, pruebas y redes de confianza:
+>
+> - **La red no está cifrada**, ni la de jugadores ni el bus entre shards: los paquetes se autentican, pero se pueden leer.
+> - **Quien tenga la clave de clúster puede hacerse pasar por cualquier shard**, y quien tenga la clave maestra, por cualquier cuenta.
+> - **No hay persistencia**: un shard reiniciado pierde su estado, y un traspaso perdido en una partición larga puede perder a un jugador.
+> - **No hay directorio de sesiones**: una cuenta podría estar en dos shards a la vez.
+> - Nada de esto ha pasado una auditoría externa.
+>
+> Úsalo en bucle local o en una red privada. Qué protege y qué no, cómo usarlo con seguridad y el plan: [`SECURITY.md`](SECURITY.md).
+
 - **Grafo vivo:** todo (simulación, red, física, audio, render, hardware) es un nodo con contrato tipado.
 - **Apagado selectivo:** un nodo solo corre si algo activo lo necesita; el resto hiberna. Lo mismo ocurre en el mundo: solo se simula donde hay jugadores cerca.
 - **Presupuesto por plataforma:** los perfiles `vr`, `pc` y `consola` fijan cuánto cabe por frame; lo de menor prioridad se descarta.
@@ -45,7 +56,7 @@ Requiere Rust 1.90 o superior (`rustup update`). No hace falta compilador de C.
 
 ## Estado
 
-Versión 0.4.0, prototipo. Incluye un servidor autoritativo con transporte UDP autenticado (sin cifrado todavía), cliente con predicción, replicación en varios hilos con niveles de detalle y presupuesto de ancho de banda, y un **clúster de shards** (el mundo repartido entre procesos, con entidades fantasma, traspaso de NPC y de jugadores y un bus UDP autenticado), todo con pruebas de carga medidas. Dibuja con un rasterizador por software verificado (`tsofgw render`); el backend de GPU con wgpu está escrito en `gpu/` pero aún no compilado con el wgpu real, y OpenXR no está empezado. Lo que está verificado y lo que no (sin sandbox, firmas solo HMAC, sin cifrado, sin persistencia, medido solo en bucle local) está en `docs/07-estado-y-pendientes.md`.
+Versión 0.4.1, prototipo (**no apto para exponerse a internet**, ver arriba y `SECURITY.md`). Incluye un servidor autoritativo con transporte UDP autenticado (sin cifrado todavía), cliente con predicción, replicación en varios hilos con niveles de detalle y presupuesto de ancho de banda, y un **clúster de shards** (el mundo repartido entre procesos, con entidades fantasma, traspaso de NPC y de jugadores y un bus UDP autenticado), todo con pruebas de carga medidas. Dibuja con un rasterizador por software verificado (`tsofgw render`); el backend de GPU con wgpu está escrito en `gpu/` y lo verifica la integración continua (trabajo `gpu`, con Vulkan por software); OpenXR no está empezado. Lo que está verificado y lo que no (sin sandbox, firmas solo HMAC, sin cifrado, sin persistencia, medido solo en bucle local) está en `docs/07-estado-y-pendientes.md`; el estado de la integración continua (Linux, Windows y macOS) se ve en la pestaña *Actions* del repositorio.
 
 ## Documentación
 
@@ -58,6 +69,7 @@ Versión 0.4.0, prototipo. Incluye un servidor autoritativo con transporte UDP a
 7. `docs/07-estado-y-pendientes.md` — estado verificado y pendientes
 8. `docs/08-red-en-linea.md` — transporte, servidor autoritativo, escala y pruebas de carga
 9. `docs/09-cluster-de-shards.md` — un mundo repartido entre varios servidores
+10. `SECURITY.md` — qué protege hoy el motor, qué no y el plan de seguridad
 
 ## Licencia
 

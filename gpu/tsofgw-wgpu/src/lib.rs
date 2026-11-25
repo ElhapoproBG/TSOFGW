@@ -6,10 +6,12 @@
 //! píxel a píxel con el backend por software de `tsofgw-soft`.
 //!
 //! # Estado
-//! **Este crate se escribió contra la documentación de wgpu 30.0.2, pero no se ha podido compilar ni ejecutar
-//! en el entorno donde se creó** (sin acceso a descargar paquetes). La lógica propia se comprobó contra una
-//! maqueta de la API; lo que falta por confirmar es que los nombres coincidan con la versión real. Los puntos
-//! más probables de ajuste están marcados con `AJUSTE`.
+//! **Este crate todavía no se ha compilado contra la biblioteca real de wgpu en el entorno donde se escribió**
+//! (sin acceso a descargar paquetes). La primera integración continua lo comprobó y falló por dos nombres que
+//! habían cambiado en wgpu 30: `PollType::wait()` ya no existe (hoy es `wait_indefinitely()`) y
+//! `BufferSlice::get_mapped_range()` devuelve un `Result`. Ambos se corrigieron leyendo las firmas en docs.rs
+//! (wgpu 30.0.2) y el ejemplo `hello_triangle` de esa versión, y se comprobaron contra una maqueta de la API
+//! actualizada; **la prueba definitiva sigue siendo la CI** (trabajo `gpu`, con Vulkan por software).
 //!
 //! # Qué hace y qué no
 //! Hace: mallas con búfer de vértices e índices, una matriz MVP por objeto, prueba de profundidad, lectura de
@@ -17,6 +19,7 @@
 //! búfer pequeño por objeto y por frame), instancias, texturas ni iluminación.
 
 use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 use tsofgw_hal::math::{model_matrix, Mat4};
 use tsofgw_hal::{DrawCmd, FrameStats, GraphicsBackend, MeshData, MeshId};
@@ -71,13 +74,9 @@ pub struct WgpuGraphics {
     adapter_name: String,
 }
 
-/// Espera a que la GPU termine el trabajo pendiente.
-///
-/// AJUSTE: esta es la llamada cuya forma más ha cambiado entre versiones de wgpu. Si no compila, prueba
-/// `wgpu::PollType::wait_indefinitely()` en lugar de `wait()`.
-fn wait_idle(device: &wgpu::Device) {
-    let _ = device.poll(wgpu::PollType::wait());
-}
+/// Tiempo máximo que se espera a que la GPU entregue los píxeles antes de rendirse (un controlador roto no
+/// debe dejar el proceso colgado para siempre).
+const READBACK_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn f32s_to_bytes(values: impl Iterator<Item = f32>) -> Vec<u8> {
     values.flat_map(|f| f.to_le_bytes()).collect()
@@ -88,7 +87,6 @@ impl WgpuGraphics {
     pub fn new() -> Result<Self, String> {
         // Sin ventana no hace falta un manejador de pantalla.
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
-        // AJUSTE: en versiones antiguas `request_adapter` devolvía `Option` en lugar de `Result`.
         let adapter =
             pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
                 .map_err(|e| format!("no hay un adaptador gráfico disponible: {e:?}"))?;
@@ -311,6 +309,10 @@ impl GraphicsBackend for WgpuGraphics {
         let mut draws: Vec<(usize, wgpu::BindGroup)> = Vec::new();
         for cmd in &self.pending {
             if let DrawCmd::Mesh { mesh, transform } = cmd {
+                // wgpu 30 no admite búferes vacíos en `set_vertex_buffer` / `set_index_buffer`.
+                if self.meshes[*mesh as usize].index_count == 0 {
+                    continue;
+                }
                 let mvp = view_proj.mul(&model_matrix(transform));
                 let bytes = f32s_to_bytes(mvp.to_cols_array().into_iter());
                 let buffer = self
@@ -411,20 +413,37 @@ impl GraphicsBackend for WgpuGraphics {
         slice.map_async(wgpu::MapMode::Read, move |r| {
             let _ = tx.send(r);
         });
-        wait_idle(&self.device);
-        rx.recv().ok()?.ok()?;
+        // `poll` con espera ejecuta la devolución de llamada cuando la GPU termina. Se repite hasta que llegue
+        // el resultado, con un plazo: si el controlador falla, se devuelve `None` en vez de colgarse.
+        let deadline = Instant::now() + READBACK_TIMEOUT;
+        let mapped = loop {
+            self.device.poll(wgpu::PollType::wait_indefinitely()).ok()?;
+            match rx.try_recv() {
+                Ok(result) => break result,
+                Err(mpsc::TryRecvError::Empty) if Instant::now() < deadline => {
+                    std::thread::yield_now();
+                }
+                Err(_) => return None,
+            }
+        };
+        mapped.ok()?;
 
         let (w, h) = self.size;
         let (row, padded) = (w as usize * 4, target.padded_row as usize);
         let mut out = Vec::with_capacity(row * h as usize);
-        {
-            let data = slice.get_mapped_range();
-            for y in 0..h as usize {
-                out.extend_from_slice(&data[y * padded..y * padded + row]);
+        // Desde wgpu 30 `get_mapped_range` devuelve un `Result`. Pase lo que pase, el búfer se desmapea para
+        // que el siguiente frame pueda copiar sobre él.
+        let copied = match slice.get_mapped_range() {
+            Ok(data) => {
+                for y in 0..h as usize {
+                    out.extend_from_slice(&data[y * padded..y * padded + row]);
+                }
+                true
             }
-        }
+            Err(_) => false,
+        };
         target.readback.unmap();
-        Some(out)
+        copied.then_some(out)
     }
 }
 

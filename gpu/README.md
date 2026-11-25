@@ -3,8 +3,11 @@
 `tsofgw-wgpu` dibuja con la tarjeta gráfica usando wgpu 30 y puede compararse con el rasterizador por software.
 Está fuera del espacio de trabajo principal a propósito: así `cargo test` en la raíz no necesita descargar wgpu.
 
-**Estado: escrito contra la documentación de wgpu 30.0.2, todavía sin compilar ni ejecutar con el wgpu real.**
-Se comprobó contra una maqueta de la API (tipos, préstamos, campos), no contra la biblioteca verdadera.
+**Estado:** la primera integración continua lo compiló contra el wgpu real y falló por dos nombres que habían
+cambiado en wgpu 30 (`PollType::wait()` → `wait_indefinitely()`, y `get_mapped_range()` ahora devuelve `Result`).
+Se corrigieron leyendo las firmas en docs.rs (30.0.2) y se comprobaron contra una maqueta de la API con esas
+firmas; **la prueba definitiva es el trabajo `gpu` de la CI** (Vulkan por software con lavapipe), que compila,
+dibuja y compara la imagen con la del rasterizador por software.
 
 ## Probarlo
 
@@ -20,12 +23,10 @@ Si no hay ningún adaptador gráfico, la prueba se omite con un aviso.
 
 ## Si no compila
 
-Los nombres de la API de wgpu cambian entre versiones. Los dos sitios más probables, marcados con `AJUSTE` en `src/lib.rs`:
-
-1. `wgpu::PollType::wait()` en `wait_idle`: prueba `wgpu::PollType::wait_indefinitely()`.
-2. `request_adapter(...)`: en versiones antiguas devolvía `Option` y no `Result`.
-
-Lo demás (descriptores del pipeline, del pase de render, copia de textura a búfer) sigue los nombres exactos de wgpu 30.0.2.
+Los nombres de la API de wgpu cambian entre versiones mayores (este crate fija `wgpu = "30"`). Si sube la
+versión, los sitios que más suelen cambiar son `Device::poll`/`PollType`, `Instance::new`/`InstanceDescriptor`,
+los campos de `RenderPipelineDescriptor`/`RenderPassDescriptor` y los tipos de retorno de `get_mapped_range` y
+`request_adapter`. Las firmas se pueden comprobar en docs.rs y en el ejemplo `hello_triangle` de la versión.
 
 ## Qué falta
 - Ventana y presentación en pantalla (`winit` + `Surface`).

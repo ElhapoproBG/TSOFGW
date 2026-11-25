@@ -171,6 +171,27 @@ fn resolve(addr: &str) -> Result<SocketAddr, String> {
         .ok_or(format!("no se pudo resolver {addr}"))
 }
 
+/// Aviso de seguridad si algún canal escucha fuera del bucle local: la red de esta versión no está cifrada y
+/// no es apta para exponerse a internet (ver `SECURITY.md`). Devuelve `None` si todo es local.
+fn exposure_warning(listening: &[(&str, SocketAddr)]) -> Option<String> {
+    let exposed: Vec<String> = listening
+        .iter()
+        .filter(|(_, addr)| !addr.ip().is_loopback())
+        .map(|(channel, addr)| format!("{channel} {addr}"))
+        .collect();
+    if exposed.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "ADVERTENCIA: escuchando fuera del bucle local ({}). TSOFGW {} NO está pensado para exponerse a internet: \
+         la red no está cifrada (ni la de jugadores ni el bus entre shards), quien tenga la clave de clúster puede \
+         suplantar a cualquier shard y no hay persistencia ni directorio de sesiones. Úsalo en una red privada o \
+         de confianza; detalles en SECURITY.md.",
+        exposed.join(", "),
+        env!("CARGO_PKG_VERSION")
+    ))
+}
+
 /// `tsofgw serve`: servidor real sobre UDP. Se detiene con Ctrl-C o tras `--duration` segundos.
 pub fn cmd_serve(args: &[String]) -> Result<(), String> {
     reject_unknown(
@@ -205,6 +226,7 @@ pub fn cmd_serve(args: &[String]) -> Result<(), String> {
     let link = UdpLink::bind(&bind).map_err(|e| format!("no se pudo abrir {bind}: {e}"))?;
     let local = link.local_addr().map_err(|e| e.to_string())?;
     let tick_ms = cfg.tick_ms;
+    let mut listening = vec![("jugadores", local)];
     let mut server = match flag(args, "--shard") {
         None => {
             for f in ["--grid", "--peers", "--bus-bind", "--cluster-key-file"] {
@@ -220,7 +242,11 @@ pub fn cmd_serve(args: &[String]) -> Result<(), String> {
                 Box::new(OsEntropy),
             )
         }
-        Some(_) => serve_shard(args, link, auth, cfg)?,
+        Some(_) => {
+            let (server, bus_addr) = serve_shard(args, link, auth, cfg)?;
+            listening.push(("bus entre shards", bus_addr));
+            server
+        }
     };
     let cluster_note = server
         .shard_id()
@@ -238,6 +264,9 @@ pub fn cmd_serve(args: &[String]) -> Result<(), String> {
         server.entity_count(),
         tsofgw_online::par::resolve_threads(server.config().threads)
     );
+    if let Some(aviso) = exposure_warning(&listening) {
+        eprintln!("{aviso}");
+    }
     let start = Instant::now();
     let mut last_report = 0u64;
     loop {
@@ -290,7 +319,7 @@ fn serve_shard(
     link: UdpLink,
     auth: Authority,
     cfg: GameConfig,
-) -> Result<GameServer<UdpLink>, String> {
+) -> Result<(GameServer<UdpLink>, SocketAddr), String> {
     let shard: u16 = num(args, "--shard", 0)?;
     let (cols, rows) = parse_grid(
         &flag(args, "--grid")
@@ -328,7 +357,10 @@ fn serve_shard(
         }
     }
     let cluster = ClusterConfig::new(shard, partition, &cfg)?;
-    GameServer::new_shard(
+    let bus_addr = bus
+        .local_addr()
+        .map_err(|e| format!("no se pudo leer la dirección del bus: {e}"))?;
+    let server = GameServer::new_shard(
         link,
         auth,
         cfg,
@@ -336,7 +368,8 @@ fn serve_shard(
         Box::new(OsEntropy),
         cluster,
         Box::new(bus),
-    )
+    )?;
+    Ok((server, bus_addr))
 }
 
 /// `tsofgw bots`: bots reales que se conectan por UDP a un servidor.
@@ -730,6 +763,30 @@ fn loadtest_udp(clients: usize, seconds: u64, game: GameConfig) -> Result<(), St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn avisa_solo_de_lo_que_escucha_fuera_del_bucle_local() {
+        let local4: SocketAddr = "127.0.0.1:7777".parse().unwrap();
+        let local6: SocketAddr = "[::1]:7777".parse().unwrap();
+        assert!(exposure_warning(&[("jugadores", local4), ("bus entre shards", local6)]).is_none());
+        assert!(exposure_warning(&[]).is_none());
+
+        let todas: SocketAddr = "0.0.0.0:7777".parse().unwrap();
+        let aviso = exposure_warning(&[("jugadores", todas)]).expect("0.0.0.0 es exponer");
+        assert!(aviso.contains("jugadores 0.0.0.0:7777"), "{aviso}");
+        assert!(aviso.contains("NO está pensado para exponerse a internet"));
+        assert!(aviso.contains("SECURITY.md"));
+
+        // Solo se nombra el canal expuesto.
+        let privada: SocketAddr = "192.168.1.5:7000".parse().unwrap();
+        let aviso =
+            exposure_warning(&[("jugadores", local4), ("bus entre shards", privada)]).unwrap();
+        assert!(
+            aviso.contains("bus entre shards 192.168.1.5:7000"),
+            "{aviso}"
+        );
+        assert!(!aviso.contains("jugadores 127.0.0.1"), "{aviso}");
+    }
 
     fn exact(clients: usize) -> Invariants {
         Invariants {
