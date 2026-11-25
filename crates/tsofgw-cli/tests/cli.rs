@@ -253,7 +253,8 @@ fn render_escribe_un_png_valido_con_objetos() {
     let (w, h, px) = tsofgw_soft::png::decode_rgba(&bytes).unwrap();
     assert_eq!((w, h), (96, 64));
     let fondo = [13u8, 15, 23];
-    let dibujados = px.chunks_exact(4).filter(|p| p[..3] != fondo).count();
+    let (pixeles, _) = px.as_chunks::<4>();
+    let dibujados = pixeles.iter().filter(|p| p[..3] != fondo).count();
     assert!(dibujados > 200, "solo {dibujados} píxeles con objetos");
     assert!(text(&o.stdout).contains("96x64"));
 

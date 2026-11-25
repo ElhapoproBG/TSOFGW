@@ -6,13 +6,15 @@
 //! píxel a píxel con el backend por software de `tsofgw-soft`.
 //!
 //! # Estado
-//! **Este crate todavía no se ha compilado contra la biblioteca real de wgpu en el entorno donde se escribió**
-//! (sin acceso a descargar paquetes): quien lo compila de verdad es la integración continua (trabajo `gpu`, con
-//! Vulkan por software), y cada ronda ha encontrado una diferencia entre lo que yo creía de wgpu 30 y lo que
-//! es: `PollType::wait()` ya no existe (hoy es `wait_indefinitely()`), `BufferSlice::get_mapped_range()`
-//! devuelve un `Result` y `VertexState::buffers` es `&[Option<VertexBufferLayout>]`. Cada diferencia se
-//! corrigió leyendo el **código fuente** de wgpu 30.0.2, y todas las estructuras y métodos que usa este archivo
-//! se contrastaron una por una con él, pero **la prueba definitiva sigue siendo la CI**.
+//! **Verificado por la integración continua** (trabajo `gpu`, con Vulkan por software mediante llvmpipe):
+//! compila contra wgpu 30.0.2 y dibuja lo mismo que el rasterizador por software (escena `mixta` a 320×240:
+//! diferencia media 0,051/255, máxima 1). **No se ha probado en una GPU real** ni con DirectX 12 o Metal.
+//!
+//! Donde se escribió no se pueden descargar paquetes, así que no se compiló contra wgpu hasta la CI, y cada
+//! ronda encontró una diferencia entre lo que se suponía de wgpu 30 y lo que es: `PollType::wait()` ya no
+//! existe (hoy es `wait_indefinitely()`), `BufferSlice::get_mapped_range()` devuelve un `Result` y
+//! `VertexState::buffers` es `&[Option<VertexBufferLayout>]`. Cada una se corrigió leyendo el **código fuente**
+//! de wgpu 30.0.2, no solo la documentación.
 //!
 //! # Qué hace y qué no
 //! Hace: mallas con búfer de vértices e índices, una matriz MVP por objeto, prueba de profundidad, lectura de

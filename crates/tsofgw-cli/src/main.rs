@@ -193,7 +193,8 @@ fn cmd_render(args: &[String]) -> Result<(), String> {
     };
     let fondo = [scene.clear[0], scene.clear[1], scene.clear[2]]
         .map(|c| (c.clamp(0.0, 1.0) * 255.0 + 0.5) as u8);
-    let dibujados = px.chunks_exact(4).filter(|p| p[..3] != fondo).count();
+    let (pixeles, _) = px.as_chunks::<4>();
+    let dibujados = pixeles.iter().filter(|p| p[..3] != fondo).count();
     fs::write(&out, png::encode_rgba(iw, ih, &px))
         .map_err(|e| format!("no se pudo escribir {out}: {e}"))?;
     println!(

@@ -1,5 +1,19 @@
 # Cambios
 
+## 0.4.3 — La CI en verde
+Tercera lectura de la integración continua (la ejecución de la 0.4.2, commit `5849357`): **terminó en verde**. Esta versión no añade funciones ni cambia comportamiento: corrige los 9 avisos que el Rust estable más reciente (1.100.0) todavía marca en el trabajo informativo y deja registrados los resultados reales.
+
+**Resultado de la ejecución de la 0.4.2**
+- **Windows:** por primera vez corren sus pruebas con esta suite (`x86_64-pc-windows-msvc`): **228 pruebas pasan**, incluidas las de UDP real en el bucle local, y las pruebas de humo acaban sin pérdidas ni duplicados.
+- **Mismos números en los tres sistemas:** los recuentos de paquetes, snapshots y traspasos de las pruebas de humo son idénticos en Linux, macOS y Windows (la simulación es determinista); solo cambian los tiempos. Clúster simulado: 6 traspasos de jugador completados, 590 mensajes entre shards, 0 jugadores y 0 NPC perdidos o duplicados. Sobre UDP real (Linux): 8 traspasos, 0 perdidos o duplicados.
+- **wgpu:** compila contra wgpu 30.0.2 y la prueba que compara la GPU con el rasterizador por software (triángulo, cubo y mixta) pasa. Con el controlador por software llvmpipe, `gpu_render` da para la escena `mixta` a 320×240 una diferencia media de 0,051/255, 0 % de píxeles con diferencia > 16 y máxima de 1: **COINCIDEN**.
+- También en verde: Linux y macOS (228 pruebas cada uno), el trabajo sin compilador de C y el compilador mínimo declarado (1.90).
+- **Rust estable más reciente (informativo):** las pruebas pasan y Clippy marca 9 avisos. Cargo se detiene en el primer fallo y los 7 de la 0.4.1 los ocultaban; con `--keep-going` (0.4.2) salieron todos de una vez.
+
+**Clippy 1.100 (9 avisos, sin cambio de comportamiento)**
+- `chunks_exact_to_as_chunks` (8): `tsofgw-cli` (`render` y su prueba de extremo a extremo) y seis pruebas de `tsofgw-soft` usan `as_chunks`.
+- `needless_range_loop` (1): el generador de snapshots de las pruebas de `replicate.rs` recorre `e.pos` con `iter_mut()`; mismos números aleatorios en el mismo orden.
+
 ## 0.4.2 — Lo que encontró la CI
 Segunda lectura real de la integración continua (la ejecución de la 0.4.1, commit `ad315f2`). Esta versión no añade funciones: corrige lo que esa ejecución encontró, y deja para después —a propósito— todo lo nuevo hasta ver la CI en verde.
 
@@ -22,7 +36,7 @@ Segunda lectura real de la integración continua (la ejecución de la 0.4.1, com
 - `chunks_exact_to_as_chunks` (5): `parse_input`, `SoftGraphics::clear`, `SoftGraphics::draw_mesh` y `compare::diff` usan `as_chunks` / `as_chunks_mut` (estables desde Rust 1.88, por debajo del mínimo declarado, 1.90).
 - `needless_range_loop` (2): una prueba de matrices recorre con iteradores.
 
-**Pendiente de confirmar con la CI:** que Windows (cuyas pruebas nunca se han ejecutado con la suite actual) y wgpu (compilación y comparación de imagen) pasen, y que el estable más reciente quede sin avisos.
+**Pendiente de confirmar con la CI:** que Windows (cuyas pruebas nunca se han ejecutado con la suite actual) y wgpu (compilación y comparación de imagen) pasen, y que el estable más reciente quede sin avisos. *(Resultado: véase la 0.4.3.)*
 
 ## 0.4.1 — Verificación externa
 Primera lectura real de la integración continua de GitHub. Resultado: **corría, y estaba en rojo desde la 0.3.0** (la 0.1.0 pasó en verde). En la 0.4.0 los tres sistemas fallaban en Clippy antes de llegar a las pruebas, y el trabajo de wgpu fallaba al compilar. Esta versión no añade funciones: arregla lo que se pudo arreglar sin ver los registros, y cambia la CI para que los registros no hagan falta.

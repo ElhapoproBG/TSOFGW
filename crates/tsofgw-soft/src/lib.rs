@@ -344,11 +344,8 @@ mod tests {
             "{abajo_der:?}"
         );
         // y la imagen no es solo fondo
-        let cubiertos = g
-            .pixels()
-            .chunks_exact(4)
-            .filter(|p| p[..3] != [0, 0, 0])
-            .count();
+        let (pixeles, _) = g.pixels().as_chunks::<4>();
+        let cubiertos = pixeles.iter().filter(|p| p[..3] != [0, 0, 0]).count();
         assert!(
             cubiertos > 300 && cubiertos < 64 * 64 / 2,
             "{cubiertos} píxeles cubiertos"
@@ -431,7 +428,8 @@ mod tests {
             &[shapes::flat_triangle([1.0, 1.0, 1.0])],
             &[(0, en([0.0, 0.0, 3.0]))],
         );
-        assert!(g.pixels().chunks_exact(4).all(|p| p[..3] == [0, 0, 0]));
+        let (pixeles, _) = g.pixels().as_chunks::<4>();
+        assert!(pixeles.iter().all(|p| p[..3] == [0, 0, 0]));
     }
 
     #[test]
@@ -439,8 +437,9 @@ mod tests {
         let mut g = SoftGraphics::new(96, 96);
         let escena = Scene::demo("cubo").unwrap();
         let px = render_mono(&mut g, &escena, &Transform::default(), 96, 96).unwrap();
-        let mut colores: Vec<[u8; 3]> = px
-            .chunks_exact(4)
+        let (pixeles, _) = px.as_chunks::<4>();
+        let mut colores: Vec<[u8; 3]> = pixeles
+            .iter()
             .map(|p| [p[0], p[1], p[2]])
             .filter(|c| *c != [13, 15, 23])
             .collect();
@@ -462,8 +461,9 @@ mod tests {
         let px = render_mono(&mut g, &escena, &Transform::default(), 128, 128).unwrap();
         // el triángulo (z = -1.8) está más cerca que el cubo (z = -3): su vértice rojo domina arriba
         // y, con el color mezclado, hay píxeles muy rojos que el cubo solo (rojo 0.9, 0.3, 0.3) no tiene
-        let muy_rojos = px
-            .chunks_exact(4)
+        let (pixeles, _) = px.as_chunks::<4>();
+        let muy_rojos = pixeles
+            .iter()
             .filter(|p| p[0] > 240 && p[1] < 40 && p[2] < 40)
             .count();
         assert!(muy_rojos > 0);
@@ -488,13 +488,17 @@ mod tests {
                 .collect()
         };
         let (izq, der) = (mitad(0), mitad(1));
-        let cubiertos = |m: &Vec<u8>| m.chunks_exact(4).filter(|p| p[..3] != [13, 15, 23]).count();
+        let cubiertos = |m: &Vec<u8>| {
+            let (pixeles, _) = m.as_chunks::<4>();
+            pixeles.iter().filter(|p| p[..3] != [13, 15, 23]).count()
+        };
         assert!(cubiertos(&izq) > 100 && cubiertos(&der) > 100);
         assert_ne!(izq, der, "los ojos deben ver imágenes distintas");
         // el ojo izquierdo está 3,2 cm a la izquierda: el objeto cercano se desplaza hacia la derecha en su imagen
         let centro_x = |m: &Vec<u8>| {
-            let (suma, n) = m
-                .chunks_exact(4)
+            let (pixeles, _) = m.as_chunks::<4>();
+            let (suma, n) = pixeles
+                .iter()
                 .enumerate()
                 .filter(|(_, p)| p[..3] != [13, 15, 23])
                 .fold((0usize, 0usize), |(s, n), (i, _)| {

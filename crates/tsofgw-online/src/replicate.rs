@@ -924,9 +924,9 @@ mod tests {
                 0 => {} // desaparece
                 1..=4 => {
                     let mut e = e.clone();
-                    for a in 0..3 {
+                    for p in e.pos.iter_mut() {
                         if rng.next_u64().is_multiple_of(3) {
-                            e.pos[a] = e.pos[a].wrapping_add((rng.next_u64() % 600) as i32 - 300);
+                            *p = p.wrapping_add((rng.next_u64() % 600) as i32 - 300);
                         }
                     }
                     if rng.next_u64().is_multiple_of(9) {
