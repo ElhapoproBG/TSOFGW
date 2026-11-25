@@ -16,3 +16,9 @@ tsofgw-world = { path = "../tsofgw-world" }
 tsofgw-net = { path = "../tsofgw-net" }
 tsofgw-hal = { path = "../tsofgw-hal" }
 tsofgw-pack = { path = "../tsofgw-pack" }
+tsofgw-soft = { path = "../tsofgw-soft" }
+tsofgw-transport = { path = "../tsofgw-transport" }
+tsofgw-online = { path = "../tsofgw-online" }
+
+[dev-dependencies]
+tsofgw-soft = { path = "../tsofgw-soft" }

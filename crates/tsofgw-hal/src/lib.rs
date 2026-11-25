@@ -7,6 +7,11 @@
 //! Los backends incluidos aquí son *headless*: no dibujan nada, sirven para pruebas, servidores
 //! dedicados y para verificar la lógica del motor sin hardware.
 
+pub mod math;
+pub mod scene;
+
+pub use math::Mat4;
+pub use scene::{MeshData, MeshId, Scene, Vertex};
 use std::collections::VecDeque;
 use std::sync::Arc;
 use tsofgw_core::{fn_node, Contract, Cost, DataType, Node, Transform, Value};
@@ -110,9 +115,18 @@ pub enum InputEvent {
 pub trait GraphicsBackend: Send {
     fn name(&self) -> &str;
     fn resize(&mut self, width: u32, height: u32);
+    fn size(&self) -> (u32, u32);
+    /// Sube una malla al backend y devuelve su identificador.
+    fn create_mesh(&mut self, mesh: &MeshData) -> MeshId;
     fn begin_frame(&mut self);
+    /// Cámara del frame en curso: del mundo al ojo y del ojo al clip (profundidad `[0, 1]`).
+    fn set_camera(&mut self, view: &Mat4, proj: &Mat4);
     fn submit(&mut self, cmds: &[DrawCmd]);
     fn end_frame(&mut self) -> FrameStats;
+    /// Píxeles RGBA8 (filas de arriba abajo) del último frame terminado, si el backend puede entregarlos.
+    fn read_back(&mut self) -> Option<Vec<u8>> {
+        None
+    }
 }
 
 pub trait XrBackend: Send {
@@ -135,6 +149,7 @@ pub trait InputBackend: Send {
 pub struct HeadlessGraphics {
     pub size: (u32, u32),
     pub last_frame: Vec<DrawCmd>,
+    pub meshes: Vec<MeshData>,
     frame: u64,
     in_frame: bool,
 }
@@ -145,6 +160,16 @@ impl GraphicsBackend for HeadlessGraphics {
     }
     fn resize(&mut self, width: u32, height: u32) {
         self.size = (width, height);
+    }
+    fn size(&self) -> (u32, u32) {
+        self.size
+    }
+    fn create_mesh(&mut self, mesh: &MeshData) -> MeshId {
+        self.meshes.push(mesh.clone());
+        (self.meshes.len() - 1) as MeshId
+    }
+    fn set_camera(&mut self, _view: &Mat4, _proj: &Mat4) {
+        assert!(self.in_frame, "set_camera fuera de un frame");
     }
     fn begin_frame(&mut self) {
         assert!(!self.in_frame, "begin_frame sin end_frame");

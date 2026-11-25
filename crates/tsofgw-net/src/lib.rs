@@ -142,50 +142,79 @@ impl Snapshot {
     }
 
     /// Codifica solo lo que cambió respecto de `baseline` (que el cliente ya confirmó haber recibido).
+    ///
+    /// Recorre las dos listas ordenadas a la vez (una sola pasada, sin búsquedas por id).
     pub fn encode_delta(&self, baseline: &Snapshot) -> Vec<u8> {
+        let mut removed: Vec<u64> = Vec::new();
+        #[allow(clippy::type_complexity)]
+        let mut changes: Vec<(u64, u8, &EntityState, Option<&EntityState>)> = Vec::new();
+        let mut cur = self.entities.iter().peekable();
+        let mut base = baseline.entities.iter().peekable();
+        loop {
+            match (cur.peek(), base.peek()) {
+                (None, None) => break,
+                (Some(&(&id, e)), None) => {
+                    changes.push((id, F_NEW, e, None));
+                    cur.next();
+                }
+                (None, Some(&(&id, _))) => {
+                    removed.push(id);
+                    base.next();
+                }
+                (Some(&(&ia, ea)), Some(&(&ib, eb))) => match ia.cmp(&ib) {
+                    std::cmp::Ordering::Less => {
+                        changes.push((ia, F_NEW, ea, None));
+                        cur.next();
+                    }
+                    std::cmp::Ordering::Greater => {
+                        removed.push(ib);
+                        base.next();
+                    }
+                    std::cmp::Ordering::Equal => {
+                        if ea != eb {
+                            let mut f = 0;
+                            if ea.pos[0] != eb.pos[0] {
+                                f |= F_X;
+                            }
+                            if ea.pos[1] != eb.pos[1] {
+                                f |= F_Y;
+                            }
+                            if ea.pos[2] != eb.pos[2] {
+                                f |= F_Z;
+                            }
+                            if ea.data != eb.data {
+                                f |= F_DATA;
+                            }
+                            changes.push((ia, f, ea, Some(eb)));
+                        }
+                        cur.next();
+                        base.next();
+                    }
+                },
+            }
+        }
+        self.write_delta(baseline.tick, &removed, &changes)
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn write_delta(
+        &self,
+        base_tick: u32,
+        removed: &[u64],
+        changes: &[(u64, u8, &EntityState, Option<&EntityState>)],
+    ) -> Vec<u8> {
         let mut w = Writer::default();
         w.varint(self.tick as u64);
-        w.varint(baseline.tick as u64);
-
-        let removed: Vec<u64> = baseline
-            .entities
-            .keys()
-            .filter(|id| !self.entities.contains_key(id))
-            .copied()
-            .collect();
+        w.varint(base_tick as u64);
         w.varint(removed.len() as u64);
         let mut prev = 0u64;
-        for id in removed {
+        for &id in removed {
             w.varint(id - prev);
             prev = id;
         }
-
-        let mut changes = Vec::new();
-        for (&id, e) in &self.entities {
-            match baseline.entities.get(&id) {
-                None => changes.push((id, F_NEW, e, None)),
-                Some(b) if b != e => {
-                    let mut f = 0;
-                    if e.pos[0] != b.pos[0] {
-                        f |= F_X;
-                    }
-                    if e.pos[1] != b.pos[1] {
-                        f |= F_Y;
-                    }
-                    if e.pos[2] != b.pos[2] {
-                        f |= F_Z;
-                    }
-                    if e.data != b.data {
-                        f |= F_DATA;
-                    }
-                    changes.push((id, f, e, Some(b)));
-                }
-                _ => {}
-            }
-        }
         w.varint(changes.len() as u64);
         let mut prev = 0u64;
-        for (id, f, e, b) in changes {
+        for &(id, f, e, b) in changes {
             w.varint(id - prev);
             prev = id;
             w.u8(f);
@@ -286,6 +315,9 @@ pub fn seq_newer(a: u16, b: u16) -> bool {
     a != b && a.wrapping_sub(b) < 0x8000
 }
 
+/// Cuántos paquetes hacia atrás se siguen esperando confirmar.
+const IN_FLIGHT_WINDOW: u16 = 64;
+
 /// Un extremo de la conexión: numera lo que envía y recuerda qué recibió del otro.
 pub struct Endpoint {
     local_seq: u16,
@@ -321,6 +353,11 @@ impl Endpoint {
         };
         self.in_flight.insert(self.local_seq);
         self.local_seq = self.local_seq.wrapping_add(1);
+        // Un paquete más de 64 puestos atrás ya no puede confirmarse (el ack cubre 33): se da por perdido.
+        // Sin esto, con pérdida sostenida el conjunto crecería hasta 65 536 entradas por conexión.
+        let newest = self.local_seq;
+        self.in_flight
+            .retain(|&s| newest.wrapping_sub(s) <= IN_FLIGHT_WINDOW);
         h
     }
 
@@ -720,5 +757,142 @@ mod tests {
         cliente.reconcile(servidor, 30);
         assert_eq!(cliente.state, servidor);
         assert_eq!(cliente.pending(), 0);
+    }
+
+    #[test]
+    fn paquetes_perdidos_no_se_acumulan_para_siempre() {
+        let mut a = Endpoint::default();
+        // Se envían 100 000 paquetes y ninguno se confirma nunca (pérdida total del camino de vuelta).
+        for _ in 0..100_000u32 {
+            a.next_header();
+            assert!(a.in_flight() <= IN_FLIGHT_WINDOW as usize + 1);
+        }
+    }
+
+    impl Snapshot {
+        fn encode_delta_referencia(&self, baseline: &Snapshot) -> Vec<u8> {
+            let mut w = Writer::default();
+            w.varint(self.tick as u64);
+            w.varint(baseline.tick as u64);
+
+            let removed: Vec<u64> = baseline
+                .entities
+                .keys()
+                .filter(|id| !self.entities.contains_key(id))
+                .copied()
+                .collect();
+            w.varint(removed.len() as u64);
+            let mut prev = 0u64;
+            for id in removed {
+                w.varint(id - prev);
+                prev = id;
+            }
+
+            let mut changes = Vec::new();
+            for (&id, e) in &self.entities {
+                match baseline.entities.get(&id) {
+                    None => changes.push((id, F_NEW, e, None)),
+                    Some(b) if b != e => {
+                        let mut f = 0;
+                        if e.pos[0] != b.pos[0] {
+                            f |= F_X;
+                        }
+                        if e.pos[1] != b.pos[1] {
+                            f |= F_Y;
+                        }
+                        if e.pos[2] != b.pos[2] {
+                            f |= F_Z;
+                        }
+                        if e.data != b.data {
+                            f |= F_DATA;
+                        }
+                        changes.push((id, f, e, Some(b)));
+                    }
+                    _ => {}
+                }
+            }
+            w.varint(changes.len() as u64);
+            let mut prev = 0u64;
+            for (id, f, e, b) in changes {
+                w.varint(id - prev);
+                prev = id;
+                w.u8(f);
+                if let Some(b) = b {
+                    for (bit, i) in [(F_X, 0), (F_Y, 1), (F_Z, 2)] {
+                        if f & bit != 0 {
+                            w.zigzag(e.pos[i] as i64 - b.pos[i] as i64);
+                        }
+                    }
+                    if f & F_DATA != 0 {
+                        w.varint(e.data as u64);
+                    }
+                } else {
+                    for c in e.pos {
+                        w.zigzag(c as i64);
+                    }
+                    w.varint(e.data as u64);
+                }
+            }
+            w.buf
+        }
+    }
+
+    #[test]
+    fn encode_delta_por_fusion_da_los_mismos_bytes_que_la_version_simple() {
+        let mut rng = 12345u64;
+        let mut next = move || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        for _ in 0..300 {
+            let mut base = Snapshot {
+                tick: 7,
+                entities: BTreeMap::new(),
+            };
+            let mut cur = Snapshot {
+                tick: 9,
+                entities: BTreeMap::new(),
+            };
+            for id in 0..(next() % 60) {
+                let id = id * 3 + next() % 3; // ids dispersos
+                let e = EntityState {
+                    pos: [
+                        (next() % 2000) as i32 - 1000,
+                        (next() % 50) as i32,
+                        (next() % 2000) as i32 - 1000,
+                    ],
+                    data: (next() % 3) as u16,
+                };
+                match next() % 5 {
+                    0 => {
+                        base.entities.insert(id, e.clone());
+                    } // desaparece
+                    1 => {
+                        cur.entities.insert(id, e.clone());
+                    } // aparece
+                    2 => {
+                        base.entities.insert(id, e.clone());
+                        cur.entities.insert(id, e);
+                    } // igual
+                    _ => {
+                        base.entities.insert(id, e.clone());
+                        let mut m = e;
+                        if next() % 2 == 0 {
+                            m.pos[0] += (next() % 9) as i32 - 4;
+                        }
+                        if next() % 3 == 0 {
+                            m.pos[2] -= 1;
+                        }
+                        if next() % 4 == 0 {
+                            m.data += 1;
+                        }
+                        cur.entities.insert(id, m);
+                    }
+                }
+            }
+            assert_eq!(cur.encode_delta(&base), cur.encode_delta_referencia(&base));
+        }
     }
 }

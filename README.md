@@ -31,12 +31,14 @@ Requiere Rust 1.90 o superior (`rustup update`). No hace falta compilador de C.
     cargo run -p tsofgw-cli -- demo
     cargo run -p tsofgw-cli -- demo --profile pc
     cargo run -p tsofgw-cli -- dot
+    cargo run -p tsofgw-cli -- render --scene mixta -o mixta.png
+    cargo run --release -p tsofgw-cli -- loadtest --clients 200 --npcs 20000
 
-La demo mide, sobre un MMO mínimo, la simulación selectiva, el interés de los jugadores, el ahorro de red con snapshots delta y qué nodos descarta cada perfil por presupuesto.
+`loadtest` levanta un servidor y cientos de bots (sobre una red simulada con pérdida o sobre UDP real) y mide tiempo de tick, interés, ancho de banda y convergencia. La demo mide, sobre un MMO mínimo, la simulación selectiva, el interés de los jugadores, el ahorro de red con snapshots delta y qué nodos descarta cada perfil por presupuesto.
 
 ## Estado
 
-Versión 0.1.0, prototipo. Lo que está verificado y lo que no (sin render real, sin sandbox, firmas solo HMAC, sin transporte de red) está en `docs/07-estado-y-pendientes.md`.
+Versión 0.3.0, prototipo. Incluye un servidor autoritativo con transporte UDP autenticado (sin cifrado todavía), cliente con predicción y pruebas de carga medidas. Dibuja con un rasterizador por software verificado (`tsofgw render`); el backend de GPU con wgpu está escrito en `gpu/` pero aún no compilado con el wgpu real, y OpenXR no está empezado. Lo que está verificado y lo que no (sin sandbox, firmas solo HMAC, sin transporte de red) está en `docs/07-estado-y-pendientes.md`.
 
 ## Documentación
 
@@ -47,6 +49,7 @@ Versión 0.1.0, prototipo. Lo que está verificado y lo que no (sin render real,
 5. `docs/05-experiencia-del-desarrollador.md` — cómo se usa TSOFGW
 6. `docs/06-mundo-y-red.md` — mundo, shards y protocolo de red
 7. `docs/07-estado-y-pendientes.md` — estado verificado y pendientes
+8. `docs/08-red-en-linea.md` — transporte, servidor autoritativo y pruebas de carga
 
 ## Licencia
 

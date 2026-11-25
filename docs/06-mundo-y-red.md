@@ -30,6 +30,6 @@ Son cifras de un entorno concreto: sirven para comparar perfiles y detectar regr
 
 ## Límites conocidos
 - No hay entidades fantasma en las fronteras de shard: un jugador cerca del borde todavía no ve lo que está al otro lado si está en otro servidor.
-- No hay transporte real ni cifrado; el protocolo define el formato, no el canal.
+- El transporte real está en el documento 08 (UDP autenticado, sin cifrado todavía); este documento describe los bloques de codificación.
 - Las posiciones se cuantizan con un rango de ±33 millones de unidades por eje.
 - El costo declarado de los nodos es una declaración, no una medición. En la demo con 100 000 entidades y 200 jugadores, el tiempo real supera el presupuesto del perfil de consola aunque el costo declarado quepa. La medición del costo real y su comparación con el declarado es una tarea pendiente.

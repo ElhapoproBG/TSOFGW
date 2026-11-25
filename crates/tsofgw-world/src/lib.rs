@@ -4,6 +4,59 @@
 //! Todo es determinista: los resultados se devuelven ordenados.
 
 use std::collections::{HashMap, HashSet};
+use std::hash::{BuildHasherDefault, Hasher};
+
+/// Hash multiplicativo rápido (el de rustc, "Fx") para los mapas internos del mundo.
+///
+/// El hash estándar de Rust (SipHash) resiste ataques de colisiones a costa de velocidad. Aquí las
+/// claves son identificadores de entidad y coordenadas de celda que decide el servidor, no texto que
+/// controle un atacante, y estas consultas están en el camino caliente de cada tick.
+#[derive(Default, Clone, Copy)]
+pub struct FastHasher(u64);
+
+impl FastHasher {
+    #[inline]
+    fn add(&mut self, v: u64) {
+        self.0 = (self.0.rotate_left(5) ^ v).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+}
+
+impl Hasher for FastHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.add(b as u64);
+        }
+    }
+    #[inline]
+    fn write_u8(&mut self, i: u8) {
+        self.add(i as u64);
+    }
+    #[inline]
+    fn write_u16(&mut self, i: u16) {
+        self.add(i as u64);
+    }
+    #[inline]
+    fn write_u32(&mut self, i: u32) {
+        self.add(i as u64);
+    }
+    #[inline]
+    fn write_u64(&mut self, i: u64) {
+        self.add(i);
+    }
+    #[inline]
+    fn write_usize(&mut self, i: usize) {
+        self.add(i as u64);
+    }
+}
+
+pub type FastMap<K, V> = HashMap<K, V, BuildHasherDefault<FastHasher>>;
+pub type FastSet<T> = HashSet<T, BuildHasherDefault<FastHasher>>;
+/// Conjunto de celdas (lo que devuelve [`World::active_cells`]).
+pub type CellSet = FastSet<Cell>;
 
 pub type EntityId = u64;
 
@@ -42,8 +95,8 @@ pub struct CellMove {
 
 pub struct World {
     cell_size: f32,
-    cells: HashMap<Cell, Vec<EntityId>>,
-    entities: HashMap<EntityId, (Vec3, Cell)>,
+    cells: FastMap<Cell, Vec<EntityId>>,
+    entities: FastMap<EntityId, (Vec3, Cell)>,
 }
 
 impl World {
@@ -51,8 +104,8 @@ impl World {
         assert!(cell_size > 0.0);
         World {
             cell_size,
-            cells: HashMap::new(),
-            entities: HashMap::new(),
+            cells: FastMap::default(),
+            entities: FastMap::default(),
         }
     }
 
@@ -138,6 +191,15 @@ impl World {
 
     /// Entidades a distancia `<= r` de `center`, ordenadas por id.
     pub fn query_radius(&self, center: Vec3, r: f32) -> Vec<EntityId> {
+        self.query_radius_d2(center, r)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect()
+    }
+
+    /// Como [`World::query_radius`], pero devuelve también el cuadrado de la distancia de cada una
+    /// (evita repetir la búsqueda de posiciones). Ordenado por id.
+    pub fn query_radius_d2(&self, center: Vec3, r: f32) -> Vec<(EntityId, f32)> {
         let r2 = r * r;
         let lo = self.cell_of(Vec3::new(center.x - r, center.y - r, center.z - r));
         let hi = self.cell_of(Vec3::new(center.x + r, center.y + r, center.z + r));
@@ -145,8 +207,9 @@ impl World {
         let mut out = Vec::new();
         let mut visit = |ids: &[EntityId]| {
             for &id in ids {
-                if self.entities[&id].0.dist2(center) <= r2 {
-                    out.push(id);
+                let d2 = self.entities[&id].0.dist2(center);
+                if d2 <= r2 {
+                    out.push((id, d2));
                 }
             }
         };
@@ -166,13 +229,13 @@ impl World {
                 }
             }
         }
-        out.sort_unstable();
+        out.sort_unstable_by_key(|&(id, _)| id);
         out
     }
 
     /// Celdas ocupadas que tocan alguna esfera `(centro, radio)`: las regiones que deben simularse.
-    pub fn active_cells(&self, spheres: &[(Vec3, f32)]) -> HashSet<Cell> {
-        let mut set = HashSet::new();
+    pub fn active_cells(&self, spheres: &[(Vec3, f32)]) -> CellSet {
+        let mut set = CellSet::default();
         for &(c, r) in spheres {
             let lo = self.cell_of(Vec3::new(c.x - r, c.y - r, c.z - r));
             let hi = self.cell_of(Vec3::new(c.x + r, c.y + r, c.z + r));
@@ -204,7 +267,7 @@ impl World {
     }
 
     /// Entidades que están en las celdas dadas (las únicas que hace falta simular), ordenadas.
-    pub fn entities_in_cells(&self, cells: &HashSet<Cell>) -> Vec<EntityId> {
+    pub fn entities_in_cells(&self, cells: &CellSet) -> Vec<EntityId> {
         let mut v: Vec<EntityId> = cells
             .iter()
             .flat_map(|c| self.entities_in(*c).iter().copied())
@@ -226,7 +289,8 @@ pub struct InterestDelta {
 /// una entidad en el borde no entre y salga en cada tick.
 pub struct Interest {
     hysteresis: f32,
-    seen: HashMap<EntityId, HashSet<EntityId>>,
+    /// Lo que ve cada observador, siempre ordenado por id.
+    seen: FastMap<EntityId, Vec<EntityId>>,
 }
 
 impl Interest {
@@ -234,18 +298,18 @@ impl Interest {
         assert!(hysteresis >= 1.0);
         Interest {
             hysteresis,
-            seen: HashMap::new(),
+            seen: FastMap::default(),
         }
     }
 
-    /// Conjunto visible actualmente por un observador.
+    /// Conjunto visible actualmente por un observador (ordenado).
     pub fn visible(&self, observer: EntityId) -> Vec<EntityId> {
-        let mut v: Vec<EntityId> = self
-            .seen
-            .get(&observer)
-            .map_or(vec![], |s| s.iter().copied().collect());
-        v.sort_unstable();
-        v
+        self.visible_ids(observer).to_vec()
+    }
+
+    /// Lo mismo, sin copiar.
+    pub fn visible_ids(&self, observer: EntityId) -> &[EntityId] {
+        self.seen.get(&observer).map_or(&[], |v| v.as_slice())
     }
 
     /// Recalcula la visibilidad de cada `(observador, radio)` y devuelve los cambios.
@@ -256,7 +320,7 @@ impl Interest {
         observers: &[(EntityId, f32)],
     ) -> HashMap<EntityId, InterestDelta> {
         let mut deltas = HashMap::new();
-        let keep: HashSet<EntityId> = observers.iter().map(|o| o.0).collect();
+        let keep: FastSet<EntityId> = observers.iter().map(|o| o.0).collect();
         self.seen.retain(|k, _| keep.contains(k));
         for &(obs, radius) in observers {
             let Some(pos) = world.position(obs) else {
@@ -264,25 +328,45 @@ impl Interest {
                 continue;
             };
             let prev = self.seen.remove(&obs).unwrap_or_default();
-            let mut now = HashSet::new();
-            for id in world.query_radius(pos, radius * self.hysteresis) {
-                if id == obs {
-                    continue;
-                }
-                let d2 = world.position(id).map_or(f32::MAX, |p| p.dist2(pos));
-                if d2 <= radius * radius || prev.contains(&id) {
-                    now.insert(id);
-                }
-            }
-            let mut enter: Vec<EntityId> = now.difference(&prev).copied().collect();
-            let mut leave: Vec<EntityId> = prev.difference(&now).copied().collect();
-            enter.sort_unstable();
-            leave.sort_unstable();
+            let r2 = radius * radius;
+            // Los candidatos salen ordenados por id, así que `now` también lo está.
+            let now: Vec<EntityId> = world
+                .query_radius_d2(pos, radius * self.hysteresis)
+                .into_iter()
+                .filter(|&(id, d2)| id != obs && (d2 <= r2 || prev.binary_search(&id).is_ok()))
+                .map(|(id, _)| id)
+                .collect();
+            let (enter, leave) = diff_sorted(&prev, &now);
             self.seen.insert(obs, now);
             deltas.insert(obs, InterestDelta { enter, leave });
         }
         deltas
     }
+}
+
+/// `(en `now` y no en `prev`, en `prev` y no en `now`)` para dos listas ordenadas y sin repetidos.
+fn diff_sorted(prev: &[EntityId], now: &[EntityId]) -> (Vec<EntityId>, Vec<EntityId>) {
+    let (mut enter, mut leave) = (Vec::new(), Vec::new());
+    let (mut i, mut j) = (0, 0);
+    while i < prev.len() && j < now.len() {
+        match prev[i].cmp(&now[j]) {
+            std::cmp::Ordering::Less => {
+                leave.push(prev[i]);
+                i += 1;
+            }
+            std::cmp::Ordering::Greater => {
+                enter.push(now[j]);
+                j += 1;
+            }
+            std::cmp::Ordering::Equal => {
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    leave.extend_from_slice(&prev[i..]);
+    enter.extend_from_slice(&now[j..]);
+    (enter, leave)
 }
 
 /// Reparto de regiones del mundo entre servidores (shards) con *rendezvous hashing*:
@@ -579,5 +663,133 @@ mod tests {
         }
         let u = Rng::new(1).unit();
         assert!((0.0..1.0).contains(&u));
+    }
+
+    #[test]
+    fn query_con_distancias_coincide_con_fuerza_bruta() {
+        let mut rng = Rng::new(5);
+        let mut w = World::new(10.0);
+        let mut all = Vec::new();
+        for id in 0..2000u64 {
+            let p = Vec3::new(
+                rng.range(-200.0, 200.0),
+                rng.range(-20.0, 20.0),
+                rng.range(-200.0, 200.0),
+            );
+            w.spawn(id, p);
+            all.push((id, p));
+        }
+        for _ in 0..50 {
+            let c = Vec3::new(
+                rng.range(-200.0, 200.0),
+                rng.range(-20.0, 20.0),
+                rng.range(-200.0, 200.0),
+            );
+            let r = rng.range(1.0, 120.0);
+            let got = w.query_radius_d2(c, r);
+            let want: Vec<(u64, f32)> = all
+                .iter()
+                .map(|&(id, p)| (id, p.dist2(c)))
+                .filter(|&(_, d)| d <= r * r)
+                .collect();
+            assert_eq!(got, want);
+            assert_eq!(
+                w.query_radius(c, r),
+                want.iter().map(|x| x.0).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    /// Referencia ingenua (con conjuntos) de lo que debe producir `Interest::update`.
+    fn interes_ingenuo(
+        w: &World,
+        prev: &HashMap<u64, HashSet<u64>>,
+        obs: &[(u64, f32)],
+        hyst: f32,
+    ) -> HashMap<u64, HashSet<u64>> {
+        let mut out = HashMap::new();
+        for &(o, r) in obs {
+            let pos = w.position(o).unwrap();
+            let empty = HashSet::new();
+            let before = prev.get(&o).unwrap_or(&empty);
+            let mut now = HashSet::new();
+            for id in w.query_radius(pos, r * hyst) {
+                if id != o && (w.position(id).unwrap().dist2(pos) <= r * r || before.contains(&id))
+                {
+                    now.insert(id);
+                }
+            }
+            out.insert(o, now);
+        }
+        out
+    }
+
+    #[test]
+    fn interes_coincide_con_la_referencia_ingenua_durante_cientos_de_ticks() {
+        let mut rng = Rng::new(9);
+        let mut w = World::new(16.0);
+        let mut im = Interest::new(1.3);
+        for id in 0..400u64 {
+            w.spawn(
+                id,
+                Vec3::new(rng.range(-150.0, 150.0), 0.0, rng.range(-150.0, 150.0)),
+            );
+        }
+        let observers: Vec<(u64, f32)> = (0..20u64).map(|i| (i, 30.0 + i as f32)).collect();
+        let mut reference: HashMap<u64, HashSet<u64>> = HashMap::new();
+        for tick in 0..300 {
+            for id in 0..400u64 {
+                let Some(p) = w.position(id) else { continue };
+                w.move_to(
+                    id,
+                    Vec3::new(p.x + rng.range(-3.0, 3.0), 0.0, p.z + rng.range(-3.0, 3.0)),
+                );
+            }
+            if tick % 50 == 25 {
+                w.despawn(100 + tick as u64 / 50);
+            }
+            let deltas = im.update(&w, &observers);
+            reference = interes_ingenuo(&w, &reference, &observers, 1.3);
+            for &(o, _) in &observers {
+                let want: Vec<u64> = {
+                    let mut v: Vec<u64> = reference[&o].iter().copied().collect();
+                    v.sort_unstable();
+                    v
+                };
+                assert_eq!(im.visible_ids(o), &want[..], "tick {tick} observador {o}");
+                // Los deltas son consistentes: lo visible = lo anterior + entradas - salidas.
+                let d = &deltas[&o];
+                assert!(d.enter.iter().all(|e| want.contains(e)));
+                assert!(d.leave.iter().all(|l| !want.contains(l)));
+            }
+        }
+    }
+
+    #[test]
+    fn diff_ordenado() {
+        assert_eq!(diff_sorted(&[], &[]), (vec![], vec![]));
+        assert_eq!(diff_sorted(&[1, 2, 3], &[]), (vec![], vec![1, 2, 3]));
+        assert_eq!(diff_sorted(&[], &[1, 2]), (vec![1, 2], vec![]));
+        assert_eq!(
+            diff_sorted(&[1, 3, 5, 9], &[2, 3, 6, 9, 10]),
+            (vec![2, 6, 10], vec![1, 5])
+        );
+    }
+
+    #[test]
+    fn hash_rapido_reparte_bien_claves_secuenciales() {
+        let mut m: FastMap<u64, u64> = FastMap::default();
+        for i in 0..100_000u64 {
+            m.insert(i, i * 2);
+        }
+        assert_eq!(m.len(), 100_000);
+        assert!((0..100_000u64).all(|i| m[&i] == i * 2));
+        let mut cells: CellSet = CellSet::default();
+        for x in -50..50 {
+            for z in -50..50 {
+                cells.insert(Cell { x, y: 0, z });
+            }
+        }
+        assert_eq!(cells.len(), 10_000);
     }
 }

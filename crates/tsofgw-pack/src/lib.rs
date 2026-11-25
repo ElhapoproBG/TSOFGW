@@ -163,6 +163,43 @@ pub fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
     outer.finalize()
 }
 
+/// Clave HMAC-SHA256 con los estados interno y externo ya calculados: cada `mac` se salta
+/// las dos compresiones del relleno de clave. Pensada para firmar muchos mensajes con la misma clave
+/// (por ejemplo, un paquete de red tras otro).
+#[derive(Clone)]
+pub struct HmacKey {
+    inner: Sha256,
+    outer: Sha256,
+}
+
+impl HmacKey {
+    pub fn new(key: &[u8]) -> Self {
+        let mut k = [0u8; 64];
+        if key.len() > 64 {
+            k[..32].copy_from_slice(&sha256(key));
+        } else {
+            k[..key.len()].copy_from_slice(key);
+        }
+        let mut inner = Sha256::new();
+        inner.update(&k.map(|b| b ^ 0x36));
+        let mut outer = Sha256::new();
+        outer.update(&k.map(|b| b ^ 0x5c));
+        HmacKey { inner, outer }
+    }
+
+    /// HMAC de la concatenación de `parts`, sin copiarlas a un búfer intermedio.
+    pub fn mac(&self, parts: &[&[u8]]) -> [u8; 32] {
+        let mut inner = self.inner.clone();
+        for p in parts {
+            inner.update(p);
+        }
+        let digest = inner.finalize();
+        let mut outer = self.outer.clone();
+        outer.update(&digest);
+        outer.finalize()
+    }
+}
+
 pub fn to_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -177,7 +214,8 @@ pub fn from_hex(s: &str) -> Option<Vec<u8>> {
         .collect()
 }
 
-fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+/// Comparación en tiempo constante (respecto del contenido) de dos secuencias de bytes.
+pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }
@@ -768,5 +806,44 @@ mod tests {
             check_load(&s, &p, &m, payload, &contrato(&["net"])),
             Err(LoadError::Revoked)
         );
+    }
+
+    #[test]
+    fn hmac_key_igual_a_hmac_sha256() {
+        // Claves cortas, de 64 bytes exactos y largas; mensajes de varios tamaños y partidos en trozos.
+        for klen in [0usize, 1, 20, 63, 64, 65, 131] {
+            let key: Vec<u8> = (0..klen).map(|i| (i * 7 + 3) as u8).collect();
+            let hk = HmacKey::new(&key);
+            for mlen in [0usize, 1, 55, 56, 63, 64, 65, 200, 1500] {
+                let msg: Vec<u8> = (0..mlen).map(|i| (i * 13 + 5) as u8).collect();
+                let expected = hmac_sha256(&key, &msg);
+                assert_eq!(hk.mac(&[&msg]), expected, "klen {klen} mlen {mlen}");
+                let cut = mlen / 3;
+                assert_eq!(hk.mac(&[&msg[..cut], &msg[cut..]]), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn hmac_key_vectores_rfc4231() {
+        // Caso 1 y caso 2 de RFC 4231.
+        let hk = HmacKey::new(&[0x0b; 20]);
+        assert_eq!(
+            to_hex(&hk.mac(&[b"Hi There"])),
+            "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
+        );
+        let hk = HmacKey::new(b"Jefe");
+        assert_eq!(
+            to_hex(&hk.mac(&[b"what do ya want ", b"for nothing?"])),
+            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+        );
+    }
+
+    #[test]
+    fn ct_eq_compara_bien() {
+        assert!(ct_eq(b"abc", b"abc"));
+        assert!(!ct_eq(b"abc", b"abd"));
+        assert!(!ct_eq(b"abc", b"ab"));
+        assert!(ct_eq(b"", b""));
     }
 }

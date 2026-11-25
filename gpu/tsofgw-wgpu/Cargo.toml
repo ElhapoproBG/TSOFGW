@@ -1,0 +1,18 @@
+[package]
+name = "tsofgw-wgpu"
+version = "0.3.0"
+edition = "2021"
+rust-version = "1.90"
+license = "Apache-2.0"
+description = "TSOFGW: backend gráfico de GPU con wgpu (render fuera de pantalla con lectura de píxeles)"
+
+[dependencies]
+wgpu = "30"
+pollster = "0.4"
+tsofgw-core = { path = "../../crates/tsofgw-core" }
+tsofgw-hal = { path = "../../crates/tsofgw-hal" }
+tsofgw-soft = { path = "../../crates/tsofgw-soft" }
+
+# Crate independiente: no forma parte del espacio de trabajo principal, para que `cargo test`
+# de la raíz siga sin necesitar descargar wgpu.
+[workspace]

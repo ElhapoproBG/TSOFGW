@@ -1,0 +1,12 @@
+[package]
+name = "tsofgw-online"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "TSOFGW: protocolo de juego en línea, servidor autoritativo con interés y regiones activas, cliente con predicción y bots"
+
+[dependencies]
+tsofgw-net = { path = "../tsofgw-net" }
+tsofgw-world = { path = "../tsofgw-world" }
+tsofgw-transport = { path = "../tsofgw-transport" }

@@ -1,13 +1,17 @@
 //! `tsofgw`: herramienta de línea de comandos de TSOFGW.
 
 mod demo;
+mod online;
 
 use std::fs;
 use std::path::Path;
-use tsofgw_hal::Profile;
+use tsofgw_core::Transform;
+use tsofgw_hal::scene::{render_mono, render_stereo, Scene};
+use tsofgw_hal::{HeadlessXr, Profile};
 use tsofgw_pack::{
     check_manifest, sha256, to_hex, HmacScheme, Manifest, Policy, Trust, TrustStore,
 };
+use tsofgw_soft::{png, SoftGraphics};
 
 const AYUDA: &str = "\
 tsofgw — The Seed of the Great World
@@ -16,10 +20,20 @@ USO:
   tsofgw version
   tsofgw demo [--profile vr|vr-120|pc|consola] [--entities N] [--players N] [--ticks N] [--seed N]
   tsofgw dot [--profile P]                      Grafo de la demo en formato Graphviz (DOT)
+  tsofgw render [--scene triangulo|cubo|mixta] [--size AxB] [--stereo] [-o salida.png]
+                                                Dibuja una escena por software y la guarda como PNG
   tsofgw hash <archivo>                         SHA-256 de un archivo
   tsofgw pack <payload> --name N --version X.Y [--caps a,b] [--signer S --key-file K] [-o salida]
   tsofgw verify <manifiesto> <payload> [--signer S --key-file K] [--trust official|certified] [--allow-unsigned]
   tsofgw new <nombre>                           Crea un proyecto nuevo que usa TSOFGW
+
+RED (servidor autoritativo, UDP autenticado):
+  tsofgw keygen -o master.key                   Clave maestra aleatoria (no sobrescribe)
+  tsofgw token --master-file K --player ID      Clave de una cuenta
+  tsofgw serve --master-file K [--bind IP:PUERTO] [--npcs N] [--duration S]
+  tsofgw bots --master-file K --connect IP:PUERTO [--count N] [--duration S]
+  tsofgw loadtest [--clients N] [--npcs N] [--seconds S] [--loss P] [--latency MS] [--jitter MS] [--udp]
+                                                Servidor + bots; informe medido
 ";
 
 fn flag(args: &[String], name: &str) -> Option<String> {
@@ -93,6 +107,11 @@ fn read_key(path: &str) -> Result<Vec<u8>, String> {
 }
 
 fn cmd_demo(args: &[String]) -> Result<(), String> {
+    online::reject_unknown(
+        args,
+        &["--profile", "--entities", "--players", "--ticks", "--seed"],
+        &[],
+    )?;
     let cfg = demo::DemoConfig {
         profile: profile(args)?,
         entities: num(args, "--entities", 50_000)?,
@@ -108,6 +127,7 @@ fn cmd_demo(args: &[String]) -> Result<(), String> {
 }
 
 fn cmd_dot(args: &[String]) -> Result<(), String> {
+    online::reject_unknown(args, &["--profile"], &[])?;
     let cfg = demo::DemoConfig {
         profile: profile(args)?,
         entities: 100,
@@ -118,6 +138,57 @@ fn cmd_dot(args: &[String]) -> Result<(), String> {
     let mut d = demo::build_graph(&cfg);
     d.graph.resolve();
     print!("{}", d.graph.to_dot());
+    Ok(())
+}
+
+fn parse_size(s: &str) -> Result<(u32, u32), String> {
+    let (w, h) = s
+        .split_once(['x', 'X'])
+        .ok_or("el tamaño debe ser AnchoxAlto, por ejemplo 800x600")?;
+    let (w, h): (u32, u32) = (
+        w.parse().map_err(|_| "ancho inválido")?,
+        h.parse().map_err(|_| "alto inválido")?,
+    );
+    if !(16..=4096).contains(&w) || !(16..=4096).contains(&h) {
+        return Err("el ancho y el alto deben estar entre 16 y 4096".into());
+    }
+    Ok((w, h))
+}
+
+fn cmd_render(args: &[String]) -> Result<(), String> {
+    online::reject_unknown(args, &["--scene", "--size", "-o"], &["--stereo"])?;
+    let name = flag(args, "--scene").unwrap_or_else(|| "mixta".into());
+    let scene = Scene::demo(&name).ok_or(format!(
+        "escena desconocida: {name} (usa triangulo, cubo o mixta)"
+    ))?;
+    let (w, h) = parse_size(&flag(args, "--size").unwrap_or_else(|| "800x600".into()))?;
+    let out = flag(args, "-o").unwrap_or_else(|| "tsofgw.png".into());
+    let mut g = SoftGraphics::new(1, 1);
+    let (iw, ih, px) = if has(args, "--stereo") {
+        // cada ojo ocupa la mitad del ancho
+        let eye_w = w / 2;
+        (
+            eye_w * 2,
+            h,
+            render_stereo(&mut g, &scene, &HeadlessXr::new(), eye_w, h)
+                .ok_or("el backend no entregó la imagen")?,
+        )
+    } else {
+        (
+            w,
+            h,
+            render_mono(&mut g, &scene, &Transform::default(), w, h)
+                .ok_or("el backend no entregó la imagen")?,
+        )
+    };
+    let fondo = [scene.clear[0], scene.clear[1], scene.clear[2]]
+        .map(|c| (c.clamp(0.0, 1.0) * 255.0 + 0.5) as u8);
+    let dibujados = px.chunks_exact(4).filter(|p| p[..3] != fondo).count();
+    fs::write(&out, png::encode_rgba(iw, ih, &px))
+        .map_err(|e| format!("no se pudo escribir {out}: {e}"))?;
+    println!(
+        "escena '{name}' dibujada por software: {iw}x{ih}, {dibujados} píxeles con objetos → {out}"
+    );
     Ok(())
 }
 
@@ -297,10 +368,16 @@ fn run() -> Result<(), String> {
         }
         "demo" => cmd_demo(rest),
         "dot" => cmd_dot(rest),
+        "render" => cmd_render(rest),
         "hash" => cmd_hash(rest),
         "pack" => cmd_pack(rest),
         "verify" => cmd_verify(rest),
         "new" => cmd_new(rest),
+        "keygen" => online::cmd_keygen(rest),
+        "token" => online::cmd_token(rest),
+        "serve" => online::cmd_serve(rest),
+        "bots" => online::cmd_bots(rest),
+        "loadtest" => online::cmd_loadtest(rest),
         otro => Err(format!("comando desconocido: {otro}\n\n{AYUDA}")),
     }
 }
@@ -347,5 +424,15 @@ mod tests {
         assert!(valid_project_name("mi-juego_2"));
         assert!(!valid_project_name("2juego"));
         assert!(!valid_project_name("../x"));
+    }
+
+    #[test]
+    fn tamanos_de_imagen() {
+        assert_eq!(parse_size("800x600"), Ok((800, 600)));
+        assert_eq!(parse_size("64X32"), Ok((64, 32)));
+        assert!(parse_size("800").is_err());
+        assert!(parse_size("axb").is_err());
+        assert!(parse_size("8x8").is_err());
+        assert!(parse_size("5000x100").is_err());
     }
 }

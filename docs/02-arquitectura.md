@@ -8,9 +8,11 @@
 | `tsofgw-world` | Rejilla espacial 3D, consultas por radio, gestión de interés con histéresis, regiones activas, reparto en shards (rendezvous hashing) | Implementado y probado |
 | `tsofgw-net` | Codificación binaria, snapshots completos y delta, cabecera con seq/ack, predicción y reconciliación | Implementado y probado (sin transporte) |
 | `tsofgw-hal` | Interfaces de gráficos, XR y entrada; perfiles `vr`, `vr-120`, `pc`, `consola`; backends headless | Interfaces y headless; sin backends reales |
+| `tsofgw-transport` | Transporte UDP autenticado: handshake con cookie, MAC por paquete, anti-replay, fragmentación, sesiones, red simulada | Implementado y probado; sin cifrado |
+| `tsofgw-online` | Protocolo de juego, servidor autoritativo (créditos de input, regiones activas, interés, snapshots delta), cliente con predicción, bots, banco de pruebas | Implementado y probado; un solo hilo |
 | `tsofgw-pack` | SHA-256, HMAC, manifiestos de módulo, niveles de confianza, política de permisos, revocación | Implementado; firmas asimétricas pendientes |
 | `tsofgw-sys` | FFI a C con respaldo en Rust puro | Implementado |
-| `tsofgw-cli` | Herramienta `tsofgw`: demo, dot, hash, pack, verify, new | Implementado |
+| `tsofgw-cli` | Herramienta `tsofgw`: demo, dot, render, hash, pack, verify, new, keygen, token, serve, bots, loadtest | Implementado |
 
 ## Capas
 1. **Hardware (HAL):** wgpu/Vulkan/Metal/D3D12, OpenXR, audio, entrada. Rust; C vía `tsofgw-sys`.
@@ -56,7 +58,9 @@ El mismo grafo se particiona: el planificador decide qué subgrafo corre en cada
 - **H0 (hecho):** grafo + apagado selectivo + FFI a C.
 - **H1 (hecho):** contratos tipados, costos declarados con presupuesto, hot-swap.
 - **H1.5 (hecho, versión 0.1.0):** flujo de datos entre nodos, ejecución paralela por capas, exportación DOT, mundo con interés y shards, red con snapshots delta, HAL con perfiles y backends headless, módulos con manifiesto y confianza, herramienta `tsofgw`, demo medible, CI.
-- **H2 (pendiente):** backends reales: wgpu (PC) y OpenXR (VR); sandbox WebAssembly; firmas Ed25519; transporte de red real con cifrado.
+- **H2a (hecho, versión 0.2.0):** matemática de render (`Mat4`, cámaras, fov asimétrico de XR), escena y mallas, rasterizador por software (`tsofgw-soft`, verificado) con salida PNG y comparación de imágenes, comando `tsofgw render`. Backend de GPU con wgpu escrito (`gpu/`), **sin compilar todavía** con el wgpu real.
+- **H2c (hecho, versión 0.3.0):** transporte UDP autenticado, servidor autoritativo con cliente y bots, banco de pruebas de carga, optimización guiada por perfil. Ver documento 08.
+- **H2b (pendiente):** confirmar y ajustar el backend wgpu; ventana y presentación; backend OpenXR; sandbox WebAssembly; firmas Ed25519; cifrado AEAD del transporte.
 - **H3 (pendiente):** inspector gráfico en vivo; ejecución distribuida del grafo entre servidores; entidades fantasma en fronteras de shard.
 - **H4 (pendiente):** identidad federada entre juegos, interfaz HAL congelada para backends de terceros, certificación.
 

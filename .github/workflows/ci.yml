@@ -26,6 +26,8 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
       - name: Pruebas
         run: cargo test --all
+      - name: Prueba de carga (humo)
+        run: cargo run --release -p tsofgw-cli -- loadtest --clients 30 --npcs 2000 --seconds 6
 
   sin-c:
     name: pruebas con respaldo en Rust (sin compilador de C)
@@ -36,3 +38,18 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo test --all
+
+  gpu:
+    name: backend wgpu (Vulkan por software con lavapipe)
+    runs-on: ubuntu-latest
+    env:
+      TSOFGW_REQUIRE_GPU: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Controlador Vulkan por software
+        run: sudo apt-get update && sudo apt-get install -y mesa-vulkan-drivers libvulkan1
+      - name: Compilar
+        run: cargo build --release --manifest-path gpu/tsofgw-wgpu/Cargo.toml --all-targets
+      - name: Pruebas (GPU contra software)
+        run: cargo test --release --manifest-path gpu/tsofgw-wgpu/Cargo.toml -- --nocapture

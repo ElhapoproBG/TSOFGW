@@ -1,0 +1,11 @@
+[package]
+name = "tsofgw-soft"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "TSOFGW: backend gráfico por software (CPU) con z-buffer, y codificador PNG"
+
+[dependencies]
+tsofgw-core = { path = "../tsofgw-core" }
+tsofgw-hal = { path = "../tsofgw-hal" }
