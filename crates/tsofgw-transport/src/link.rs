@@ -210,6 +210,21 @@ impl SimNet {
         }
     }
 
+    /// Vuelve a abrir un extremo con una dirección que ya existió (el servidor que la usaba se cayó y
+    /// arranca de nuevo). Lo que llegó mientras nadie escuchaba se pierde, como pasaría con UDP hacia un
+    /// puerto cerrado: el extremo nuevo empieza con el buzón vacío. Solo para simulaciones.
+    pub fn rebind(&self, addr: SimAddr) -> SimLink {
+        let mut n = self.inner.borrow_mut();
+        n.inboxes.insert(addr.0, BinaryHeap::new());
+        if addr.0 >= n.next_addr {
+            n.next_addr = addr.0 + 1;
+        }
+        SimLink {
+            net: self.clone(),
+            addr,
+        }
+    }
+
     pub fn set_now(&self, now_ms: u64) {
         self.inner.borrow_mut().now = now_ms;
     }
@@ -347,6 +362,26 @@ mod tests {
         net.set_now(50);
         let got = drain(&mut b);
         assert_eq!(got, vec![(a.addr(), b"hola".to_vec())]);
+    }
+
+    #[test]
+    fn reabrir_una_direccion_descarta_lo_que_llego_mientras_nadie_escuchaba() {
+        let net = SimNet::new(SimConfig::default());
+        let (mut a, b) = (net.endpoint(), net.endpoint());
+        let baddr = b.addr();
+        a.send(baddr, b"antes de la caida");
+        drop(b);
+        a.send(baddr, b"con el servidor caido");
+        let mut b2 = net.rebind(baddr);
+        assert_eq!(b2.addr(), baddr, "misma direccion");
+        assert!(
+            drain(&mut b2).is_empty(),
+            "lo enviado durante la caida se perdio"
+        );
+        a.send(baddr, b"despues");
+        assert_eq!(drain(&mut b2), vec![(a.addr(), b"despues".to_vec())]);
+        // Una direccion nueva no choca con la reabierta.
+        assert_ne!(net.endpoint().addr(), baddr);
     }
 
     #[test]

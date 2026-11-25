@@ -2,6 +2,8 @@
 
 Esta capa (versión 0.4.0) permite que **un mismo mundo** lo sirvan varios procesos, cada uno dueño de una región. El jugador no debería notar los bordes: ve a quien está al otro lado, los NPC cruzan sin parpadear y su conexión pasa de un shard a otro sin perder estado.
 
+> Desde la 0.5.0 los shards pueden **guardar su estado en disco** y existe un **directorio de sesiones** que decide en qué shard vive cada cuenta. Eso cambia el traspaso de jugadores (cada paso importante se escribe antes de prometerse) y añade cuatro mensajes al bus: está explicado en el **documento 10**. Este documento describe el clúster sin esa capa, que sigue siendo el modo por defecto.
+
 ```
    jugadores (UDP autenticado, una clave por cuenta)
         │                       │                       │
@@ -58,6 +60,7 @@ Lo dirige **el cliente**, que es quien tiene la conexión. La autoridad cambia d
 - El estado que viaja incluye la posición y **el último input procesado**: el cliente reconcilia sin salto (en la prueba sin pérdida hubo **0 correcciones** y la posición predicha nunca avanzó más de un paso normal por tick, 0,376 u, tampoco al cambiar de shard). Al llegar, el jugador recibe créditos de input de recuperación para no perder terreno por el cambio.
 - **Histéresis:** `player_depth` (6 u) y un enfriamiento de 40 ticks tras cada traspaso o cancelación impiden que quien oscila sobre el borde salte de un lado a otro (hay una prueba: oscilar no traspasa, alejarse sí).
 - **Si el destino no responde** o el cliente no llega, el origen cancela (`ABORT`) pasados 200 ticks y el jugador sigue donde estaba; cuando la red vuelve, el traspaso se reintenta. Un jugador nunca queda sin dueño por una cancelación.
+- **Una vez enviado el `HANDOVER`, sin persistencia el origen acaba rindiéndose** si el acuse no llega (el jugador ya no está en el origen y el destino puede no haberlo recibido): una partición larga puede perder a ese jugador. Con persistencia el buzón de salida está en disco y no se rinde nunca (documento 10, sección 4).
 - **Un `JOIN` nuevo** (alguien que entra directamente a ese shard) aparece recortado dentro de la región del shard.
 - **Los contadores de tick son de cada proceso** (cada shard cuenta desde que arrancó). El cliente tolera cambiar a un shard cuya numeración va atrás: se descarta su historial de snapshots al cambiar (`just_switched`). Esto fue un defecto real encontrado al probar (ver 8).
 
@@ -71,8 +74,10 @@ Una abstracción (`PeerBus`) con dos implementaciones: `SimBus` (determinista, c
 | `NpcXfer` / `NpcXferAck` | traspaso de un NPC y su acuse |
 | `Prepare` / `PrepareAck` | el destino anota que espera a ese jugador y lo confirma |
 | `Activate` | el destino pide el estado final cuando el cliente ya llegó |
-| `Handover` / `HandoverAck` | **única** transferencia de autoridad y su acuse |
+| `Handover` / `HandoverAck` | **única** transferencia de autoridad y su acuse; lleva la **época** de la cuenta en el destino (la del origen más uno), para que una repetición vieja no se adopte otra vez |
 | `Abort` | el origen cancela un traspaso que no avanza |
+| `DirLogin` / `DirRoute` | solo con directorio (0.5.0): un shard pregunta dónde vive una cuenta y el directorio contesta con `(shard, época)` |
+| `DirTransfer` / `DirResult` | solo con directorio (0.5.0): el cambio de dueño de una cuenta (*compare-and-swap* sobre la época) y su respuesta (`Committed`, `Rejected` o `Unknown`) |
 
 **Todo mensaje cabe en un datagrama** (`MAX_PEER_MSG` = 1154 B): no hay fragmentación ni reensamblado entre shards. Las listas de fantasmas se parten en trozos de tamaño exacto (`ghost_chunks`, que calcula las longitudes sin codificar), y `SimBus` descarta y cuenta lo que no cabría para que las pruebas demuestren que todo lo que se envía cabría en UDP.
 
@@ -87,7 +92,7 @@ La etiqueta se calcula con `bus_key = HMAC(clave_de_cluster, "tsofgw/bus-key/v1"
 
 - **No responde nunca** a lo que recibe y **solo envía a las direcciones configuradas** (`--peers`): no se le puede usar para amplificar ni para reflejar tráfico.
 - El contador parte de `reloj_ms × 1000`, así que **sigue creciendo tras un reinicio** y las capturas antiguas no se repiten.
-- **Resumen de configuración** (`ClusterConfig::digest`): una huella de lo que debe ser igual en todos los shards (rejilla, tick, radios, NPC —cuántos, velocidad y semilla— y margen). Un shard con otra configuración es auténtico pero **incompatible**: sus datagramas se rechazan y se cuentan aparte («por otra configuración de mundo»), y no mezcla mundos distintos. Lo que es política local (hilos, límites de jugadores, reintentos…) no cuenta.
+- **Resumen de configuración** (`ClusterConfig::digest`): una huella de lo que debe ser igual en todos los shards (rejilla, si hay directorio, tick, radios, NPC —cuántos, velocidad y semilla— y margen). Un shard con otra configuración es auténtico pero **incompatible**: sus datagramas se rechazan y se cuentan aparte («por otra configuración de mundo»), y no mezcla mundos distintos. Lo que es política local (hilos, límites de jugadores, reintentos…) no cuenta. **La 0.5.0 cambió el formato de `Handover` (lleva la época) y la huella (ahora incluye si hay directorio): un shard de la 0.4.x y uno de la 0.5.0 se rechazan mutuamente como «otra configuración de mundo». Actualiza todo el clúster a la vez.**
 - Lectura acotada (8192 datagramas por vuelta) y tolerancia a `ConnectionReset` de Windows.
 
 ## 6. Garantías y cómo se comprueban
@@ -105,6 +110,7 @@ La etiqueta se calcula con `bus_key = HMAC(clave_de_cluster, "tsofgw/bus-key/v1"
 | Los shards no necesitan llevar la misma cuenta de ticks | un shard arranca 3 s tarde; tras cada cambio el tick del cliente queda a ≤ 3 del del servidor en un segundo |
 | Configuraciones distintas no se mezclan | la huella cambia con lo que importa y solo con eso |
 | **Sobre UDP real** (sockets de este equipo) | 2×2 con 42 traspasos y 0 datagramas rechazados; un intruso que forja datagramas con otra clave: todos rechazados y registrados (0 «mal formados», porque la etiqueta falla antes de interpretar nada); una clave de clúster distinta: los shards no se fían, no se completa ningún traspaso, no se aplica ningún fantasma y **no se pierde nada** |
+| **Persistencia y directorio** (0.5.0) | documento 10, sección 9: ninguna cuenta en dos shards ni sin dueño en ningún instante, ni siquiera con caídas en cada punto del traspaso |
 | **Procesos reales** | una prueba de la CLI lanza 2 procesos `serve --shard` (el segundo arranca más tarde, con otra cuenta de ticks) y 10 bots, 8 de ellos patrullando: todos siguen jugando, 0 cambios fallidos, 0 datagramas rechazados, y cada shard entrega y recibe jugadores. A mano también se probaron 4 procesos en rejilla 2×2 con 40 bots (82 cambios de shard, 0 fallidos) |
 
 ## 7. Cómo se pone en marcha
@@ -130,6 +136,8 @@ tsofgw loadtest --shards 2x2 --clients 200 --npcs 20000 --patrol 100
 tsofgw loadtest --shards 2x2 --clients 200 --npcs 20000 --patrol 100 --udp
 ```
 
+Para guardar el estado en disco y usar el directorio de sesiones (`--data-dir`, `--directory`, el comando `tsofgw directory`, `store info`…) véase el documento 10, sección 8.
+
 `serve` imprime cada 5 s una línea de clúster: NPC propios, copias, traspasos (completados/empezados, cancelados y llegadas), NPC traspasados y datagramas del bus rechazados o mal formados. Un número de «rechazados» que sube sin parar es una configuración distinta, una clave equivocada, un reloj desfasado o alguien probando.
 
 ## 8. Defectos encontrados al construirlo
@@ -143,8 +151,8 @@ tsofgw loadtest --shards 2x2 --clients 200 --npcs 20000 --patrol 100 --udp
 - **Solo medido en bucle local**: no hay mediciones en una red de verdad ni en varias máquinas. Los tiempos son de un sandbox de 2 núcleos.
 - **El bus está autenticado pero no cifrado.** Está pensado para una red privada entre servidores; no expongas sus puertos a internet. Necesita relojes sincronizados (NTP) con menos de 30 s de diferencia.
 - **Quien tenga la clave de clúster puede hacerse pasar por cualquier shard** (inyectar fantasmas o traspasos). Es una clave de infraestructura: trátala como tal y rótala si se filtra.
-- **No hay un directorio de sesiones entre shards:** cada shard garantiza «una cuenta, una sesión» solo localmente. Una cuenta con credenciales válidas podría estar conectada a la vez en dos shards.
-- **Sin persistencia:** un shard que se reinicia pierde su estado, y un `HANDOVER` perdido durante una partición larga de red puede perder a un jugador. Hace falta una capa de persistencia (documento 07).
+- **Sin directorio de sesiones, la unicidad de una cuenta es de mejor esfuerzo:** cada shard garantiza «una cuenta, una sesión» solo localmente. Con el directorio (0.5.0, documento 10) una cuenta vive en un solo shard; el directorio es un único proceso, sin alta disponibilidad.
+- **Sin `--data-dir`, un shard que se reinicia pierde su estado, y un `HANDOVER` perdido durante una partición larga de red puede perder a un jugador.** Con persistencia (0.5.0) no ocurre (documento 10); es opcional y no es el modo por defecto.
 - **Reparto estático** en rejilla: no hay equilibrado dinámico de carga ni fusión/división de regiones.
 - **Memoria por shard proporcional al total de NPC** (cada shard reserva todos los ids aunque solo simule los suyos).
 - Un clúster de procesos reales se probó en una sola máquina; falta probar fallos de máquinas (apagar un shard en caliente) y latencias de WAN.

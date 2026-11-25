@@ -24,6 +24,9 @@ const SNAPSHOT_RING: usize = 32;
 const INTERP_DELAY_TICKS: f64 = 2.0;
 /// Plazo (ms) para que el shard de destino dé la bienvenida; si no, se abandona ese intento.
 const PENDING_TIMEOUT_MS: u64 = 8000;
+/// Cuántas redirecciones seguidas se aceptan **antes de entrar** (un shard que no es el de la cuenta
+/// manda al cliente al correcto; más de esto es un bucle o un servidor que no sabe lo que hace).
+const MAX_LOGIN_REDIRECTS: u32 = 4;
 
 /// Lo que el cliente necesita para abrir una conexión nueva a otro shard.
 pub struct NewConnection<L: Link> {
@@ -67,6 +70,9 @@ pub struct ClientStats {
     pub switches: u64,
     /// Intentos de cambio que se abandonaron (el destino no respondió o cerró la conexión).
     pub switch_failures: u64,
+    /// Veces que, al pedir entrar, el servidor mandó al cliente a otro shard (el de su cuenta) y el
+    /// cliente lo siguió.
+    pub login_redirects: u64,
 }
 
 pub struct GameClient<L: Link> {
@@ -98,6 +104,8 @@ pub struct GameClient<L: Link> {
     /// Se acaba de cambiar de shard y falta el primer snapshot del nuevo: cada shard cuenta sus ticks
     /// desde que arrancó, así que el nuevo puede ir por detrás del anterior.
     just_switched: bool,
+    /// Redirecciones seguidas antes de entrar (se pone a cero al empezar a jugar).
+    login_hops: u32,
 }
 
 impl<L: Link> GameClient<L> {
@@ -133,6 +141,7 @@ impl<L: Link> GameClient<L> {
             old_lost: false,
             carried_out: (0, 0),
             just_switched: false,
+            login_hops: 0,
         }
     }
 
@@ -322,6 +331,42 @@ impl<L: Link> GameClient<L> {
         }
     }
 
+    /// Pidió entrar en un shard que no es el de su cuenta y este le dice cuál es. Como aún no hay estado
+    /// de juego que conservar, se abandona esta conexión y se entra por la del shard indicado. Sin
+    /// conector (o con un número de shard que no se conoce) la redirección se ignora, y tras demasiadas
+    /// seguidas se da por perdida la conexión: es un bucle.
+    fn follow_login_redirect(&mut self, now: u64, shard: u16) {
+        if self.login_hops >= MAX_LOGIN_REDIRECTS {
+            self.net.disconnect();
+            self.phase = Phase::Disconnected(DisconnectReason::ConnectFailed);
+            return;
+        }
+        let Some(conn) = self.connector.as_mut().and_then(|f| f(shard)) else {
+            return;
+        };
+        let fresh = SecureClient::new(
+            conn.link,
+            conn.server,
+            self.creds.clone(),
+            self.transport_cfg.clone(),
+            conn.entropy,
+        );
+        let mut old = std::mem::replace(&mut self.net, fresh);
+        let t = old.stats();
+        self.carried_out = (
+            self.carried_out.0 + t.bytes_out,
+            self.carried_out.1 + t.packets_out,
+        );
+        old.disconnect();
+        self.endpoint = Endpoint::default();
+        self.sent_at.clear();
+        self.last_join = None;
+        self.login_hops += 1;
+        self.stats.login_redirects += 1;
+        self.phase = Phase::Connecting;
+        let _ = now;
+    }
+
     fn send_message(&mut self, now: u64, kind: u8, body: &[u8]) {
         let hdr = self.endpoint.next_header();
         self.sent_at.insert(hdr.seq, now);
@@ -373,6 +418,7 @@ impl<L: Link> GameClient<L> {
                     self.input_seq = 0;
                     self.recent.clear();
                     self.next_input_at = now + self.tick_ms;
+                    self.login_hops = 0;
                     self.phase = Phase::Playing;
                 }
             }
@@ -383,6 +429,10 @@ impl<L: Link> GameClient<L> {
                 let acked = self.endpoint.on_receive(&hdr);
                 self.on_ack(now, acked);
                 self.stats.redirects += 1;
+                if self.phase == Phase::Joining && self.pending.is_none() {
+                    self.follow_login_redirect(now, shard);
+                    return;
+                }
                 if self.phase != Phase::Playing
                     || self.pending.as_ref().is_some_and(|p| p.shard == shard)
                 {

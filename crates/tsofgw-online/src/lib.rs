@@ -15,8 +15,10 @@ pub mod bus;
 mod client;
 pub mod cluster_scenario;
 pub mod cluster_udp;
+pub mod directory;
 pub mod par;
 pub mod partition;
+pub mod persist;
 pub mod protocol;
 mod replicate;
 pub mod scenario;
@@ -27,8 +29,16 @@ pub mod udp_bus;
 
 pub use bot::Bot;
 pub use client::{ClientStats, Connector, GameClient, NewConnection, Phase};
+pub use directory::{
+    rebuild_from_shards, summarize_directory_store, Directory, DirectoryConfig, DirectoryStats,
+    DirectorySummary, RebuildReport,
+};
+pub use persist::{
+    summarize_shard_store, PersistConfig, PersistStats, RestoreReport, ShardStoreSummary,
+};
 pub use replicate::{default_lod, LodBand};
 pub use server::{
-    ClusterConfig, ClusterStats, GameConfig, GameServer, GameStats, KIND_NPC, KIND_PLAYER, NPC_BASE,
+    AccountRecords, ClusterConfig, ClusterStats, GameConfig, GameServer, GameStats, NpcDump,
+    OutboxEntry, KIND_NPC, KIND_PLAYER, NPC_BASE,
 };
 pub use udp_bus::{UdpBus, UdpBusStats};

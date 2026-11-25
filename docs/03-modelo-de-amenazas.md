@@ -31,7 +31,18 @@ Añade un segundo canal de red, el **bus entre shards**, y con él nuevas amenaz
 - **Shard mal configurado o con otro mundo:** cada datagrama lleva una huella de la configuración que debe coincidir (rejilla, tick, radios, NPC, semilla); si no coincide se rechaza y se cuenta aparte.
 - **Cliente que intenta aprovechar un traspaso:** el estado del jugador lo envía el shard de origen, nunca el cliente; el destino solo adopta un `HANDOVER` del mismo shard que lo preparó, para esa cuenta, y después de que el cliente se autenticara con su propia clave. La autoridad cambia en un único mensaje.
 - **Reinicio de un shard con capturas antiguas:** el contador del bus parte del reloj, así que sigue creciendo tras un reinicio y las capturas previas no se aceptan.
-- **No cubierto aún:** confidencialidad del bus (no hay cifrado; usar solo en una red privada), **la clave de clúster es un punto único de confianza** (quien la tenga puede suplantar a cualquier shard), no hay directorio de sesiones entre shards (una cuenta podría abrir dos sesiones en shards distintos), ni persistencia que permita recuperar un shard comprometido o reiniciado.
+- **No cubierto aún:** confidencialidad del bus (no hay cifrado; usar solo en una red privada) y **la clave de clúster es un punto único de confianza** (quien la tenga puede suplantar a cualquier shard y, desde la 0.5.0, al directorio de sesiones). El directorio de sesiones y la persistencia que faltaban aquí llegaron en la 0.5.0 (sección siguiente).
+
+## Persistencia y directorio de sesiones (0.5.0)
+Añade datos en disco y un nuevo proceso con autoridad sobre las cuentas; detalle en el documento 10.
+- **Una cuenta en dos shards, o en ninguno:** el cambio de dueño es una operación atómica del directorio sobre una época (*compare-and-swap*), anotada en disco antes de responderse; el origen no envía el estado hasta tenerla anotada y el destino no acusa hasta haberlo escrito. Un `HANDOVER` repetido, tardío o con una época que el destino ya conoce no resucita ni hace retroceder a nadie. Se vigila durante toda la marcha de las pruebas, con caídas en cada punto del traspaso.
+- **Carpeta de datos alterada por alguien sin la clave:** cada registro y cada checkpoint llevan un HMAC-SHA256 (la secuencia y la generación entran en la etiqueta); un daño o una edición se detecta, y la carpeta de otro mundo, de otro shard o con otra clave se rechaza sin tocarla.
+- **Tampoco se detecta lo que parece una escritura a medias:** un cambio en los **últimos 8 MiB del diario** es indistinguible de una caída y se descarta sin error (la señal es `torn_bytes` mayor que cero sin que hubiera caída).
+- **Copia vieja devuelta a su sitio (retroceso):** **no se detecta**. La clave autentica el contenido, no la frescura: quien pueda reemplazar la carpeta de un shard puede devolver el estado de ayer. Hace falta un ancla fuera de esa máquina (pendiente).
+- **Confidencialidad en reposo:** **no hay cifrado**; la carpeta contiene cuentas y posiciones en claro, autenticadas.
+- **Directorio comprometido o suplantado:** quien tenga la clave de clúster puede enviar `DirRoute` y `DirResult` falsos (reasignar cuentas, hacer que un shard crea que una cuenta es suya). Es la misma confianza total de siempre, con más alcance.
+- **Directorio caído:** nadie puede entrar ni cruzar bordes con una cuenta mientras no vuelva (lo que ya está jugando sigue jugando y no se pierde a nadie). Es un solo proceso, sin réplica ni sustitución automática.
+- **Disco que falla:** el shard (o el directorio) deja de prometer lo que no está en disco y hay que reiniciarlo; nunca miente sobre lo escrito.
 
 ## Estado de implementación del sistema de módulos (0.1.0)
 Implementado en `tsofgw-pack` y probado:

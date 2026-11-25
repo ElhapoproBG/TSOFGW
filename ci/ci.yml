@@ -6,13 +6,15 @@ name: CI
 on:
   push:
   pull_request:
+  # Solo para lanzar a mano el trabajo «mutaciones» (la prueba de las pruebas, que tarda decenas de minutos).
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 # Una ejecución nueva sobre la misma rama cancela la anterior que siga en marcha.
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: true
 
 # Todos los pasos usan bash (también en Windows) y el compilador sin colores, para que los registros y las
@@ -36,6 +38,7 @@ env:
 jobs:
   pruebas:
     name: pruebas (${{ matrix.os }})
+    if: ${{ github.event_name != 'workflow_dispatch' }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 40
     strategy:
@@ -63,6 +66,9 @@ jobs:
       - name: Pruebas
         if: ${{ !cancelled() && steps.rust.outcome == 'success' }}
         run: python ci/annotate.py "Pruebas (${{ matrix.os }})" --notice-grep '^test result:' -- cargo test --all
+      - name: Catálogo de mutantes (comprueba que cada parche de la prueba de las pruebas aún se aplica)
+        if: ${{ !cancelled() && runner.os == 'Linux' }}
+        run: python ci/annotate.py "Mutantes (catálogo)" -- python ci/mutaciones.py --check
       - name: Prueba de carga (humo)
         if: ${{ !cancelled() && steps.rust.outcome == 'success' }}
         run: python ci/annotate.py "Carga (${{ matrix.os }})" --notice-tail 33 -- cargo run --release -p tsofgw-cli -- loadtest --clients 30 --npcs 2000 --seconds 6
@@ -72,12 +78,16 @@ jobs:
       - name: Clúster de shards simulado (humo; falla si algo se pierde o se duplica)
         if: ${{ !cancelled() && steps.rust.outcome == 'success' }}
         run: python ci/annotate.py "Clúster simulado (${{ matrix.os }})" --notice-tail 30 -- cargo run --release -p tsofgw-cli -- loadtest --shards 2x1 --clients 20 --npcs 2000 --seconds 10 --patrol 10
+      - name: Clúster con persistencia, directorio de sesiones y tormenta de caídas (humo; falla si una cuenta se pierde o se duplica)
+        if: ${{ !cancelled() && steps.rust.outcome == 'success' }}
+        run: python ci/annotate.py "Clúster con caídas (${{ matrix.os }})" --notice-tail 24 -- cargo run --release -p tsofgw-cli -- loadtest --shards 2x2 --clients 32 --npcs 1500 --seconds 14 --directory --chaos 8 --chaos-seed 11
       - name: Clúster de shards sobre UDP real (humo)
         if: ${{ !cancelled() && steps.rust.outcome == 'success' && runner.os == 'Linux' }}
         run: python ci/annotate.py "Clúster UDP (${{ matrix.os }})" --notice-tail 30 -- cargo run --release -p tsofgw-cli -- loadtest --shards 2x1 --clients 20 --npcs 2000 --seconds 12 --patrol 10 --udp
 
   sin-c:
     name: pruebas con respaldo en Rust (sin compilador de C)
+    if: ${{ github.event_name != 'workflow_dispatch' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -97,6 +107,7 @@ jobs:
   # Comprueba que `rust-version` del Cargo.toml es verdad: compila y prueba con el compilador mínimo.
   version-minima:
     name: compilador mínimo declarado
+    if: ${{ github.event_name != 'workflow_dispatch' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -116,6 +127,7 @@ jobs:
   # avisos nuevos de Clippy y de cambios del compilador antes de subir `RUST_FIJA`.
   ultima-estable:
     name: Rust estable más reciente (informativo)
+    if: ${{ github.event_name != 'workflow_dispatch' }}
     runs-on: ubuntu-latest
     continue-on-error: true
     timeout-minutes: 30
@@ -142,6 +154,7 @@ jobs:
 
   gpu:
     name: backend wgpu (Vulkan por software con lavapipe)
+    if: ${{ github.event_name != 'workflow_dispatch' }}
     runs-on: ubuntu-latest
     timeout-minutes: 40
     env:
@@ -166,3 +179,23 @@ jobs:
       - name: Imagen de GPU contra imagen de software
         if: ${{ !cancelled() && steps.compilar.outcome == 'success' }}
         run: python ci/annotate.py "Imagen wgpu" --notice-tail 6 -- cargo run --release --manifest-path gpu/tsofgw-wgpu/Cargo.toml --bin gpu_render -- --scene mixta --size 320x240
+
+  # Solo se lanza a mano («Run workflow» en la pestaña Actions): estropea el código a propósito, de uno en uno,
+  # y exige que las pruebas lo noten. Un defecto que ninguna prueba nota es un hueco en la suite. Tarda decenas
+  # de minutos, así que no corre en cada push. Falla si algún defecto sobrevive.
+  mutaciones:
+    name: mutaciones (la prueba de las pruebas; solo a mano)
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Compilador de Rust
+        run: |
+          rustup toolchain install "$RUST_FIJA" --profile minimal --no-self-update
+          rustup default "$RUST_FIJA"
+      - name: Mutantes
+        run: python ci/annotate.py "Mutaciones" --notice-tail 80 -- python ci/mutaciones.py

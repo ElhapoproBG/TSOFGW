@@ -19,6 +19,8 @@ tsofgw-pack = { path = "../tsofgw-pack" }
 tsofgw-soft = { path = "../tsofgw-soft" }
 tsofgw-transport = { path = "../tsofgw-transport" }
 tsofgw-online = { path = "../tsofgw-online" }
+tsofgw-store = { path = "../tsofgw-store" }
+tsofgw-sys = { path = "../tsofgw-sys" }
 
 [dev-dependencies]
 tsofgw-soft = { path = "../tsofgw-soft" }

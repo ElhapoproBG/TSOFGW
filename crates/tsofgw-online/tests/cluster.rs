@@ -455,6 +455,30 @@ fn los_mensajes_hostiles_del_bus_no_rompen_ni_corrompen_nada() {
             player: 77_777,
             pos: [0, 0, 0],
             last_processed: 1,
+            epoch: 1,
+        },
+        // Mensajes del directorio de sesiones: ningún shard los puede enviar, y un shard no los atiende.
+        PeerMsg::DirRoute {
+            account: 77_777,
+            shard: 0,
+            epoch: 1,
+        },
+        PeerMsg::DirResult {
+            xfer: 1,
+            account: 77_777,
+            status: tsofgw_online::bus::DirStatus::Committed,
+            shard: 1,
+            epoch: 2,
+        },
+        PeerMsg::DirLogin {
+            account: 77_777,
+            home: 0,
+        },
+        PeerMsg::DirTransfer {
+            xfer: 1,
+            account: 77_777,
+            epoch: 1,
+            to: 1,
         },
         PeerMsg::Activate {
             xfer: 1,

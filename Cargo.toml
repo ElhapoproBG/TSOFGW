@@ -1,10 +1,10 @@
 [workspace]
-members = ["crates/tsofgw-core", "crates/tsofgw-sys", "crates/tsofgw-world", "crates/tsofgw-net", "crates/tsofgw-hal", "crates/tsofgw-soft", "crates/tsofgw-pack", "crates/tsofgw-transport", "crates/tsofgw-online", "crates/tsofgw-cli"]
+members = ["crates/tsofgw-core", "crates/tsofgw-sys", "crates/tsofgw-world", "crates/tsofgw-net", "crates/tsofgw-hal", "crates/tsofgw-soft", "crates/tsofgw-pack", "crates/tsofgw-transport", "crates/tsofgw-store", "crates/tsofgw-online", "crates/tsofgw-cli"]
 resolver = "2"
 exclude = ["gpu"]
 
 [workspace.package]
-version = "0.4.3"
+version = "0.5.0"
 edition = "2021"
 rust-version = "1.90"
 license = "Apache-2.0"

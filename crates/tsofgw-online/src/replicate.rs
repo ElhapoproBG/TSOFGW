@@ -551,7 +551,7 @@ mod tests {
     }
 
     fn player(entity: u64, pos: [i32; 3], visible: Vec<u64>) -> Player {
-        let mut p = Player::new(entity, entity);
+        let mut p = Player::new(entity, entity, 0);
         p.state = PlayerState { pos };
         p.joined = true;
         p.visible = visible;

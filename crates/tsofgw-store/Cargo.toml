@@ -1,0 +1,10 @@
+[package]
+name = "tsofgw-store"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "TSOFGW: almacén clave-valor durable (diario con HMAC por registro, checkpoints atómicos, recuperación tras caídas)"
+
+[dependencies]
+tsofgw-pack = { path = "../tsofgw-pack" }

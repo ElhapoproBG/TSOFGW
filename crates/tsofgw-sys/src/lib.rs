@@ -8,6 +8,8 @@ extern "C" {
     fn tsofgw_hash64(data: *const u8, len: usize) -> u64;
 }
 
+pub mod stop;
+
 /// Qué implementación se compiló: `"c"` o `"rust"`.
 pub const BACKEND: &str = if cfg!(tsofgw_no_c) { "rust" } else { "c" };
 

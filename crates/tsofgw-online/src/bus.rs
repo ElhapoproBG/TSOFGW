@@ -12,16 +12,22 @@
 //! PREPARE   4 | xfer jugador pos último_input    «voy a pasarte a este jugador»
 //! PREP_ACK  5 | xfer jugador
 //! ACTIVATE  6 | xfer jugador                     «su cliente ya está conectado aquí: cédeme la autoridad»
-//! HANDOVER  7 | xfer jugador pos último_input    estado final: desde aquí manda el destino
+//! HANDOVER  7 | xfer jugador pos último_input época   estado final: desde aquí manda el destino
 //! HAND_ACK  8 | xfer jugador
 //! ABORT     9 | xfer jugador                     el traspaso se cancela
+//! DIR_LOGIN 10| cuenta casa                      shard → directorio: «esta cuenta quiere entrar; ¿dónde vive?»
+//! DIR_ROUTE 11| cuenta shard época               directorio → shard: dónde vive la cuenta
+//! DIR_XFER  12| xfer cuenta época destino        shard → directorio: «la cuenta pasa de mí a `destino`»
+//! DIR_RESULT 13| xfer cuenta estado shard época  directorio → shard: aceptado, rechazado o desconocida
 //! ```
+//! Los mensajes 10 a 13 solo viajan entre un shard y el **directorio de sesiones** (un par más del bus,
+//! con identificador `shard_count`); el directorio nunca recibe ni envía el resto.
 //! Todos los enteros van como varint (los con signo, en zigzag). El decodificador rechaza versiones
 //! desconocidas, mensajes truncados o con bytes sobrantes, ids repetidos o desordenados, flotantes no
 //! finitos y listas imposibles, sin reservar memoria en función de lo que diga el mensaje.
 
 use std::cmp::Reverse;
-use std::collections::BinaryHeap;
+use std::collections::{BTreeSet, BinaryHeap};
 use std::sync::{Arc, Mutex};
 
 use tsofgw_net::{varint_len, zigzag_len, DecodeError, EntityState, Reader, Writer};
@@ -30,7 +36,7 @@ use tsofgw_world::{EntityId, Rng};
 use crate::partition::ShardId;
 use crate::server::NPC_BASE;
 
-pub const PEER_VERSION: u8 = 1;
+pub const PEER_VERSION: u8 = 2;
 /// Tope de entidades por lista en un mensaje de fantasmas.
 pub const MAX_GHOSTS_PER_LIST: usize = 50_000;
 /// Tamaño máximo de un mensaje del bus. Cabe en un único datagrama UDP de 1200 bytes con la cabecera y
@@ -101,6 +107,9 @@ pub enum PeerMsg {
         player: u64,
         pos: [i32; 3],
         last_processed: u32,
+        /// Época que tendrá la cuenta en el destino (la del origen más uno). Una repetición con una
+        /// época que el destino ya conoce no se adopta otra vez.
+        epoch: u64,
     },
     HandoverAck {
         xfer: u32,
@@ -110,6 +119,45 @@ pub enum PeerMsg {
         xfer: u32,
         player: u64,
     },
+    /// Shard → directorio: la cuenta quiere entrar en este shard. Si el directorio no la conoce, la
+    /// registra en `home`.
+    DirLogin {
+        account: u64,
+        home: ShardId,
+    },
+    /// Directorio → shard: la cuenta vive en `shard` desde la época `epoch`.
+    DirRoute {
+        account: u64,
+        shard: ShardId,
+        epoch: u64,
+    },
+    /// Shard → directorio: «la cuenta, que según yo está aquí con la época `epoch`, pasa a `to`».
+    DirTransfer {
+        xfer: u32,
+        account: u64,
+        epoch: u64,
+        to: ShardId,
+    },
+    /// Directorio → shard: respuesta a un `DirTransfer`. `shard` y `epoch` son lo que el directorio
+    /// tiene ahora para la cuenta (cero si no la conoce).
+    DirResult {
+        xfer: u32,
+        account: u64,
+        status: DirStatus,
+        shard: ShardId,
+        epoch: u64,
+    },
+}
+
+/// Resultado de un `DirTransfer`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirStatus {
+    /// El directorio anotó el cambio (o ya lo había anotado: es idempotente).
+    Committed = 1,
+    /// El directorio tiene otro dueño u otra época para esa cuenta: el cambio no vale.
+    Rejected = 2,
+    /// El directorio no conoce la cuenta.
+    Unknown = 3,
 }
 
 fn put_list(w: &mut Writer, list: &[(EntityId, EntityState)]) {
@@ -228,6 +276,27 @@ fn get_u32(r: &mut Reader<'_>) -> Result<u32, DecodeError> {
     u32::try_from(r.varint()?).map_err(|_| DecodeError::VarintOverflow)
 }
 
+/// Una cuenta de jugador: nunca puede ocupar el rango de los NPC.
+fn get_account(r: &mut Reader<'_>) -> Result<u64, DecodeError> {
+    let a = r.varint()?;
+    if a >= NPC_BASE {
+        return Err(DecodeError::BadReference);
+    }
+    Ok(a)
+}
+
+/// Una época de cuenta: empiezan en 1 (0 significa «ninguna»).
+fn get_epoch(r: &mut Reader<'_>) -> Result<u64, DecodeError> {
+    match r.varint()? {
+        0 => Err(DecodeError::BadReference),
+        e => Ok(e),
+    }
+}
+
+fn get_shard(r: &mut Reader<'_>) -> Result<ShardId, DecodeError> {
+    ShardId::try_from(r.varint()?).map_err(|_| DecodeError::VarintOverflow)
+}
+
 fn get_pos(r: &mut Reader<'_>) -> Result<[i32; 3], DecodeError> {
     let mut pos = [0i32; 3];
     for c in &mut pos {
@@ -274,24 +343,71 @@ impl PeerMsg {
                 player,
                 pos,
                 last_processed,
-            }
-            | PeerMsg::Handover {
-                xfer,
-                player,
-                pos,
-                last_processed,
             } => {
-                w.u8(if matches!(self, PeerMsg::Prepare { .. }) {
-                    4
-                } else {
-                    7
-                });
+                w.u8(4);
                 w.varint(*xfer as u64);
                 w.varint(*player);
                 for c in pos {
                     w.zigzag(*c as i64);
                 }
                 w.varint(*last_processed as u64);
+            }
+            PeerMsg::Handover {
+                xfer,
+                player,
+                pos,
+                last_processed,
+                epoch,
+            } => {
+                w.u8(7);
+                w.varint(*xfer as u64);
+                w.varint(*player);
+                for c in pos {
+                    w.zigzag(*c as i64);
+                }
+                w.varint(*last_processed as u64);
+                w.varint(*epoch);
+            }
+            PeerMsg::DirLogin { account, home } => {
+                w.u8(10);
+                w.varint(*account);
+                w.varint(*home as u64);
+            }
+            PeerMsg::DirRoute {
+                account,
+                shard,
+                epoch,
+            } => {
+                w.u8(11);
+                w.varint(*account);
+                w.varint(*shard as u64);
+                w.varint(*epoch);
+            }
+            PeerMsg::DirTransfer {
+                xfer,
+                account,
+                epoch,
+                to,
+            } => {
+                w.u8(12);
+                w.varint(*xfer as u64);
+                w.varint(*account);
+                w.varint(*epoch);
+                w.varint(*to as u64);
+            }
+            PeerMsg::DirResult {
+                xfer,
+                account,
+                status,
+                shard,
+                epoch,
+            } => {
+                w.u8(13);
+                w.varint(*xfer as u64);
+                w.varint(*account);
+                w.u8(*status as u8);
+                w.varint(*shard as u64);
+                w.varint(*epoch);
             }
             PeerMsg::PrepareAck { xfer, player }
             | PeerMsg::Activate { xfer, player }
@@ -361,12 +477,20 @@ impl PeerMsg {
                 xfer: get_u32(&mut r)?,
                 player: r.varint()?,
             },
-            7 => PeerMsg::Handover {
-                xfer: get_u32(&mut r)?,
-                player: r.varint()?,
-                pos: get_pos(&mut r)?,
-                last_processed: get_u32(&mut r)?,
-            },
+            7 => {
+                let xfer = get_u32(&mut r)?;
+                let player = get_account(&mut r)?;
+                let pos = get_pos(&mut r)?;
+                let last_processed = get_u32(&mut r)?;
+                let epoch = get_epoch(&mut r)?;
+                PeerMsg::Handover {
+                    xfer,
+                    player,
+                    pos,
+                    last_processed,
+                    epoch,
+                }
+            }
             8 => PeerMsg::HandoverAck {
                 xfer: get_u32(&mut r)?,
                 player: r.varint()?,
@@ -375,6 +499,45 @@ impl PeerMsg {
                 xfer: get_u32(&mut r)?,
                 player: r.varint()?,
             },
+            10 => PeerMsg::DirLogin {
+                account: get_account(&mut r)?,
+                home: get_shard(&mut r)?,
+            },
+            11 => PeerMsg::DirRoute {
+                account: get_account(&mut r)?,
+                shard: get_shard(&mut r)?,
+                epoch: get_epoch(&mut r)?,
+            },
+            12 => PeerMsg::DirTransfer {
+                xfer: get_u32(&mut r)?,
+                account: get_account(&mut r)?,
+                epoch: get_epoch(&mut r)?,
+                to: get_shard(&mut r)?,
+            },
+            13 => {
+                let xfer = get_u32(&mut r)?;
+                let account = get_account(&mut r)?;
+                let status = match r.u8()? {
+                    1 => DirStatus::Committed,
+                    2 => DirStatus::Rejected,
+                    3 => DirStatus::Unknown,
+                    _ => return Err(DecodeError::BadReference),
+                };
+                let shard = get_shard(&mut r)?;
+                let epoch = r.varint()?;
+                // Una respuesta afirmativa o de rechazo describe un registro real (época ≥ 1); solo
+                // «desconocida» puede traer ceros.
+                if status != DirStatus::Unknown && epoch == 0 {
+                    return Err(DecodeError::BadReference);
+                }
+                PeerMsg::DirResult {
+                    xfer,
+                    account,
+                    status,
+                    shard,
+                    epoch,
+                }
+            }
             _ => return Err(DecodeError::BadReference),
         };
         r.finish()?;
@@ -413,6 +576,9 @@ pub struct BusStats {
     pub bytes: u64,
     /// Mensajes que no cabían en un datagrama ([`MAX_PEER_MSG`]) y no se enviaron.
     pub oversize: u64,
+    /// Mensajes descartados por una partición de red o por una caída simulada (véase
+    /// [`SimBus::isolate`], [`SimBus::set_link_down`] y [`SimBus::clear_inbox`]).
+    pub partitioned: u64,
 }
 
 type Queued = Reverse<(u64, u64, ShardId, Vec<u8>)>;
@@ -423,6 +589,18 @@ struct Inner {
     seq: u64,
     queues: Vec<BinaryHeap<Queued>>,
     stats: BusStats,
+    /// Pares de shards sin comunicación (guardados como `(menor, mayor)`).
+    down: BTreeSet<(ShardId, ShardId)>,
+    /// Shards aislados del resto.
+    isolated: BTreeSet<ShardId>,
+}
+
+impl Inner {
+    fn blocked(&self, a: ShardId, b: ShardId) -> bool {
+        self.isolated.contains(&a)
+            || self.isolated.contains(&b)
+            || self.down.contains(&(a.min(b), a.max(b)))
+    }
 }
 
 /// Bus en memoria compartido por todos los shards de un proceso.
@@ -440,8 +618,42 @@ impl SimBus {
                 seq: 0,
                 queues: (0..shards).map(|_| BinaryHeap::new()).collect(),
                 stats: BusStats::default(),
+                down: BTreeSet::new(),
+                isolated: BTreeSet::new(),
             })),
         }
+    }
+
+    /// Corta (`down = true`) o restablece la comunicación entre dos shards, en los dos sentidos. Lo que
+    /// se envíe mientras tanto se pierde; también lo que estuviera en camino y llegue durante el corte.
+    pub fn set_link_down(&self, a: ShardId, b: ShardId, down: bool) {
+        let mut g = self.lock();
+        let key = (a.min(b), a.max(b));
+        if down {
+            g.down.insert(key);
+        } else {
+            g.down.remove(&key);
+        }
+    }
+
+    /// Aísla un shard del resto (o lo reconecta). Equivale a cortar todos sus enlaces.
+    pub fn isolate(&self, shard: ShardId, on: bool) {
+        let mut g = self.lock();
+        if on {
+            g.isolated.insert(shard);
+        } else {
+            g.isolated.remove(&shard);
+        }
+    }
+
+    /// Descarta lo que esperaba a un shard (lo que se perdería si el proceso cayera: nadie lo lee).
+    pub fn clear_inbox(&self, shard: ShardId) {
+        let mut g = self.lock();
+        let lost = g.queues.get(shard as usize).map_or(0, |q| q.len()) as u64;
+        if let Some(q) = g.queues.get_mut(shard as usize) {
+            q.clear();
+        }
+        g.stats.partitioned += lost;
     }
 
     /// El extremo de un shard.
@@ -485,6 +697,10 @@ impl PeerBus for SimBusEnd {
         }
         g.stats.sent += 1;
         g.stats.bytes += data.len() as u64;
+        if g.blocked(self.shard, to) {
+            g.stats.partitioned += 1;
+            return;
+        }
         if (to as usize) >= g.queues.len() || g.rng.unit() < g.cfg.loss {
             g.stats.dropped += 1;
             return;
@@ -512,12 +728,23 @@ impl PeerBus for SimBusEnd {
 
     fn recv(&mut self, now_ms: u64, out: &mut Vec<(ShardId, Vec<u8>)>) {
         let mut g = self.bus.lock();
-        let q = &mut g.queues[self.shard as usize];
-        while q.peek().is_some_and(|Reverse((at, ..))| *at <= now_ms) {
-            if let Some(Reverse((_, _, from, data))) = q.pop() {
+        let mut cut = 0;
+        while let Some(Reverse((from, data))) = {
+            let q = &mut g.queues[self.shard as usize];
+            if q.peek().is_some_and(|Reverse((at, ..))| *at <= now_ms) {
+                q.pop()
+                    .map(|Reverse((_, _, from, data))| Reverse((from, data)))
+            } else {
+                None
+            }
+        } {
+            if g.blocked(from, self.shard) {
+                cut += 1;
+            } else {
                 out.push((from, data));
             }
         }
+        g.stats.partitioned += cut;
     }
 }
 
@@ -579,6 +806,7 @@ mod tests {
                 player: 1001,
                 pos: [i32::MIN, 1, i32::MAX],
                 last_processed: u32::MAX,
+                epoch: u64::MAX,
             },
             PeerMsg::HandoverAck {
                 xfer: 3,
@@ -587,6 +815,42 @@ mod tests {
             PeerMsg::Abort {
                 xfer: 3,
                 player: 1001,
+            },
+            PeerMsg::DirLogin {
+                account: 1001,
+                home: 3,
+            },
+            PeerMsg::DirRoute {
+                account: NPC_BASE - 1,
+                shard: u16::MAX,
+                epoch: 1,
+            },
+            PeerMsg::DirTransfer {
+                xfer: u32::MAX,
+                account: 7,
+                epoch: u64::MAX,
+                to: 0,
+            },
+            PeerMsg::DirResult {
+                xfer: 5,
+                account: 7,
+                status: DirStatus::Committed,
+                shard: 2,
+                epoch: 9,
+            },
+            PeerMsg::DirResult {
+                xfer: 5,
+                account: 7,
+                status: DirStatus::Rejected,
+                shard: 1,
+                epoch: 4,
+            },
+            PeerMsg::DirResult {
+                xfer: 5,
+                account: 7,
+                status: DirStatus::Unknown,
+                shard: 0,
+                epoch: 0,
             },
         ]
     }
@@ -619,8 +883,13 @@ mod tests {
     fn rechaza_versiones_etiquetas_y_contenido_imposible() {
         let ok = PeerMsg::Abort { xfer: 1, player: 2 }.encode();
         let mut bad = ok.clone();
-        bad[0] = 2;
-        assert!(PeerMsg::decode(&bad).is_err(), "versión");
+        bad[0] = PEER_VERSION + 1;
+        assert!(PeerMsg::decode(&bad).is_err(), "versión futura");
+        bad[0] = 1;
+        assert!(
+            PeerMsg::decode(&bad).is_err(),
+            "la versión 1 (sin épocas) no se mezcla con la 2"
+        );
         bad = ok.clone();
         bad[1] = 0;
         assert!(PeerMsg::decode(&bad).is_err(), "etiqueta 0");
@@ -702,6 +971,129 @@ mod tests {
         })
         .encode();
         assert!(PeerMsg::decode(&not_npc).is_err(), "no es un NPC");
+    }
+
+    #[test]
+    fn los_mensajes_del_directorio_rechazan_valores_imposibles() {
+        let enc = |m: PeerMsg| m.encode();
+        // Épocas a cero: una cuenta registrada siempre tiene al menos la época 1.
+        for m in [
+            PeerMsg::DirRoute {
+                account: 1,
+                shard: 0,
+                epoch: 0,
+            },
+            PeerMsg::DirTransfer {
+                xfer: 1,
+                account: 1,
+                epoch: 0,
+                to: 1,
+            },
+            PeerMsg::Handover {
+                xfer: 1,
+                player: 1,
+                pos: [0; 3],
+                last_processed: 0,
+                epoch: 0,
+            },
+            PeerMsg::DirResult {
+                xfer: 1,
+                account: 1,
+                status: DirStatus::Committed,
+                shard: 0,
+                epoch: 0,
+            },
+            PeerMsg::DirResult {
+                xfer: 1,
+                account: 1,
+                status: DirStatus::Rejected,
+                shard: 0,
+                epoch: 0,
+            },
+        ] {
+            assert!(PeerMsg::decode(&enc(m.clone())).is_err(), "{m:?}");
+        }
+        // Una cuenta en el rango de los NPC no es una cuenta.
+        for m in [
+            PeerMsg::DirLogin {
+                account: NPC_BASE,
+                home: 0,
+            },
+            PeerMsg::DirRoute {
+                account: NPC_BASE + 5,
+                shard: 0,
+                epoch: 1,
+            },
+            PeerMsg::DirTransfer {
+                xfer: 1,
+                account: u64::MAX,
+                epoch: 1,
+                to: 0,
+            },
+        ] {
+            assert!(PeerMsg::decode(&enc(m.clone())).is_err(), "{m:?}");
+        }
+        // Un estado desconocido y un shard que no cabe en 16 bits.
+        let mut w = Writer::default();
+        w.u8(PEER_VERSION);
+        w.u8(13);
+        w.varint(1);
+        w.varint(1);
+        w.u8(9); // estado desconocido
+        w.varint(1);
+        w.varint(1);
+        assert!(PeerMsg::decode(&w.buf).is_err(), "estado inventado");
+        let mut w = Writer::default();
+        w.u8(PEER_VERSION);
+        w.u8(10);
+        w.varint(1);
+        w.varint(70_000); // no cabe en un ShardId
+        assert!(PeerMsg::decode(&w.buf).is_err(), "shard fuera de rango");
+    }
+
+    #[test]
+    fn el_bus_simulado_corta_enlaces_aisla_y_descarta_lo_que_esperaba() {
+        let bus = SimBus::new(3, SimBusConfig::default());
+        let (mut a, mut b, mut c) = (bus.end(0), bus.end(1), bus.end(2));
+        let mut out = Vec::new();
+        let mut got = |end: &mut SimBusEnd, now| {
+            out.clear();
+            end.recv(now, &mut out);
+            out.len()
+        };
+        // Un enlace cortado pierde lo enviado, en los dos sentidos, pero no afecta a los demás.
+        bus.set_link_down(0, 1, true);
+        a.send(0, 1, vec![1]);
+        b.send(0, 0, vec![2]);
+        a.send(0, 2, vec![3]);
+        assert_eq!(got(&mut b, 100), 0);
+        assert_eq!(got(&mut a, 100), 0);
+        assert_eq!(got(&mut c, 100), 1);
+        assert_eq!(bus.stats().partitioned, 2);
+        bus.set_link_down(1, 0, false);
+        a.send(100, 1, vec![4]);
+        assert_eq!(got(&mut b, 200), 1);
+        // Un mensaje ya en camino cuando se corta el enlace tampoco llega.
+        a.send(200, 1, vec![5]);
+        bus.set_link_down(0, 1, true);
+        assert_eq!(got(&mut b, 300), 0);
+        bus.set_link_down(0, 1, false);
+        // Aislar un shard lo deja sin enviar ni recibir.
+        bus.isolate(2, true);
+        a.send(300, 2, vec![6]);
+        c.send(300, 0, vec![7]);
+        assert_eq!(got(&mut c, 400), 0);
+        assert_eq!(got(&mut a, 400), 0);
+        bus.isolate(2, false);
+        a.send(400, 2, vec![8]);
+        assert_eq!(got(&mut c, 500), 1);
+        // Una caída descarta lo que esperaba al shard.
+        a.send(500, 1, vec![9]);
+        a.send(500, 1, vec![10]);
+        let before = bus.stats().partitioned;
+        bus.clear_inbox(1);
+        assert_eq!(bus.stats().partitioned, before + 2);
+        assert_eq!(got(&mut b, 600), 0);
     }
 
     #[test]

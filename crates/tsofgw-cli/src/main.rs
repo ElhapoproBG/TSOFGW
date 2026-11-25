@@ -2,6 +2,7 @@
 
 mod demo;
 mod online;
+mod store;
 
 use std::fs;
 use std::path::Path;
@@ -34,6 +35,20 @@ RED (servidor autoritativo, UDP autenticado):
                [--shard I --grid CxF --peers DIR0,DIR1,.. --cluster-key-file K [--bus-bind DIR]]
                                                 Un shard de un cluster: mundo repartido en C×F regiones (--peers: el bus de
                                                 cada shard, en orden; la misma rejilla, lista y clave en todos)
+               [--data-dir CARPETA [--repair] [--sync-ticks N] [--npc-save-ticks N] [--player-save-ticks N] [--compact-mb N]]
+                                                Persistencia: el estado sobrevive a reinicios y caídas (diario + checkpoints
+                                                autenticados con la clave; Ctrl-C o SIGTERM cierran limpiando). --repair
+                                                tolera daño en medio del diario descartando lo posterior (por defecto se niega)
+               [--directory DIR]                En un cluster con persistencia: dirección del directorio de sesiones, que
+                                                decide en qué shard vive cada cuenta (una cuenta, un shard)
+  tsofgw directory --grid CxF --peers DIR0,DIR1,.. --cluster-key-file K --bind DIR --data-dir CARPETA
+                   [--duration S] [--compact-mb N] [--repair] [--npcs N] [--seed N] [--radius R] [--sim-radius R] [--tick-ms MS]
+                                                El directorio de sesiones del cluster (un único proceso; mismos parámetros de
+                                                mundo que los shards, o el bus descarta sus mensajes)
+  tsofgw store info --data-dir CARPETA (--shard I --cluster-key-file K | --directory --cluster-key-file K | --standalone --master-file K)
+                                                Qué hay guardado en una carpeta de datos (con el proceso parado)
+  tsofgw store rebuild-directory --shard-dirs D0,D1,.. --data-dir CARPETA --cluster-key-file K [--accept-conflicts]
+                                                Reconstruye el directorio desde lo que guarda cada shard (todos parados)
   tsofgw bots --master-file K --connect IP:PUERTO [--count N] [--duration S]
               [--shards DIR0,DIR1,..] [--patrol N] [--patrol-ms MS]
                                                 En un cluster: la dirección de jugadores de cada shard, para seguir los
@@ -43,6 +58,10 @@ RED (servidor autoritativo, UDP autenticado):
                   [--spawn-half H] [--share-min N]     (aparecer en un área de ±H: multitud; vecindad compartida desde N jugadores/celda)
                   [--shards CxF] [--patrol N] [--patrol-ms MS] [--bus-loss P] [--bus-latency MS] [--bus-jitter MS]
                                                 (cluster: mundo repartido en C×F shards; N clientes patrullan cruzando bordes)
+                  [--persist] [--directory] [--chaos RONDAS [--chaos-seed N]]
+                                                (cluster, red simulada: shards con almacén durable; directorio de sesiones; una
+                                                tormenta de caídas de shards y del directorio, con vigilancia continua de que
+                                                ninguna cuenta se duplique ni se pierda)
                                                 Servidor + bots; informe medido
 ";
 
@@ -389,6 +408,8 @@ fn run() -> Result<(), String> {
         "serve" => online::cmd_serve(rest),
         "bots" => online::cmd_bots(rest),
         "loadtest" => online::cmd_loadtest(rest),
+        "directory" => store::cmd_directory(rest),
+        "store" => store::cmd_store(rest),
         otro => Err(format!("comando desconocido: {otro}\n\n{AYUDA}")),
     }
 }

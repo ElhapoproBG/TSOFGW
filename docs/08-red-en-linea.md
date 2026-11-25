@@ -1,6 +1,6 @@
 # Red en línea: transporte, servidor autoritativo y pruebas de carga
 
-Esta capa (introducida en 0.3.0 y ampliada en 0.4.0) convierte los bloques del documento 06 en algo que se puede ejecutar de extremo a extremo: un servidor, clientes y bots hablando por UDP real, o por una red simulada con pérdida y latencia para pruebas reproducibles. La versión 0.4.0 añade el reparto del trabajo entre hilos, los niveles de detalle, el presupuesto de ancho de banda y el clúster de shards (documento 09).
+Esta capa (introducida en 0.3.0 y ampliada en 0.4.0 y 0.5.0) convierte los bloques del documento 06 en algo que se puede ejecutar de extremo a extremo: un servidor, clientes y bots hablando por UDP real, o por una red simulada con pérdida y latencia para pruebas reproducibles. La versión 0.4.0 añade el reparto del trabajo entre hilos, los niveles de detalle, el presupuesto de ancho de banda y el clúster de shards (documento 09). La 0.5.0 añade la persistencia, el directorio de sesiones y el cierre limpio (documento 10).
 
 ```
  GameClient / Bot ─┐                                       ┌─ GameServer
@@ -54,6 +54,8 @@ El tick tiene dos partes: simular (inputs y NPC) y **replicar** (por cada jugado
 - **Predicción:** aplica sus inputs al instante y, al llegar el estado del servidor, reaplica los pendientes. Cada input se reenvía en los 4 mensajes siguientes para tolerar pérdidas sin retransmisión.
 - **Interpolación:** `view(now)` dibuja a los demás entre los dos snapshots que rodean `now` menos 2 ticks, y a mi jugador con la posición predicha.
 - **Cambio de shard (0.4.0):** en un clúster, el servidor puede redirigir al cliente a otro shard (documento 09). El cliente abre una segunda conexión con su propia clave de cuenta mediante un `Connector` y, cuando el nuevo shard lo recibe, cambia sin perder predicción ni vista. Como cada shard cuenta sus ticks desde que arrancó, al cambiar se descarta el historial de snapshots para no tratar como «viejo» lo que simplemente tiene otra numeración.
+- **Redirección al entrar (0.5.0):** con persistencia, un shard que no es el dueño de la cuenta contesta al `JOIN` con una redirección (si todavía no puede decidir, por ejemplo porque falta la respuesta del directorio, el cliente simplemente repite su `JOIN`); el cliente con `Connector` la sigue solo (`login_redirects`, que no cuenta como cambio de shard) y los bots lo muestran como «entradas redirigidas». Una cuenta nueva se crea en el shard que posee su punto de aparición.
+- **Cierre limpio (0.5.0):** cuando un servidor se apaga con `Ctrl-C` o `SIGTERM`, expulsa a sus clientes con un aviso (`DISCONNECT`, motivo «Kicked») en lugar de desaparecer: antes, el cliente seguía creyéndose conectado hasta que vencía el tiempo de espera del transporte (5 s). Tras una caída de verdad sigue tardando esos 5 s y **no se reconecta solo**.
 
 ## 4. Herramientas
 
@@ -140,12 +142,13 @@ El trabajo total se conserva (la suma casi no cambia: el costo de los fantasmas 
 ## 7. Defectos encontrados al construirlo
 - **Movimiento:** al normalizar y escalar en dos pasos, una diagonal podía avanzar un 0,2 % más que un eje. La prueba exhaustiva lo detectó; ahora se calcula en un solo paso redondeando el denominador hacia arriba.
 - **Memoria en `Endpoint`:** los paquetes perdidos nunca se olvidaban, así que con pérdida sostenida el conjunto de paquetes en vuelo crecía hasta ~65 000 entradas por conexión. Ahora se descartan los de más de 64 puestos atrás.
+- **Clientes que no se enteraban de un cierre limpio (0.5.0):** una prueba que reinicia todos los shards a la vez y espera que todos los clientes sigan jugando mostró 23 de 24: el servidor se iba sin avisar y el cliente esperaba los 5 s del transporte. El apagado ordenado ahora los expulsa con aviso (documento 10, sección 10).
 - **Cliente congelado tras cambiar de shard (0.4.0):** al pasar a un shard con la cuenta de ticks atrasada, el cliente descartaba todos sus snapshots como «viejos». Lo encontró una prueba endurecida a propósito (documento 09, sección 8).
 
 ## 8. Pendiente
 - **Cifrado AEAD** de los datos y del bus entre shards, y credenciales asimétricas (Ed25519) emitidas por la autoridad.
 - **Simulación de NPC en paralelo** (hoy solo la replicación usa varios hilos) y medir el escalado con más de 2 núcleos.
 - **Migración de dirección** del cliente y control de congestión.
-- **Persistencia** y recuperación de shards (documento 09).
-- Probar en Windows y macOS (la entropía de Windows usa FFI a `BCryptGenRandom` y no se ha podido compilar aquí).
+- **Reconexión automática de los clientes** tras una caída de un shard (hoy solo la hacen los bancos de pruebas) y **checkpoints incrementales** para mundos grandes (documento 10, sección 11).
+- Probar el clúster sobre UDP real también en Windows y macOS (la integración continua ya ejecuta allí las 228 pruebas, incluida la entropía de Windows por FFI a `BCryptGenRandom`, pero la prueba de humo del clúster por UDP solo corre en Linux).
 - Medir en hardware real y con latencias de internet reales; todo lo anterior es simulación y bucle local.

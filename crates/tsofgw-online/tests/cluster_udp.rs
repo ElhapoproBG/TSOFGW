@@ -111,6 +111,7 @@ fn un_intruso_en_el_bus_no_consigue_nada_y_queda_registrado() {
                         player: 1000,
                         pos: [0, 0, 0],
                         last_processed: 1,
+                        epoch: 1,
                     },
                     PeerMsg::Ghosts {
                         tick: u32::MAX,

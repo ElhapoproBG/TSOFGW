@@ -4,12 +4,12 @@ Motor dinámico y open source para mundos inmersivos de realidad virtual a gran 
 No es un juego: es la base sobre la que se programa, construida como un **grafo de interdependencias**.
 
 > ## ⚠️ No apto para exponerse a internet
-> *Not suitable for exposure to the internet.* TSOFGW 0.4 es un prototipo para desarrollo, pruebas y redes de confianza:
+> *Not suitable for exposure to the internet.* TSOFGW 0.5 es un prototipo para desarrollo, pruebas y redes de confianza:
 >
 > - **La red no está cifrada**, ni la de jugadores ni el bus entre shards: los paquetes se autentican, pero se pueden leer.
-> - **Quien tenga la clave de clúster puede hacerse pasar por cualquier shard**, y quien tenga la clave maestra, por cualquier cuenta.
-> - **No hay persistencia**: un shard reiniciado pierde su estado, y un traspaso perdido en una partición larga puede perder a un jugador.
-> - **No hay directorio de sesiones**: una cuenta podría estar en dos shards a la vez.
+> - **Quien tenga la clave de clúster puede hacerse pasar por cualquier shard y por el directorio de sesiones**, y quien tenga la clave maestra, por cualquier cuenta.
+> - **Lo que se guarda en disco está autenticado, no cifrado**: quien lea la carpeta de datos ve las cuentas y sus posiciones, y restaurar una copia vieja de la carpeta no se detecta.
+> - **El directorio de sesiones es un solo proceso**, sin alta disponibilidad ni sustitución automática.
 > - Nada de esto ha pasado una auditoría externa.
 >
 > Úsalo en bucle local o en una red privada. Qué protege y qué no, cómo usarlo con seguridad y el plan: [`SECURITY.md`](SECURITY.md).
@@ -19,6 +19,7 @@ No es un juego: es la base sobre la que se programa, construida como un **grafo 
 - **Presupuesto por plataforma:** los perfiles `vr`, `pc` y `consola` fijan cuánto cabe por frame; lo de menor prioridad se descarta.
 - **Menos fricción para MMO:** mundo, interés, shards y red como piezas listas para conectar.
 - **Escala:** la replicación del tick se reparte entre hilos con resultado idéntico, hay niveles de detalle por distancia y presupuesto de ancho de banda, y el mundo se reparte entre servidores (clúster de shards con entidades fantasma y traspaso de jugadores entre procesos).
+- **Persistencia y sesiones:** cada shard guarda su estado en disco (diario con checkpoints autenticados) y un directorio de sesiones decide en qué shard vive cada cuenta. Sobrevive a reinicios y caídas sin perder ni duplicar una cuenta: lo comprueban una tormenta de caídas, procesos a los que se hace `kill -9` y una herramienta que estropea el código a propósito para ver si la suite lo nota (no es una demostración formal).
 - **Actualizaciones por módulo:** hot-swap de nodos con reglas de compatibilidad, módulos con manifiesto, hash y firma.
 - **Multiplataforma:** VR primero, con PC y consolas soportados por backends intercambiables.
 - **Rust** en el núcleo, **C** de apoyo vía FFI (con respaldo en Rust si no hay compilador de C).
@@ -32,10 +33,11 @@ No es un juego: es la base sobre la que se programa, construida como un **grafo 
 | `tsofgw-net` | Snapshots delta, seq/ack, predicción |
 | `tsofgw-hal` | Interfaces de plataforma, perfiles, backends headless |
 | `tsofgw-transport` | UDP autenticado: handshake con cookie, MAC por paquete, anti-replay, fragmentación |
-| `tsofgw-online` | Servidor autoritativo, cliente con predicción, bots, banco de pruebas y clúster de shards |
+| `tsofgw-online` | Servidor autoritativo, cliente con predicción, bots, banco de pruebas, clúster de shards, persistencia y directorio de sesiones |
+| `tsofgw-store` | Almacén durable: diario con checkpoints autenticados (HMAC), recuperación tras caídas, medio de archivos y de memoria con fallos inyectables |
 | `tsofgw-soft` | Rasterizador por software, PNG y comparación de imágenes |
 | `tsofgw-pack` | SHA-256, manifiestos, confianza, permisos |
-| `tsofgw-sys` | FFI a C con respaldo en Rust |
+| `tsofgw-sys` | FFI a C con respaldo en Rust, y parada limpia por señales (Ctrl-C, SIGTERM) |
 | `tsofgw-cli` | Herramienta `tsofgw` |
 
 ## Probar
@@ -51,12 +53,13 @@ Requiere Rust 1.90 o superior (`rustup update`). No hace falta compilador de C.
     cargo run --release -p tsofgw-cli -- loadtest --clients 500 --threads 2 --lod
     cargo run --release -p tsofgw-cli -- loadtest --shards 2x2 --clients 400 --npcs 40000 --patrol 200
     cargo run --release -p tsofgw-cli -- loadtest --shards 2x2 --clients 100 --udp
+    cargo run --release -p tsofgw-cli -- loadtest --shards 2x2 --clients 100 --directory --chaos 12
 
-`loadtest` levanta un servidor y cientos de bots (sobre una red simulada con pérdida o sobre UDP real) y mide tiempo de tick, interés, ancho de banda y convergencia; con `--shards` reparte el mundo entre varios shards y comprueba que nada se pierde ni se duplica al cruzar bordes. La demo mide, sobre un MMO mínimo, la simulación selectiva, el interés de los jugadores, el ahorro de red con snapshots delta y qué nodos descarta cada perfil por presupuesto.
+`loadtest` levanta un servidor y cientos de bots (sobre una red simulada con pérdida o sobre UDP real) y mide tiempo de tick, interés, ancho de banda y convergencia; con `--shards` reparte el mundo entre varios shards y comprueba que nada se pierde ni se duplica al cruzar bordes; con `--directory --chaos N` los shards guardan su estado, hay directorio de sesiones y N rondas de caídas de shards y del directorio, y falla si alguna cuenta se duplica o se pierde en cualquier momento. La demo mide, sobre un MMO mínimo, la simulación selectiva, el interés de los jugadores, el ahorro de red con snapshots delta y qué nodos descarta cada perfil por presupuesto.
 
 ## Estado
 
-Versión 0.4.3, prototipo (**no apto para exponerse a internet**, ver arriba y `SECURITY.md`). Incluye un servidor autoritativo con transporte UDP autenticado (sin cifrado todavía), cliente con predicción, replicación en varios hilos con niveles de detalle y presupuesto de ancho de banda, y un **clúster de shards** (el mundo repartido entre procesos, con entidades fantasma, traspaso de NPC y de jugadores y un bus UDP autenticado), todo con pruebas de carga medidas. Dibuja con un rasterizador por software verificado (`tsofgw render`); el backend de GPU con wgpu (`gpu/`) compila y dibuja lo mismo que el rasterizador por software, comprobado en la integración continua con Vulkan por software (todavía no en una GPU real); OpenXR no está empezado. Lo que está verificado y lo que no (sin sandbox, firmas solo HMAC, sin cifrado, sin persistencia, medido solo en bucle local) está en `docs/07-estado-y-pendientes.md`; el estado de la integración continua (Linux, Windows y macOS) se ve en la pestaña *Actions* del repositorio.
+Versión 0.5.0, prototipo (**no apto para exponerse a internet**, ver arriba y `SECURITY.md`). Incluye un servidor autoritativo con transporte UDP autenticado (sin cifrado todavía), cliente con predicción, replicación en varios hilos con niveles de detalle y presupuesto de ancho de banda, un **clúster de shards** (el mundo repartido entre procesos, con entidades fantasma, traspaso de NPC y de jugadores y un bus UDP autenticado), y desde la 0.5.0 **persistencia y directorio de sesiones** (`docs/10-persistencia-y-sesiones.md`), todo con pruebas de carga medidas. Dibuja con un rasterizador por software verificado (`tsofgw render`); el backend de GPU con wgpu (`gpu/`) compila y dibuja lo mismo que el rasterizador por software, comprobado en la integración continua con Vulkan por software (todavía no en una GPU real); OpenXR no está empezado. Lo que está verificado y lo que no (sin sandbox, firmas solo HMAC, sin cifrado de la red ni del disco, directorio de un solo proceso, medido solo en bucle local) está en `docs/07-estado-y-pendientes.md`; el estado de la integración continua (Linux, Windows y macOS) se ve en la pestaña *Actions* del repositorio.
 
 ## Documentación
 
@@ -69,7 +72,8 @@ Versión 0.4.3, prototipo (**no apto para exponerse a internet**, ver arriba y `
 7. `docs/07-estado-y-pendientes.md` — estado verificado y pendientes
 8. `docs/08-red-en-linea.md` — transporte, servidor autoritativo, escala y pruebas de carga
 9. `docs/09-cluster-de-shards.md` — un mundo repartido entre varios servidores
-10. `SECURITY.md` — qué protege hoy el motor, qué no y el plan de seguridad
+10. `docs/10-persistencia-y-sesiones.md` — persistencia en disco, directorio de sesiones y cómo se probó
+11. `SECURITY.md` — qué protege hoy el motor, qué no y el plan de seguridad
 
 ## Licencia
 

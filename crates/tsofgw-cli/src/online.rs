@@ -5,14 +5,19 @@ use std::net::{SocketAddr, ToSocketAddrs};
 use std::time::{Duration, Instant};
 
 use tsofgw_online::bus::SimBusConfig;
-use tsofgw_online::cluster_scenario::{run_cluster, ClusterScenario, Invariants};
+use tsofgw_online::cluster_scenario::{
+    run_cluster, run_cluster_chaos, ClusterReport, ClusterScenario, Invariants, Reconnect,
+    Violations,
+};
 use tsofgw_online::cluster_udp::UdpCluster;
 use tsofgw_online::partition::Partition;
 use tsofgw_online::scenario::{run, Scenario};
 use tsofgw_online::{
-    default_lod, Bot, ClusterConfig, GameClient, GameConfig, GameServer, NewConnection, UdpBus,
+    default_lod, Bot, ClusterConfig, GameClient, GameConfig, GameServer, NewConnection,
+    PersistConfig, RestoreReport, UdpBus,
 };
 use tsofgw_pack::{from_hex, to_hex};
+use tsofgw_store::{FsMedium, OpenMode};
 use tsofgw_transport::{
     Authority, ClientConfig, Entropy, OsEntropy, ServerConfig, SimConfig, UdpLink,
 };
@@ -46,7 +51,7 @@ pub fn reject_unknown(
 
 /// Lee una clave de un archivo (nunca de la línea de comandos: quedaría en el historial y en `ps`).
 /// Se acepta hexadecimal (lo que escribe `keygen`) o cualquier texto de al menos 16 bytes.
-fn key_from_file(path: &str, what: &str) -> Result<Vec<u8>, String> {
+pub(crate) fn key_from_file(path: &str, what: &str) -> Result<Vec<u8>, String> {
     let text = read_key(path)?;
     let key = std::str::from_utf8(&text)
         .ok()
@@ -59,14 +64,19 @@ fn key_from_file(path: &str, what: &str) -> Result<Vec<u8>, String> {
     Ok(key)
 }
 
-fn master(args: &[String]) -> Result<Authority, String> {
+/// Los bytes de la clave maestra (de `--master-file`).
+pub(crate) fn master_key(args: &[String]) -> Result<Vec<u8>, String> {
     let path = flag(args, "--master-file")
         .ok_or("falta --master-file (genera una con `tsofgw keygen`)")?;
-    Ok(Authority::new(&key_from_file(&path, "la clave maestra")?))
+    key_from_file(&path, "la clave maestra")
+}
+
+fn master(args: &[String]) -> Result<Authority, String> {
+    Ok(Authority::new(&master_key(args)?))
 }
 
 /// `COLUMNASxFILAS` (por ejemplo `2x2`; un número solo es `Nx1`).
-fn parse_grid(spec: &str, flag_name: &str) -> Result<(u16, u16), String> {
+pub(crate) fn parse_grid(spec: &str, flag_name: &str) -> Result<(u16, u16), String> {
     let (a, b) = spec.split_once('x').unwrap_or((spec, "1"));
     let (cols, rows) = (
         a.parse::<u16>().map_err(|_| {
@@ -82,7 +92,7 @@ fn parse_grid(spec: &str, flag_name: &str) -> Result<(u16, u16), String> {
     Ok((cols, rows))
 }
 
-fn parse_addr_list(list: &str, flag_name: &str) -> Result<Vec<SocketAddr>, String> {
+pub(crate) fn parse_addr_list(list: &str, flag_name: &str) -> Result<Vec<SocketAddr>, String> {
     list.split(',')
         .map(|a| resolve(a.trim()).map_err(|e| format!("{flag_name}: {e}")))
         .collect()
@@ -123,7 +133,7 @@ pub fn cmd_token(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-fn game_config(args: &[String], default_threads: usize) -> Result<GameConfig, String> {
+pub(crate) fn game_config(args: &[String], default_threads: usize) -> Result<GameConfig, String> {
     let d = GameConfig::default();
     let cfg = GameConfig {
         threads: num(args, "--threads", default_threads)?,
@@ -164,7 +174,7 @@ fn game_config(args: &[String], default_threads: usize) -> Result<GameConfig, St
     Ok(cfg)
 }
 
-fn resolve(addr: &str) -> Result<SocketAddr, String> {
+pub(crate) fn resolve(addr: &str) -> Result<SocketAddr, String> {
     addr.to_socket_addrs()
         .map_err(|e| format!("dirección inválida {addr}: {e}"))?
         .next()
@@ -173,7 +183,7 @@ fn resolve(addr: &str) -> Result<SocketAddr, String> {
 
 /// Aviso de seguridad si algún canal escucha fuera del bucle local: la red de esta versión no está cifrada y
 /// no es apta para exponerse a internet (ver `SECURITY.md`). Devuelve `None` si todo es local.
-fn exposure_warning(listening: &[(&str, SocketAddr)]) -> Option<String> {
+pub(crate) fn exposure_warning(listening: &[(&str, SocketAddr)]) -> Option<String> {
     let exposed: Vec<String> = listening
         .iter()
         .filter(|(_, addr)| !addr.ip().is_loopback())
@@ -185,14 +195,106 @@ fn exposure_warning(listening: &[(&str, SocketAddr)]) -> Option<String> {
     Some(format!(
         "ADVERTENCIA: escuchando fuera del bucle local ({}). TSOFGW {} NO está pensado para exponerse a internet: \
          la red no está cifrada (ni la de jugadores ni el bus entre shards), quien tenga la clave de clúster puede \
-         suplantar a cualquier shard y no hay persistencia ni directorio de sesiones. Úsalo en una red privada o \
-         de confianza; detalles en SECURITY.md.",
+         suplantar a cualquier shard, y el directorio de sesiones (si lo usas) es un solo proceso sin réplica. Úsalo en \
+         una red privada o de confianza; detalles en SECURITY.md.",
         exposed.join(", "),
         env!("CARGO_PKG_VERSION")
     ))
 }
 
-/// `tsofgw serve`: servidor real sobre UDP. Se detiene con Ctrl-C o tras `--duration` segundos.
+/// Opciones de persistencia de `serve`.
+struct PersistOpts {
+    dir: String,
+    mode: OpenMode,
+    cfg: PersistConfig,
+}
+
+/// Opciones que solo valen con `--data-dir`.
+const PERSIST_FLAGS: [&str; 4] = [
+    "--sync-ticks",
+    "--npc-save-ticks",
+    "--player-save-ticks",
+    "--compact-mb",
+];
+
+fn persist_opts(args: &[String]) -> Result<Option<PersistOpts>, String> {
+    let Some(dir) = flag(args, "--data-dir") else {
+        for f in PERSIST_FLAGS
+            .iter()
+            .copied()
+            .chain(["--repair", "--directory"])
+        {
+            if flag(args, f).is_some() || has(args, f) {
+                return Err(format!("{f} solo tiene sentido con --data-dir"));
+            }
+        }
+        return Ok(None);
+    };
+    let d = PersistConfig::default();
+    let compact_mb: u64 = num(args, "--compact-mb", d.compact_bytes >> 20)?;
+    let cfg = PersistConfig {
+        sync_ticks: num(args, "--sync-ticks", d.sync_ticks)?,
+        npc_checkpoint_ticks: num(args, "--npc-save-ticks", d.npc_checkpoint_ticks)?,
+        player_save_ticks: num(args, "--player-save-ticks", d.player_save_ticks)?,
+        compact_bytes: compact_mb << 20,
+        ..d
+    };
+    if cfg.sync_ticks == 0 || cfg.npc_checkpoint_ticks == 0 || cfg.player_save_ticks == 0 {
+        return Err(
+            "--sync-ticks, --npc-save-ticks y --player-save-ticks deben ser al menos 1".into(),
+        );
+    }
+    if !(1..=4096).contains(&compact_mb) {
+        return Err("--compact-mb debe estar entre 1 y 4096".into());
+    }
+    Ok(Some(PersistOpts {
+        dir,
+        mode: if has(args, "--repair") {
+            OpenMode::Repair
+        } else {
+            OpenMode::Recover
+        },
+        cfg,
+    }))
+}
+
+/// Abre la carpeta de datos (con su bloqueo) y lo que dice el almacén.
+pub(crate) fn open_medium(dir: &str) -> Result<FsMedium, String> {
+    FsMedium::open(dir).map_err(|e| format!("no se pudo abrir la carpeta de datos {dir}: {e}"))
+}
+
+/// Una línea para el operador sobre lo que encontró el arranque en la carpeta de datos.
+fn describe_restore(dir: &str, r: &RestoreReport) -> String {
+    let rec = &r.recovery;
+    let mut o = if r.first_start {
+        format!(
+            "Persistencia en {dir}: primer arranque (mundo nuevo, generación {}).",
+            rec.generation
+        )
+    } else {
+        format!(
+            "Persistencia en {dir}: restaurado — {} NPC, {} traspasos de NPC sin acuse, {} jugadores residentes, \
+             {} traspasos de jugador sin acuse, {} lápidas (generación {}, {} registros del diario).",
+            r.npcs, r.npc_transfers, r.residents, r.handovers, r.tombstones, rec.generation, rec.records
+        )
+    };
+    if rec.torn_bytes > 0 {
+        o.push_str(&format!(
+            " Se descartó una cola rota de {} bytes (lo normal tras una caída).",
+            rec.torn_bytes
+        ));
+    }
+    if rec.repaired_bytes > 0 {
+        o.push_str(&format!(
+            "\nADVERTENCIA: --repair descartó {} bytes dañados en medio del diario; lo que venía después se perdió.",
+            rec.repaired_bytes
+        ));
+    }
+    o
+}
+
+/// `tsofgw serve`: servidor real sobre UDP. Se detiene con Ctrl-C (o `SIGTERM`) o tras `--duration`
+/// segundos, y en los dos casos cierra el almacén con orden y avisa a los clientes.
 pub fn cmd_serve(args: &[String]) -> Result<(), String> {
     reject_unknown(
         args,
@@ -215,38 +317,67 @@ pub fn cmd_serve(args: &[String]) -> Result<(), String> {
             "--peers",
             "--bus-bind",
             "--cluster-key-file",
+            "--data-dir",
+            "--directory",
+            "--sync-ticks",
+            "--npc-save-ticks",
+            "--player-save-ticks",
+            "--compact-mb",
         ],
-        &["--lod"],
+        &["--lod", "--repair"],
     )?;
     let auth = master(args)?;
     let bind = flag(args, "--bind").unwrap_or_else(|| "0.0.0.0:7777".into());
     // En un servidor real, por defecto se usan los núcleos disponibles.
     let cfg = game_config(args, 0)?;
     let duration: u64 = num(args, "--duration", 0)?;
+    let persist = persist_opts(args)?;
+    if flag(args, "--directory").is_some() && flag(args, "--shard").is_none() {
+        return Err("--directory solo tiene sentido con --shard".into());
+    }
     let link = UdpLink::bind(&bind).map_err(|e| format!("no se pudo abrir {bind}: {e}"))?;
     let local = link.local_addr().map_err(|e| e.to_string())?;
     let tick_ms = cfg.tick_ms;
     let mut listening = vec![("jugadores", local)];
-    let mut server = match flag(args, "--shard") {
+    // El secreto de donde sale la clave de integridad del almacén: la de cluster en un shard (todos
+    // los shards la comparten y cada uno deriva la suya), la maestra en un servidor suelto.
+    let (mut server, store_secret) = match flag(args, "--shard") {
         None => {
             for f in ["--grid", "--peers", "--bus-bind", "--cluster-key-file"] {
                 if flag(args, f).is_some() {
                     return Err(format!("{f} solo tiene sentido con --shard"));
                 }
             }
-            GameServer::new(
-                link,
-                auth,
-                cfg,
-                ServerConfig::default(),
-                Box::new(OsEntropy),
+            let secret = if persist.is_some() {
+                master_key(args)?
+            } else {
+                Vec::new()
+            };
+            (
+                GameServer::new(
+                    link,
+                    auth,
+                    cfg,
+                    ServerConfig::default(),
+                    Box::new(OsEntropy),
+                ),
+                secret,
             )
         }
         Some(_) => {
-            let (server, bus_addr) = serve_shard(args, link, auth, cfg)?;
-            listening.push(("bus entre shards", bus_addr));
-            server
+            let boot = serve_shard(args, link, auth, cfg)?;
+            listening.push(("bus entre shards", boot.bus_addr));
+            (boot.server, boot.cluster_key)
         }
+    };
+    let restore = match &persist {
+        Some(p) => {
+            let medium = open_medium(&p.dir)?;
+            let key = server.store_key(&store_secret);
+            let rep = server.enable_persistence(Box::new(medium), &key, p.cfg.clone(), p.mode)?;
+            Some((p.dir.clone(), rep))
+        }
+        None => None,
     };
     let cluster_note = server
         .shard_id()
@@ -264,11 +395,16 @@ pub fn cmd_serve(args: &[String]) -> Result<(), String> {
         server.entity_count(),
         tsofgw_online::par::resolve_threads(server.config().threads)
     );
+    if let Some((dir, rep)) = &restore {
+        println!("{}", describe_restore(dir, rep));
+    }
     if let Some(aviso) = exposure_warning(&listening) {
         eprintln!("{aviso}");
     }
+    tsofgw_sys::stop::install();
     let start = Instant::now();
     let mut last_report = 0u64;
+    let mut warned_store = false;
     loop {
         let now = start.elapsed().as_millis() as u64;
         server.update(now);
@@ -304,13 +440,58 @@ pub fn cmd_serve(args: &[String]) -> Result<(), String> {
                     c.bus_rejected,
                     c.bus_malformed
                 );
+                if server.cluster_config().is_some_and(|c| c.directory) {
+                    println!(
+                        "          sesiones: entradas redirigidas {} | esperando al directorio {} | traspasos sin acuse {}",
+                        c.login_redirects,
+                        c.login_waits,
+                        server.handover_outbox().len()
+                    );
+                }
+            }
+            if let Some(st) = server.persist_stats() {
+                println!(
+                    "          almacén: commits {} | NPC guardados {} | jugadores guardados {} | compactaciones {} | diario {:.1} KB | promesas retenidas {}",
+                    st.commits,
+                    st.npc_saves,
+                    st.player_saves,
+                    st.compactions,
+                    server.store_log_bytes().unwrap_or(0) as f64 / 1000.0,
+                    st.deferred_dropped
+                );
             }
         }
+        if server.persistence_failed() && !warned_store {
+            warned_store = true;
+            eprintln!(
+                "ERROR: el almacén falló al escribir. Este servidor sigue jugando en memoria pero ya no promete nada \
+                 (no entrega ni acepta cuentas ni NPC de forma duradera). Lo ya sincronizado está a salvo: revisa el \
+                 disco y reinícialo."
+            );
+        }
+        if tsofgw_sys::stop::requested() {
+            println!("Parada pedida: cerrando el servidor...");
+            break;
+        }
         if duration > 0 && now >= duration * 1000 {
-            return Ok(());
+            break;
         }
         std::thread::sleep(Duration::from_millis(1));
     }
+    let persistent = server.persistence_enabled();
+    server.shutdown()?;
+    if persistent {
+        println!("Cierre limpio: estado guardado, almacén compactado y clientes avisados.");
+    }
+    Ok(())
+}
+
+/// Un shard listo para arrancar y lo que hace falta saber de él.
+struct ShardBoot {
+    server: GameServer<UdpLink>,
+    bus_addr: SocketAddr,
+    /// La clave de cluster, de donde sale la clave de integridad de su almacén.
+    cluster_key: Vec<u8>,
 }
 
 /// Un shard de un cluster: lee la rejilla, las direcciones de los demás shards y la clave del cluster.
@@ -319,7 +500,7 @@ fn serve_shard(
     link: UdpLink,
     auth: Authority,
     cfg: GameConfig,
-) -> Result<(GameServer<UdpLink>, SocketAddr), String> {
+) -> Result<ShardBoot, String> {
     let shard: u16 = num(args, "--shard", 0)?;
     let (cols, rows) = parse_grid(
         &flag(args, "--grid")
@@ -349,14 +530,22 @@ fn serve_shard(
             n - 1
         ));
     }
+    let directory = flag(args, "--directory")
+        .map(|a| resolve(&a).map_err(|e| format!("--directory: {e}")))
+        .transpose()?;
     let bus_bind = flag(args, "--bus-bind").unwrap_or_else(|| peers[shard as usize].to_string());
-    let mut bus = UdpBus::bind(shard, &bus_bind, n, &key)?;
+    // Con directorio, el bus tiene un par más: el directorio, con el identificador siguiente al último shard.
+    let mut bus = UdpBus::bind(shard, &bus_bind, n + usize::from(directory.is_some()), &key)?;
     for (j, a) in peers.iter().enumerate() {
         if j != shard as usize {
             bus.set_peer(j as u16, *a)?;
         }
     }
-    let cluster = ClusterConfig::new(shard, partition, &cfg)?;
+    if let Some(a) = directory {
+        bus.set_peer(n as u16, a)?;
+    }
+    let mut cluster = ClusterConfig::new(shard, partition, &cfg)?;
+    cluster.directory = directory.is_some();
     let bus_addr = bus
         .local_addr()
         .map_err(|e| format!("no se pudo leer la dirección del bus: {e}"))?;
@@ -369,7 +558,11 @@ fn serve_shard(
         cluster,
         Box::new(bus),
     )?;
-    Ok((server, bus_addr))
+    Ok(ShardBoot {
+        server,
+        bus_addr,
+        cluster_key: key,
+    })
 }
 
 /// `tsofgw bots`: bots reales que se conectan por UDP a un servidor.
@@ -463,10 +656,15 @@ pub fn cmd_bots(args: &[String]) -> Result<(), String> {
             };
             let switches: u64 = bots.iter().map(|b| b.client.stats().switches).sum();
             let failed: u64 = bots.iter().map(|b| b.client.stats().switch_failures).sum();
+            let entradas: u64 = bots.iter().map(|b| b.client.stats().login_redirects).sum();
             let extra = if shard_addrs.is_empty() {
                 String::new()
             } else {
-                format!(" | cambios de shard {switches} ({failed} fallidos)")
+                // Los cambios de shard son los traspasos en pleno juego; las entradas redirigidas, las veces
+                // que al pedir entrar el servidor mandó al cliente al shard de su cuenta.
+                format!(
+                    " | cambios de shard {switches} ({failed} fallidos) | entradas redirigidas {entradas}"
+                )
             };
             println!(
                 "[{:>4} s] jugando {playing}/{count} | RTT medio {rtt:.1} ms{extra}",
@@ -511,8 +709,10 @@ pub fn cmd_loadtest(args: &[String]) -> Result<(), String> {
             "--bus-jitter",
             "--patrol",
             "--patrol-ms",
+            "--chaos",
+            "--chaos-seed",
         ],
-        &["--udp", "--lod"],
+        &["--udp", "--lod", "--persist", "--directory"],
     )?;
     let mut game = game_config(args, 1)?;
     let clients: usize = num(args, "--clients", 100)?;
@@ -531,6 +731,11 @@ pub fn cmd_loadtest(args: &[String]) -> Result<(), String> {
     }
     if let Some(spec) = flag(args, "--shards") {
         return loadtest_cluster(args, &spec, clients, seconds, game, loss, dup);
+    }
+    for f in ["--persist", "--directory", "--chaos", "--chaos-seed"] {
+        if flag(args, f).is_some() || has(args, f) {
+            return Err(format!("{f} solo tiene sentido con --shards"));
+        }
     }
     if has(args, "--udp") {
         return loadtest_udp(clients, seconds, game);
@@ -572,6 +777,23 @@ fn loadtest_cluster(
     if !(0.0..=0.9).contains(&bus_loss) {
         return Err("--bus-loss debe estar entre 0 y 0.9".into());
     }
+    // Persistencia en los shards (en memoria, con caídas inyectables), directorio de sesiones y una
+    // tormenta de caídas: cada nivel exige el anterior y todos exigen la red simulada.
+    let chaos: usize = num(args, "--chaos", 0)?;
+    let directory = has(args, "--directory");
+    let persist = has(args, "--persist") || directory || chaos > 0;
+    if !(0..=500).contains(&chaos) {
+        return Err("--chaos debe estar entre 0 y 500 rondas".into());
+    }
+    if flag(args, "--chaos-seed").is_some() && chaos == 0 {
+        return Err("--chaos-seed solo tiene sentido con --chaos".into());
+    }
+    if persist && has(args, "--udp") {
+        return Err(
+            "--persist, --directory y --chaos usan la red simulada: no se combinan con --udp"
+                .into(),
+        );
+    }
     let s = ClusterScenario {
         grid: (cols, rows),
         clients,
@@ -593,14 +815,54 @@ fn loadtest_cluster(
             seed: game.seed ^ 0x5eed,
         },
         game,
+        persist: persist.then(PersistConfig::default),
+        directory,
+        // Con persistencia los clientes que pierden la conexión vuelven a entrar solos, como en un juego
+        // real; con directorio entran por cualquier shard y el cluster los lleva al suyo.
+        reconnect: Reconnect {
+            enabled: persist,
+            delay_ms: 500,
+            any_shard: directory,
+        },
         ..ClusterScenario::default()
     };
     if has(args, "--udp") {
         return loadtest_cluster_udp(&s);
     }
-    let r = run_cluster(&s)?;
+    let r = if chaos > 0 {
+        run_cluster_chaos(&s, chaos, num(args, "--chaos-seed", 1u64)?)?
+    } else {
+        run_cluster(&s)?
+    };
     print!("{}", r.render());
-    cluster_verdict(&r.invariants, s.clients)
+    cluster_report_verdict(&r, s.clients)
+}
+
+/// El veredicto de un cluster con persistencia: además del reparto final, durante toda la marcha no debe
+/// haberse visto ninguna cuenta duplicada, simulada por dos shards, perdida ni en desacuerdo con el
+/// directorio.
+fn cluster_report_verdict(r: &ClusterReport, clients: usize) -> Result<(), String> {
+    cluster_verdict(&r.invariants, clients)?;
+    violations_verdict(&r.violations)?;
+    if r.persistent
+        && r.shards
+            .iter()
+            .any(|s| s.store.as_ref().is_some_and(|st| st.failed))
+    {
+        return Err("el almacén de algún shard falló durante la prueba".into());
+    }
+    Ok(())
+}
+
+fn violations_verdict(v: &Violations) -> Result<(), String> {
+    if *v == Violations::default() {
+        return Ok(());
+    }
+    Err(format!(
+        "se violó un invariante durante la marcha: cuentas residentes en dos shards {}, simuladas por dos shards a \
+         la vez {}, cuentas desaparecidas {}, residentes que el directorio sitúa en otro shard {}, NPC sin dueño {}",
+        v.resident_duplicates, v.simulated_twice, v.lost_accounts, v.dir_mismatch, v.npc_lost
+    ))
 }
 
 /// El reparto de un cluster debe quedar perfecto al terminar: nada perdido ni duplicado y todos jugando.
@@ -818,5 +1080,16 @@ mod tests {
         // Todo exacto pero faltan jugadores jugando: tampoco es un resultado válido.
         let e = cluster_verdict(&exact(18), 20).unwrap_err();
         assert!(e.contains("jugando 18/20"), "{e}");
+    }
+
+    #[test]
+    fn una_violacion_durante_la_marcha_basta_para_suspender() {
+        assert!(violations_verdict(&Violations::default()).is_ok());
+        let v = Violations {
+            simulated_twice: 1,
+            ..Violations::default()
+        };
+        let e = violations_verdict(&v).unwrap_err();
+        assert!(e.contains("simuladas por dos shards a la vez 1"), "{e}");
     }
 }

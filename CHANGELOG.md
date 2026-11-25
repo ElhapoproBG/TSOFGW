@@ -1,5 +1,56 @@
 # Cambios
 
+## 0.5.0 — Persistencia y directorio de sesiones
+Responde a lo que más dolía del clúster de la 0.4: un shard reiniciado perdía su estado, un traspaso perdido durante una partición larga podía perder a un jugador, y nada impedía que una cuenta estuviera en dos shards a la vez. Se empezó **después de leer la CI de la 0.4.3** (en verde), así que lo nuevo se apoya en algo confirmado fuera de mi máquina; **lo nuevo de la 0.5.0 todavía no ha corrido en la CI**.
+
+**Resultado de la ejecución de la 0.4.3** (commit `abe28d2`; los 7 trabajos en verde)
+- Linux, Windows y macOS con el compilador fijado (1.97.0): formato, Clippy sin avisos y las **228 pruebas**; los recuentos de las pruebas de humo coinciden (clúster simulado de 2 shards: 6 traspasos de jugador, 0 pérdidas ni duplicados). Sobre UDP real (solo Linux): 8 traspasos, 0 perdidos o duplicados. En Windows y macOS esa prueba de humo se salta a propósito.
+- **Rust estable más reciente (1.100.0, informativo): en verde**, con formato, Clippy y las 228 pruebas: los 9 avisos que quedaban estaban corregidos.
+- **wgpu** con llvmpipe: la prueba pasa y la escena `mixta` a 320×240 da una diferencia media de 0,051/255 y máxima de 1.
+
+**Un almacén durable nuevo: `tsofgw-store`**
+- Mapa clave-valor ordenado con **diario** (*write-ahead log*) y **checkpoints**, solo con la biblioteca estándar y el HMAC del proyecto. Lotes atómicos; cada registro y cada checkpoint llevan un HMAC-SHA256 en el que entran la secuencia y la generación (no se pueden quitar, repetir ni mezclar registros); una escritura a medias al final del diario se descarta y se informa (`torn_bytes`), un daño en medio es un error (o, con `--repair`, se corta ahí y se avisa); abrir con la clave equivocada falla y **nunca borra nada**; un almacén nuevo escribe un checkpoint ancla autenticado.
+- Dos medios: archivos reales (`snap-<generación>.bin`, `wal-<generación>.log`, bloqueo `LOCK` exclusivo, checkpoint con archivo temporal, sincronización y renombrado) y memoria **con fallos inyectables** (caída limpia, con cola rota o con huecos, errores de escritura y de sincronización, caída antes o después de renombrar un checkpoint). La misma lógica se prueba en cada byte contra el medio que sabe fallar.
+- Límite honesto: el almacén sincroniza al menos cada 4 MiB, así que lo anterior a los últimos 8 MiB del diario seguro estaba en disco; un daño dentro de esa ventana es indistinguible de una escritura a medias y se descarta.
+
+**El clúster guarda su estado**
+- Cada shard guarda sus NPC (posición, dirección, giro, generador), sus jugadores (posición y **época**), sus traspasos pendientes (de NPC y de jugador) y **lápidas** (una cuenta que salió de aquí no resucita por una repetición vieja). Cada NPC y cada cuenta está bajo exactamente una clave a la vez: el paso de una a otra es un solo lote atómico, y por eso tras cualquier caída hay un dueño, nunca cero ni dos.
+- **Escribir antes de prometer:** una promesa al otro lado («lo adopté», «te lo entrego») sale solo después del `commit` al final de la vuelta del tick. Si el disco falla, el shard descarta lo retenido y deja de prometer; no miente.
+- Lo no crítico (la posición de quien camina, el estado de los NPC) se escribe sin sincronizar y se hace durable cada pocos ticks: una caída pierde como mucho ese intervalo de movimiento, nunca la propiedad de nada. Un cierre limpio lo guarda todo.
+- Los traspasos pendientes **se retoman tras un reinicio** y, con persistencia, el buzón de salida **no se rinde nunca** (reintenta despacio): una partición larga ya no puede perder a un jugador (la prueba corta la red 40 s simulados, cuatro veces el plazo de 10 s tras el cual la 0.4 se rendía).
+
+**Directorio de sesiones**
+- Un proceso nuevo (`tsofgw directory`) con su propio almacén guarda `(shard, época)` por cuenta. Cuatro mensajes nuevos en el bus: `DirLogin`, `DirRoute`, `DirTransfer` y `DirResult`. El cambio de dueño es un *compare-and-swap* sobre la época, idempotente, **anotado en disco antes de responder**; el origen no envía el estado hasta tener la anotación y el destino no acusa hasta haberlo escrito. `Handover` lleva ahora la época: un traspaso repetido, tardío o con una época que el destino ya conoce no resucita ni hace retroceder a nadie.
+- **Entrar:** con directorio, un shard que no es el dueño redirige al cliente; el cliente con `Connector` sigue la redirección solo. Las cuentas nuevas se crean en el shard que posee su punto de aparición, y sin directorio también (mejor esfuerzo con lápidas como punteros de reenvío; la unicidad solo se garantiza con directorio).
+- **Si se pierde su carpeta,** `tsofgw store rebuild-directory` la reconstruye a partir de lo que guardan los shards (parados); se niega a elegir por su cuenta entre dos reclamaciones iguales (`--accept-conflicts`) y a reconstruir sobre una carpeta con datos.
+- **Incompatible con la 0.4.x en el bus:** `Handover` cambió de formato y la huella de configuración ahora incluye si hay directorio (versión 2), así que los shards 0.4.x y 0.5.0 se rechazan entre sí como «otra configuración de mundo». Actualiza todo el clúster a la vez.
+
+**Línea de comandos**
+- `tsofgw serve --data-dir CARPETA` (más `--sync-ticks`, `--npc-save-ticks`, `--player-save-ticks`, `--compact-mb`, `--repair`, y `--directory DIR` en un shard); `tsofgw directory …`; `tsofgw store info` (con `--shard`, `--directory` o `--standalone`; **no crea nunca un almacén**) y `tsofgw store rebuild-directory`; `tsofgw loadtest --directory --chaos N [--chaos-seed S]`. Las claves siguen sin aceptarse por la línea de comandos.
+- **Cierre limpio:** `Ctrl-C`, `SIGINT` y `SIGTERM` (en Windows, `Ctrl-C` y `Ctrl-Break`; `tsofgw-sys::stop`) guardan el estado, compactan y **expulsan a los clientes con aviso**. `tsofgw bots` imprime ahora `cambios de shard N (F fallidos) | entradas redirigidas E`.
+
+**La prueba de las pruebas (`ci/mutaciones.py`)**
+- Estropea el código a propósito, de uno en uno, con 23 defectos que un programador podría cometer de verdad (9 en el almacén y 14 en la persistencia del clúster: acusar antes de escribir, responder desde un directorio con el disco caído, no comprobar una etiqueta, olvidar la lápida, aceptar una época vieja, rendirse tras un tiempo…) y exige que la suite falle con cada uno. Resultado de la ejecución completa: **23 de 23 defectos detectados** (14 de la persistencia del clúster y 9 del almacén), ejecutados con el código final de esta versión.
+- **Encontró un hueco real** (S7): un checkpoint que no sincronizara antes lo escrito sin sincronizar lo perdía en una caída sin que ninguna prueba del almacén lo notara. Se cerró con una prueba nueva (`un_checkpoint_que_no_llega_a_instalarse_no_pierde_lo_escrito_sin_sincronizar`).
+- La CI comprueba en cada ejecución (Linux) que cada parche del catálogo aún se aplica, y hay un trabajo manual (*Run workflow*) para la ejecución completa. **Ese trabajo manual no se ha ejecutado nunca en Actions.**
+
+**Cómo se probó**
+- **292 pruebas pasan**, con la librería C y con el respaldo en Rust puro (la 0.4.3 tenía 228). Entre ellas, 15 pruebas de persistencia del clúster que vigilan **durante toda la marcha** (cada 100 ms simulados) que ninguna cuenta esté en dos shards, ninguna desaparezca y ningún NPC se quede sin dueño: una tormenta de caídas aleatorias, **una caída en cada punto del traspaso de un jugador** (origen, destino, los dos y el directorio; corte limpio y cola rota; con y sin directorio), particiones largas, directorio caído y reconstruido, un disco que falla justo al prometer, y traspasos viejos, repetidos o con época falsificada.
+- Desde la línea de comandos: `loadtest --shards 2x2 --directory --chaos 8` (la orden de la CI): en 8 rondas, 9 caídas de shard (3 dobles) y 2 del directorio, 57 reconexiones de clientes y, al final, 32 cuentas con 0 duplicadas, 0 perdidas y 0 distintas del directorio; en lo vigilado cada 100 ms, 0 violaciones.
+- **Procesos reales:** un cluster de 2 shards y un directorio como procesos separados, con 10 bots que cruzan el borde; se hace `kill -9` a un shard y al directorio, se reinician con sus carpetas, los mismos jugadores vuelven a entrar y al final cada cuenta está en un solo shard, el directorio coincide con los shards y `store rebuild-directory` reconstruye el mismo reparto. También: `SIGTERM` que cierra guardando (unix), y la negativa a abrir con otra clave o con la carpeta de otro mundo.
+
+**Medidas (simulador, no un disco real)**
+- Tiempo de un traspaso de jugador con `loadtest --shards 2x2 --clients 200 --npcs 4000 --seconds 20 --patrol 100` (unos 235 traspasos por ejecución, bus simulado de 10 ms): de media **37 ms** sin persistencia, **43 ms** con ella y **67 ms** con directorio (una ida y vuelta más); máximos de 200, 400 y 250 ms. La resolución es de un tick (50 ms): son órdenes de magnitud. El simulador no modela el coste de `fsync`: con disco real cada traspaso fuerza sincronizaciones en el origen, el destino y el directorio. **Coste en un disco real** (procesos `serve` y `bots`, 4000 NPC, 60 bots; disco virtual rápido, `fsync` de mediana 0,14 ms): en 90 s el tick medio fue de 1,46 ms con `--data-dir` y 1,45 ms sin él (máximos de 9,4 y 6,2 ms); una de las cinco ejecuciones con persistencia tuvo un tick de 135 ms que no se repitió. El almacén sincroniza en el hilo del tick: un `fsync` lento se nota como un tick largo. No dice nada de un disco duro o un volumen de red.
+
+**Defectos encontrados al construirlo** (documento 10, sección 10)
+- Tras un cierre limpio los clientes seguían creyendo que jugaban hasta que vencía el tiempo de espera del transporte (5 s): ahora se les avisa.
+- `tsofgw store info` creaba un almacén vacío si se le daba una ruta equivocada: ahora comprueba que existe y no crea nada.
+- El banco de pruebas contaba como pérdida lo que eran registros no durables de un shard con el disco caído, y comprobaba el reparto exacto en un instante en que un NPC cruzaba un borde: era el banco, no el motor.
+- El hueco S7 del almacén, arriba.
+
+**Límites (documento 10, sección 11)**
+- **Sin cifrado** de la red ni del disco; **la clave de clúster es confianza total** (también suplanta al directorio); **el directorio es un solo proceso** sin alta disponibilidad; **no se detecta que devuelvan una copia vieja** de una carpeta; un daño en los últimos 8 MiB del diario se toma por una escritura a medias; las lápidas crecen; el almacén vive en memoria y un checkpoint bloquea el tick; la ventana de repeticiones de NPC es finita; un shard con el disco fallado deja de prometer hasta reiniciarse; los clientes no se reconectan solos tras una caída; el manejador de señales de Windows solo se comprobó con el compilador; todo se probó en una sola máquina.
+
 ## 0.4.3 — La CI en verde
 Tercera lectura de la integración continua (la ejecución de la 0.4.2, commit `5849357`): **terminó en verde**. Esta versión no añade funciones ni cambia comportamiento: corrige los 9 avisos que el Rust estable más reciente (1.100.0) todavía marca en el trabajo informativo y deja registrados los resultados reales.
 

@@ -25,12 +25,16 @@
 //! verdad del conjunto del cluster.
 
 use tsofgw_net::{quantize, EntityState};
+use tsofgw_store::Batch;
 use tsofgw_transport::{Authority, Entropy, Link, ServerConfig, SessionId};
 use tsofgw_world::{EntityId, FastMap, Rng, Vec3};
 
 use super::{vec3_from_q, GameConfig, GameServer, Npc, KIND_NPC, KIND_PLAYER, NPC_BASE};
-use crate::bus::{ghost_chunks, NpcXfer, PeerBus, PeerMsg, MAX_PEER_MSG};
+use crate::bus::{ghost_chunks, DirStatus, NpcXfer, PeerBus, PeerMsg, MAX_PEER_MSG};
 use crate::partition::{Partition, Rect, ShardId};
+use crate::persist::{
+    k_ho, k_npc, k_player, k_tomb, k_xi, k_xo, HoRec, HoStage, NpcRec, PlayerRec, TombRec, XoRec,
+};
 use crate::protocol::{self as proto, Welcome};
 use crate::sim::PlayerState;
 use crate::states::Own;
@@ -58,6 +62,10 @@ pub struct ClusterConfig {
     pub handoff_timeout_ticks: u32,
     /// Ticks durante los que se recuerdan los traspasos de NPC ya adoptados (para detectar repeticiones).
     pub xfer_memory_ticks: u32,
+    /// Hay un **directorio de sesiones** en el bus (un par más, con identificador `shard_count`) y los
+    /// shards le preguntan dónde vive cada cuenta antes de dejarla entrar. Debe valer lo mismo en todos
+    /// los shards y en el directorio; exige activar la persistencia en cada shard.
+    pub directory: bool,
 }
 
 impl ClusterConfig {
@@ -79,6 +87,7 @@ impl ClusterConfig {
             handoff_cooldown_ticks: 40,
             handoff_timeout_ticks: 200,
             xfer_memory_ticks: 1200,
+            directory: false,
         };
         c.validate(game)?;
         Ok(c)
@@ -89,9 +98,10 @@ impl ClusterConfig {
     /// fantasmas. Lo que es política local (hilos, límites de jugadores, reintentos...) no cuenta.
     pub fn digest(&self, game: &GameConfig) -> u64 {
         let (nx, nz, half) = self.partition.shape();
-        let mut b: Vec<u8> = b"tsofgw/cluster-config/v1".to_vec();
+        let mut b: Vec<u8> = b"tsofgw/cluster-config/v2".to_vec();
         b.extend_from_slice(&nx.to_le_bytes());
         b.extend_from_slice(&nz.to_le_bytes());
+        b.push(self.directory as u8);
         for f in [
             half,
             game.interest_radius,
@@ -108,6 +118,12 @@ impl ClusterConfig {
         b.extend_from_slice(&game.seed.to_le_bytes());
         let h = tsofgw_pack::sha256(&b);
         u64::from_le_bytes([h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]])
+    }
+
+    /// Identificador del directorio de sesiones en el bus, si lo hay: el siguiente al último shard.
+    pub fn dir_peer(&self) -> Option<ShardId> {
+        self.directory
+            .then(|| self.partition.shard_count() as ShardId)
     }
 
     pub fn validate(&self, game: &GameConfig) -> Result<(), String> {
@@ -134,6 +150,9 @@ impl ClusterConfig {
                     self.ghost_margin
                 ));
             }
+        }
+        if self.directory && self.partition.shard_count() >= ShardId::MAX as usize {
+            return Err("con directorio no caben más de 65 534 shards".into());
         }
         if self.ghost_ttl_ticks < 2 || self.retry_ticks == 0 {
             return Err("ghost_ttl_ticks debe ser ≥ 2 y retry_ticks ≥ 1".into());
@@ -178,8 +197,86 @@ pub struct ClusterStats {
     pub redirect_retries: u64,
     /// Traspasos que el origen dio por hechos sin recibir el acuse final.
     pub handovers_unacked: u64,
+    /// Traspasos de jugador que el destino acusó, y cuántos ticks pasaron en cada uno desde que la
+    /// autoridad salió de este shard hasta ese acuse (suma y máximo). Es lo que cuesta el camino
+    /// seguro: escribir a disco antes de entregar, anotar el cambio en el directorio y esperar al
+    /// destino, que también escribe antes de acusar.
+    pub handover_acked: u64,
+    pub handover_ticks_sum: u64,
+    pub handover_ticks_max: u32,
     pub arrivals_completed: u64,
     pub arrivals_expired: u64,
+    /// Traspasos de jugador que se repitieron y se reenviaron porque seguían sin acuse.
+    pub handover_retries: u64,
+    /// `HANDOVER` repetidos o de una época que este shard ya conocía (se acusan, no se adoptan).
+    pub handovers_stale: u64,
+    /// `HANDOVER` de una cuenta que ya está conectada aquí con otra época (no debería ocurrir).
+    pub handover_conflicts: u64,
+    /// `HANDOVER` que llegaron mientras este shard aún esperaba el acuse de un traspaso de esa misma
+    /// cuenta hacia fuera: se ignoran y el origen los reenvía.
+    pub handovers_deferred: u64,
+    /// Jugadores adoptados sin que su cliente estuviera aquí (quedan residentes hasta que entren).
+    pub offline_adoptions: u64,
+    /// Preguntas al directorio al entrar, respuestas recibidas y su resultado.
+    pub dir_logins: u64,
+    pub dir_routes_in: u64,
+    pub dir_transfers_out: u64,
+    pub dir_results_in: u64,
+    /// Cambios de dueño que el directorio rechazó (la cuenta no estaba donde creíamos) o no conocía.
+    pub dir_rejected: u64,
+    pub dir_unknown: u64,
+    /// Clientes que pidieron entrar en un shard que no era el de su cuenta (se les redirigió).
+    pub login_redirects: u64,
+    /// Entradas que tuvieron que esperar (a que el directorio contestara o llegara el estado).
+    pub login_waits: u64,
+}
+
+impl ClusterStats {
+    /// Suma los contadores de `other` a los de `self` (por ejemplo, de varias vidas de un shard que se
+    /// reinició).
+    pub fn merge(&mut self, other: &ClusterStats) {
+        self.bus_msgs_out += other.bus_msgs_out;
+        self.bus_bytes_out += other.bus_bytes_out;
+        self.bus_msgs_in += other.bus_msgs_in;
+        self.bus_bytes_in += other.bus_bytes_in;
+        self.bus_malformed += other.bus_malformed;
+        self.bus_rejected += other.bus_rejected;
+        self.bus_config_mismatch += other.bus_config_mismatch;
+        self.ghost_msgs_out += other.ghost_msgs_out;
+        self.ghost_players_out += other.ghost_players_out;
+        self.ghost_npcs_out += other.ghost_npcs_out;
+        self.ghost_applied += other.ghost_applied;
+        self.ghost_stale += other.ghost_stale;
+        self.ghost_expired += other.ghost_expired;
+        self.npc_xfers_out += other.npc_xfers_out;
+        self.npc_xfer_retries += other.npc_xfer_retries;
+        self.npc_xfers_in += other.npc_xfers_in;
+        self.npc_xfer_dups += other.npc_xfer_dups;
+        self.npc_xfer_conflicts += other.npc_xfer_conflicts;
+        self.handoffs_started += other.handoffs_started;
+        self.handoffs_completed += other.handoffs_completed;
+        self.handoffs_aborted += other.handoffs_aborted;
+        self.redirect_retries += other.redirect_retries;
+        self.handovers_unacked += other.handovers_unacked;
+        self.handover_acked += other.handover_acked;
+        self.handover_ticks_sum += other.handover_ticks_sum;
+        self.handover_ticks_max = self.handover_ticks_max.max(other.handover_ticks_max);
+        self.arrivals_completed += other.arrivals_completed;
+        self.arrivals_expired += other.arrivals_expired;
+        self.handover_retries += other.handover_retries;
+        self.handovers_stale += other.handovers_stale;
+        self.handover_conflicts += other.handover_conflicts;
+        self.handovers_deferred += other.handovers_deferred;
+        self.offline_adoptions += other.offline_adoptions;
+        self.dir_logins += other.dir_logins;
+        self.dir_routes_in += other.dir_routes_in;
+        self.dir_transfers_out += other.dir_transfers_out;
+        self.dir_results_in += other.dir_results_in;
+        self.dir_rejected += other.dir_rejected;
+        self.dir_unknown += other.dir_unknown;
+        self.login_redirects += other.login_redirects;
+        self.login_waits += other.login_waits;
+    }
 }
 
 /// Estado de traspaso de un jugador conectado a este shard.
@@ -200,14 +297,11 @@ pub(crate) enum Handoff {
         since: u32,
         last_sent: u32,
     },
-    /// La autoridad ya se entregó: este shard no simula ni replica a este jugador.
+    /// La autoridad ya se entregó: este shard no simula ni replica a este jugador. El estado que se
+    /// lleva el destino y los reintentos viven en el buzón de salida, que no depende de la sesión.
     HandedOver {
         to: ShardId,
         xfer: u32,
-        pos: [i32; 3],
-        last_processed: u32,
-        since: u32,
-        last_sent: u32,
     },
 }
 
@@ -224,6 +318,47 @@ struct OutXfer {
     sent: u32,
     msg: NpcXfer,
 }
+
+/// Un traspaso de jugador que este shard ha entregado y aún no ha recibido acuse. Es **independiente de
+/// la sesión**: sigue vivo aunque el cliente se desconecte, y con persistencia está también en disco, de
+/// modo que sobrevive a un reinicio y se reintenta sin límite hasta que el destino lo acuse.
+struct HoOut {
+    to: ShardId,
+    xfer: u32,
+    /// Época que tendrá la cuenta en el destino (la de aquí más uno).
+    epoch: u64,
+    pos: [i32; 3],
+    last_processed: u32,
+    /// ¿El directorio ya anotó el cambio de dueño? (sin directorio, siempre). Hasta entonces el estado
+    /// de la cuenta no se envía al destino: dos shards no pueden quedarse con ella.
+    committed: bool,
+    since: u32,
+    last_sent: u32,
+}
+
+/// Un traspaso de jugador entregado y sin acuse, tal como lo ve quien inspecciona un shard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutboxEntry {
+    pub account: u64,
+    /// Shard al que se entrega.
+    pub to: ShardId,
+    /// Época que tendrá la cuenta allí.
+    pub epoch: u64,
+    /// El directorio ya anotó el cambio de dueño (sin directorio, siempre). Hasta entonces la entrega
+    /// puede cancelarse; después ya no.
+    pub committed: bool,
+}
+
+/// Lo que respondió el directorio la última vez que se le preguntó por una cuenta.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct Route {
+    pub shard: ShardId,
+    pub epoch: u64,
+    at: u32,
+}
+
+/// Cuánto vale una respuesta del directorio que nadie ha usado (ticks).
+const ROUTE_TTL_TICKS: u32 = 400;
 
 /// Un jugador que otro shard va a pasarnos.
 struct Arrival {
@@ -246,6 +381,11 @@ pub(crate) struct ClusterNode {
     npc_out: FastMap<EntityId, OutXfer>,
     seen_xfers: FastMap<(ShardId, u32), u32>,
     arrivals: FastMap<u64, Arrival>,
+    /// Traspasos de jugador entregados y sin acuse, por cuenta.
+    outbox: FastMap<u64, HoOut>,
+    /// Respuestas del directorio aún sin usar, y cuándo se preguntó por última vez cada cuenta.
+    routes: FastMap<u64, Route>,
+    asked: FastMap<u64, u32>,
     next_xfer: u32,
     pub stats: ClusterStats,
     inbox: Vec<(ShardId, Vec<u8>)>,
@@ -267,15 +407,102 @@ impl ClusterNode {
             npc_out: FastMap::default(),
             seen_xfers: FastMap::default(),
             arrivals: FastMap::default(),
+            outbox: FastMap::default(),
+            routes: FastMap::default(),
+            asked: FastMap::default(),
             next_xfer: 0,
             stats: ClusterStats::default(),
             inbox: Vec::new(),
         }
     }
 
-    fn next_xfer(&mut self) -> u32 {
+    pub(super) fn next_xfer(&mut self) -> u32 {
         self.next_xfer = self.next_xfer.wrapping_add(1).max(1);
         self.next_xfer
+    }
+
+    /// Tras un reinicio: los números ya reservados (y quizá usados) no se repiten.
+    pub(super) fn set_next_xfer(&mut self, v: u32) {
+        self.next_xfer = v;
+    }
+
+    /// Identificador del directorio en el bus, si lo hay.
+    pub(super) fn dir_peer(&self) -> Option<ShardId> {
+        self.cfg.dir_peer()
+    }
+
+    pub(super) fn outbox_has(&self, account: u64) -> bool {
+        self.outbox.contains_key(&account)
+    }
+
+    /// Los traspasos de jugador sin acuse, por cuenta.
+    pub(super) fn outbox_summary(&self) -> Vec<OutboxEntry> {
+        let mut v: Vec<_> = self
+            .outbox
+            .iter()
+            .map(|(&account, h)| OutboxEntry {
+                account,
+                to: h.to,
+                epoch: h.epoch,
+                committed: h.committed,
+            })
+            .collect();
+        v.sort_unstable_by_key(|e| e.account);
+        v
+    }
+
+    /// Respuesta del directorio para una cuenta, si hay una vigente.
+    pub(super) fn route(&self, account: u64, tick: u32) -> Option<Route> {
+        self.routes
+            .get(&account)
+            .copied()
+            .filter(|r| tick.wrapping_sub(r.at) <= ROUTE_TTL_TICKS)
+    }
+
+    /// La respuesta ya se usó: la próxima entrada de esa cuenta vuelve a preguntar.
+    pub(super) fn consume_route(&mut self, account: u64) {
+        self.routes.remove(&account);
+    }
+
+    /// ¿Toca (re)preguntar al directorio por esta cuenta? Como mucho una vez por `retry_ticks`.
+    pub(super) fn should_ask_dir(&mut self, account: u64, tick: u32) -> bool {
+        let retry = self.cfg.retry_ticks;
+        match self.asked.get(&account) {
+            Some(&t) if tick.wrapping_sub(t) < retry => false,
+            _ => {
+                self.asked.insert(account, tick);
+                true
+            }
+        }
+    }
+
+    /// Restaura un traspaso de NPC sin acuse tras un reinicio (se reenvía enseguida).
+    pub(super) fn restore_npc_out(&mut self, id: EntityId, to: ShardId, msg: NpcXfer, tick: u32) {
+        let sent = tick.wrapping_sub(self.cfg.retry_ticks);
+        self.npc_out.insert(id, OutXfer { to, sent, msg });
+    }
+
+    /// Restaura el recuerdo de un traspaso de NPC ya adoptado.
+    pub(super) fn restore_seen(&mut self, from: ShardId, xfer: u32, tick: u32) {
+        self.seen_xfers.insert((from, xfer), tick);
+    }
+
+    /// Restaura un traspaso de jugador sin acuse tras un reinicio (se reenvía enseguida).
+    pub(super) fn restore_outbox(&mut self, account: u64, r: HoRec, tick: u32) {
+        let committed = r.stage == HoStage::Committed || self.dir_peer().is_none();
+        self.outbox.insert(
+            account,
+            HoOut {
+                to: r.to,
+                xfer: r.xfer,
+                epoch: r.epoch,
+                pos: r.pos,
+                last_processed: r.last_processed,
+                committed,
+                since: tick,
+                last_sent: tick.wrapping_sub(self.cfg.retry_ticks),
+            },
+        );
     }
 
     pub fn region(&self) -> Rect {
@@ -302,19 +529,13 @@ impl ClusterNode {
 enum Act {
     Prepare(SessionId),
     Redirect(SessionId, ShardId),
-    Handover(SessionId),
     Abort(SessionId, ShardId, u32),
-    GiveUp(SessionId),
 }
 
 impl Act {
     fn session(&self) -> SessionId {
         match self {
-            Act::Prepare(s)
-            | Act::Redirect(s, _)
-            | Act::Handover(s)
-            | Act::Abort(s, _, _)
-            | Act::GiveUp(s) => *s,
+            Act::Prepare(s) | Act::Redirect(s, _) | Act::Abort(s, _, _) => *s,
         }
     }
 }
@@ -389,7 +610,11 @@ impl<L: Link> GameServer<L> {
     /// hasta que el destino acusa recibo).
     pub fn owned_player_ids(&self) -> Vec<u64> {
         let mut v: Vec<u64> = self.by_entity.keys().copied().collect();
+        if let Some(c) = self.cluster.as_ref() {
+            v.extend(c.outbox.keys().copied());
+        }
         v.sort_unstable();
+        v.dedup();
         v
     }
 
@@ -405,18 +630,62 @@ impl<L: Link> GameServer<L> {
         self.cluster.as_ref().map_or(0, |c| c.npc_out.len())
     }
 
+    /// En qué fase está el traspaso de un jugador conectado a este shard: `"preparing"` (se avisó al
+    /// destino), `"redirecting"` (se mandó al cliente al destino), `"handed_over"` (la autoridad ya se
+    /// entregó) o `"none"`. `None` si la cuenta no está conectada aquí.
+    pub fn player_handoff_state(&self, account: u64) -> Option<&'static str> {
+        let p = self.player_by_id(account)?;
+        Some(match p.handoff {
+            Handoff::None => "none",
+            Handoff::Preparing { .. } => "preparing",
+            Handoff::Redirecting { .. } => "redirecting",
+            Handoff::HandedOver { .. } => "handed_over",
+        })
+    }
+
+    /// Traspasos de NPC enviados y sin acuse, como `(NPC, destino)`. Orden por NPC.
+    pub fn npc_transfers_out(&self) -> Vec<(EntityId, ShardId)> {
+        let mut v: Vec<_> = self
+            .cluster
+            .as_ref()
+            .map(|c| c.npc_out.iter().map(|(&id, o)| (id, o.to)).collect())
+            .unwrap_or_default();
+        v.sort_unstable();
+        v
+    }
+
     /// Jugadores con un traspaso en curso (en cualquiera de sus fases) o esperados aquí.
     pub fn pending_player_handoffs(&self) -> usize {
         self.players
             .values()
-            .filter(|p| !matches!(p.handoff, Handoff::None))
+            .filter(|p| !matches!(p.handoff, Handoff::None) && !p.frozen())
             .count()
-            + self.cluster.as_ref().map_or(0, |c| c.arrivals.len())
+            + self
+                .cluster
+                .as_ref()
+                .map_or(0, |c| c.arrivals.len() + c.outbox.len())
     }
 
-    /// ¿Este shard manda sobre ese jugador?
+    /// Cuentas que este shard **está simulando ahora mismo** (conectadas y no congeladas). Una cuenta no
+    /// puede estar en esta lista de dos shards a la vez, ni siquiera a mitad de un traspaso.
+    pub fn simulated_player_ids(&self) -> Vec<u64> {
+        let mut v: Vec<u64> = self
+            .players
+            .values()
+            .filter(|p| p.joined && !p.frozen())
+            .map(|p| p.entity)
+            .collect();
+        v.sort_unstable();
+        v
+    }
+
+    /// ¿Este shard manda sobre ese jugador? (También mientras lo tiene entregado sin acuse.)
     pub fn owns_player(&self, player_id: u64) -> bool {
         self.by_entity.contains_key(&player_id)
+            || self
+                .cluster
+                .as_ref()
+                .is_some_and(|c| c.outbox.contains_key(&player_id))
     }
 
     /// Estado replicado (cuantizado) de cualquier entidad que este shard conozca, propia o copia.
@@ -426,7 +695,7 @@ impl<L: Link> GameServer<L> {
 
     // ------------------------------------------------------------------ bus
 
-    fn peer_send(&mut self, to: ShardId, msg: &PeerMsg) {
+    pub(super) fn peer_send(&mut self, to: ShardId, msg: &PeerMsg) {
         let now = self.now_ms;
         if let Some(c) = self.cluster.as_mut() {
             let bytes = msg.encode();
@@ -451,12 +720,13 @@ impl<L: Link> GameServer<L> {
             };
             c.stats.bus_msgs_in += 1;
             c.stats.bus_bytes_in += data.len() as u64;
-            if from == c.cfg.shard || !c.cfg.partition.is_valid(from) {
+            let from_dir = c.dir_peer() == Some(from);
+            if from == c.cfg.shard || (!c.cfg.partition.is_valid(from) && !from_dir) {
                 c.stats.bus_malformed += 1;
                 continue;
             }
             match PeerMsg::decode(&data) {
-                Ok(m) => self.on_peer(from, m),
+                Ok(m) => self.on_peer(from, from_dir, m),
                 Err(_) => c.stats.bus_malformed += 1,
             }
         }
@@ -465,7 +735,17 @@ impl<L: Link> GameServer<L> {
         }
     }
 
-    fn on_peer(&mut self, from: ShardId, m: PeerMsg) {
+    fn on_peer(&mut self, from: ShardId, from_dir: bool, m: PeerMsg) {
+        // El directorio solo habla con DirRoute y DirResult; ningún shard puede enviarlos; y DirLogin y
+        // DirTransfer (que van al directorio) no tienen sentido en un shard.
+        let dir_reply = matches!(m, PeerMsg::DirRoute { .. } | PeerMsg::DirResult { .. });
+        let dir_request = matches!(m, PeerMsg::DirLogin { .. } | PeerMsg::DirTransfer { .. });
+        if dir_request || dir_reply != from_dir {
+            if let Some(c) = self.cluster.as_mut() {
+                c.stats.bus_malformed += 1;
+            }
+            return;
+        }
         match m {
             PeerMsg::Ghosts {
                 tick,
@@ -482,9 +762,24 @@ impl<L: Link> GameServer<L> {
                 player,
                 pos,
                 last_processed,
-            } => self.on_handover(from, xfer, player, pos, last_processed),
+                epoch,
+            } => self.on_handover(from, xfer, player, pos, last_processed, epoch),
             PeerMsg::HandoverAck { xfer, player } => self.on_handover_ack(from, xfer, player),
             PeerMsg::Abort { xfer, player } => self.on_abort(from, xfer, player),
+            PeerMsg::DirRoute {
+                account,
+                shard,
+                epoch,
+            } => self.on_dir_route(account, shard, epoch),
+            PeerMsg::DirResult {
+                xfer,
+                account,
+                status,
+                shard,
+                epoch,
+            } => self.on_dir_result(xfer, account, status, shard, epoch),
+            // Ya filtrados arriba.
+            PeerMsg::DirLogin { .. } | PeerMsg::DirTransfer { .. } => {}
         }
     }
 
@@ -718,7 +1013,18 @@ impl<L: Link> GameServer<L> {
         c.stats.npc_xfer_retries += resend.len() as u64;
 
         let memory = c.cfg.xfer_memory_ticks;
-        c.seen_xfers.retain(|_, t| tick.wrapping_sub(*t) <= memory);
+        let mut forgotten: Vec<(ShardId, u32)> = Vec::new();
+        c.seen_xfers.retain(|k, t| {
+            let keep = tick.wrapping_sub(*t) <= memory;
+            if !keep {
+                forgotten.push(*k);
+            }
+            keep
+        });
+        c.routes
+            .retain(|_, r| tick.wrapping_sub(r.at) <= ROUTE_TTL_TICKS);
+        c.asked
+            .retain(|_, t| tick.wrapping_sub(*t) <= ROUTE_TTL_TICKS);
 
         // Llegadas: reclamar la autoridad cuando el cliente ya está aquí; descartar las que no avanzan.
         let timeout = c.cfg.handoff_timeout_ticks;
@@ -746,8 +1052,19 @@ impl<L: Link> GameServer<L> {
         for id in expired {
             self.remove_ghost_entity(id);
         }
+        if !forgotten.is_empty() {
+            if let Some(pe) = self.persist.as_mut() {
+                // Lo que ya no se recuerda en memoria tampoco se guarda (no es crítico: si el borrado
+                // se pierde en una caída, el recuerdo caduca de nuevo tras el reinicio).
+                let mut b = Batch::new();
+                for (from, xfer) in forgotten {
+                    b.delete(k_xi(from, xfer));
+                }
+                pe.apply(&b);
+            }
+        }
         for (to, m) in resend {
-            self.peer_send(to, &PeerMsg::NpcXfer(m));
+            self.peer_send_durable(to, PeerMsg::NpcXfer(m));
         }
         for (from, xfer, player) in activate {
             self.peer_send(from, &PeerMsg::Activate { xfer, player });
@@ -760,9 +1077,10 @@ impl<L: Link> GameServer<L> {
             }
         }
         self.cluster_player_timers();
+        self.cluster_outbox_timers();
     }
 
-    /// Reenvíos y plazos de los traspasos de jugadores que este shard está entregando.
+    /// Reenvíos y plazos de los traspasos de jugadores que este shard está preparando.
     fn cluster_player_timers(&mut self) {
         let tick = self.tick;
         let Some(c) = self.cluster.as_ref() else {
@@ -772,7 +1090,7 @@ impl<L: Link> GameServer<L> {
         let mut acts: Vec<Act> = Vec::new();
         for (&s, p) in self.players.iter_mut() {
             match &mut p.handoff {
-                Handoff::None => {}
+                Handoff::None | Handoff::HandedOver { .. } => {}
                 Handoff::Preparing {
                     to,
                     xfer,
@@ -799,16 +1117,6 @@ impl<L: Link> GameServer<L> {
                         acts.push(Act::Redirect(s, *to));
                     }
                 }
-                Handoff::HandedOver {
-                    since, last_sent, ..
-                } => {
-                    if tick.wrapping_sub(*since) > timeout {
-                        acts.push(Act::GiveUp(s));
-                    } else if tick.wrapping_sub(*last_sent) >= retry {
-                        *last_sent = tick;
-                        acts.push(Act::Handover(s));
-                    }
-                }
             }
         }
         acts.sort_unstable_by_key(|a| a.session());
@@ -819,7 +1127,7 @@ impl<L: Link> GameServer<L> {
                         if let Some(Handoff::Preparing { to, .. }) =
                             self.players.get(&s).map(|p| p.handoff)
                         {
-                            self.peer_send(to, &m);
+                            self.peer_send_durable(to, m);
                         }
                     }
                 }
@@ -829,7 +1137,6 @@ impl<L: Link> GameServer<L> {
                     }
                     self.send_redirect(s, to);
                 }
-                Act::Handover(s) => self.resend_handover(s),
                 Act::Abort(s, to, xfer) => {
                     let Some(p) = self.players.get_mut(&s) else {
                         continue;
@@ -846,16 +1153,6 @@ impl<L: Link> GameServer<L> {
                     }
                     self.peer_send(to, &PeerMsg::Abort { xfer, player });
                 }
-                Act::GiveUp(s) => {
-                    if let Some(Handoff::HandedOver { to, .. }) =
-                        self.players.get(&s).map(|p| p.handoff)
-                    {
-                        if let Some(c) = self.cluster.as_mut() {
-                            c.stats.handovers_unacked += 1;
-                        }
-                        self.finish_handover(s, to);
-                    }
-                }
             }
         }
     }
@@ -871,11 +1168,11 @@ impl<L: Link> GameServer<L> {
         to: ShardId,
     ) {
         let tick = self.tick;
-        let npc = &self.npcs[idx];
-        let Some(c) = self.cluster.as_mut() else {
+        if self.cluster.is_none() {
             return;
-        };
-        let xfer = c.next_xfer();
+        }
+        let xfer = self.alloc_xfer();
+        let npc = &self.npcs[idx];
         let msg = NpcXfer {
             xfer,
             id,
@@ -884,17 +1181,35 @@ impl<L: Link> GameServer<L> {
             turn_in: npc.turn_in,
             rng: npc.rng.state(),
         };
-        c.npc_out.insert(
-            id,
-            OutXfer {
-                to,
-                sent: tick,
-                msg: msg.clone(),
-            },
-        );
-        c.stats.npc_xfers_out += 1;
+        // A disco antes que a ningún vecino: el NPC deja de ser «mío» y pasa a ser «en traspaso hacia
+        // `to`» en un único lote, así que tras cualquier caída consta bajo una sola de las dos claves.
+        if let Some(pe) = self.persist.as_mut() {
+            pe.clear_npc(idx);
+            let mut b = Batch::new();
+            b.delete(k_npc(idx));
+            b.put(
+                k_xo(idx),
+                XoRec {
+                    to,
+                    msg: msg.clone(),
+                }
+                .encode(),
+            );
+            pe.apply_critical(&b);
+        }
+        if let Some(c) = self.cluster.as_mut() {
+            c.npc_out.insert(
+                id,
+                OutXfer {
+                    to,
+                    sent: tick,
+                    msg: msg.clone(),
+                },
+            );
+            c.stats.npc_xfers_out += 1;
+        }
         self.ents.set_npc_own(idx, Own::Transferring);
-        self.peer_send(to, &PeerMsg::NpcXfer(msg));
+        self.peer_send_durable(to, PeerMsg::NpcXfer(msg));
     }
 
     fn on_npc_xfer(&mut self, from: ShardId, x: NpcXfer) {
@@ -914,8 +1229,15 @@ impl<L: Link> GameServer<L> {
         if c.seen_xfers.contains_key(&(from, x.xfer)) || own == Own::Owned {
             // Una repetición (el acuse se perdió) o ya es mío: basta con acusar de nuevo.
             c.stats.npc_xfer_dups += 1;
-            c.seen_xfers.insert((from, x.xfer), tick);
-            self.peer_send(from, &ack);
+            let first_time = c.seen_xfers.insert((from, x.xfer), tick).is_none();
+            if first_time {
+                if let Some(pe) = self.persist.as_mut() {
+                    let mut b = Batch::new();
+                    b.put(k_xi(from, x.xfer), vec![1]);
+                    pe.apply(&b);
+                }
+            }
+            self.peer_send_durable(from, ack);
             return;
         }
         if own == Own::Transferring {
@@ -926,6 +1248,13 @@ impl<L: Link> GameServer<L> {
         c.ghosts.remove(&x.id);
         c.seen_xfers.insert((from, x.xfer), tick);
         c.stats.npc_xfers_in += 1;
+        // A disco antes de acusar: si el acuse llega al origen, este shard ya es dueño de verdad.
+        if let Some(pe) = self.persist.as_mut() {
+            let mut b = Batch::new();
+            b.put(k_npc(idx), NpcRec::from_xfer(&x).encode());
+            b.put(k_xi(from, x.xfer), vec![1]);
+            pe.apply_critical(&b);
+        }
         let pos = Vec3::new(x.pos[0], x.pos[1], x.pos[2]);
         if own == Own::Absent {
             self.world.spawn(x.id, pos);
@@ -942,7 +1271,7 @@ impl<L: Link> GameServer<L> {
             data: KIND_NPC,
         };
         self.ents.set_npc_own(idx, Own::Owned);
-        self.peer_send(from, &ack);
+        self.peer_send_durable(from, ack);
     }
 
     fn on_npc_xfer_ack(&mut self, from: ShardId, xfer: u32, id: EntityId) {
@@ -966,10 +1295,28 @@ impl<L: Link> GameServer<L> {
                 from,
             },
         );
-        self.ents.set_npc_own((id - NPC_BASE) as usize, Own::Ghost);
+        let idx = (id - NPC_BASE) as usize;
+        self.ents.set_npc_own(idx, Own::Ghost);
+        // Ya no hace falta recordar el traspaso. Se sincroniza enseguida: si el borrado se perdiera en una
+        // caída, el NPC se reenviaría tras el reinicio, y el destino solo lo reconoce como repetido
+        // mientras recuerde el traspaso (`xfer_memory_ticks`).
+        if let Some(pe) = self.persist.as_mut() {
+            let mut b = Batch::new();
+            b.delete(k_xo(idx));
+            pe.apply_critical(&b);
+        }
     }
 
     // ------------------------------------------------------------------ jugadores: origen
+
+    /// ¿Hay directorio de sesiones y almacén para usarlo?
+    fn dir_active(&self) -> bool {
+        self.persist.is_some()
+            && self
+                .cluster
+                .as_ref()
+                .is_some_and(|c| c.dir_peer().is_some())
+    }
 
     /// Tras mover a los jugadores: ¿alguno se ha adentrado en otra región?
     pub(super) fn cluster_players_begin(&mut self) {
@@ -996,11 +1343,10 @@ impl<L: Link> GameServer<L> {
         }
         starts.sort_unstable_by_key(|s| s.0);
         for (s, to) in starts {
-            let Some(c) = self.cluster.as_mut() else {
-                return;
-            };
-            let xfer = c.next_xfer();
-            c.stats.handoffs_started += 1;
+            let xfer = self.alloc_xfer();
+            if let Some(c) = self.cluster.as_mut() {
+                c.stats.handoffs_started += 1;
+            }
             if let Some(p) = self.players.get_mut(&s) {
                 p.handoff = Handoff::Preparing {
                     to,
@@ -1010,7 +1356,7 @@ impl<L: Link> GameServer<L> {
                 };
             }
             if let Some(m) = self.prepare_msg(s) {
-                self.peer_send(to, &m);
+                self.peer_send_durable(to, m);
             }
         }
     }
@@ -1028,7 +1374,7 @@ impl<L: Link> GameServer<L> {
         })
     }
 
-    fn send_redirect(&mut self, session: SessionId, to: ShardId) {
+    pub(super) fn send_redirect(&mut self, session: SessionId, to: ShardId) {
         if let Some(p) = self.players.get_mut(&session) {
             let hdr = p.endpoint.next_header();
             let msg = proto::frame(hdr, proto::REDIRECT, &proto::redirect_body(to));
@@ -1060,8 +1406,22 @@ impl<L: Link> GameServer<L> {
         }
     }
 
+    /// El destino dice que el cliente ya está allí y pide la autoridad. Es el instante en que el jugador
+    /// deja de ser de este shard: se congela, su estado final pasa al buzón de salida (y a disco) y se
+    /// pide al directorio, si lo hay, que anote el cambio de dueño.
     fn on_activate(&mut self, from: ShardId, xfer: u32, player: u64) {
         let tick = self.tick;
+        // ¿Ya está entregado? Entonces es un ACTIVATE repetido: se reenvía lo que toque.
+        let known = self
+            .cluster
+            .as_ref()
+            .and_then(|c| c.outbox.get(&player).map(|h| (h.to, h.xfer)));
+        if let Some((to, x)) = known {
+            if to == from && x == xfer {
+                self.send_outbox_msg(player);
+            }
+            return;
+        }
         let Some(&session) = self.by_entity.get(&player) else {
             return;
         };
@@ -1072,92 +1432,222 @@ impl<L: Link> GameServer<L> {
             Handoff::Preparing { to, xfer, .. } | Handoff::Redirecting { to, xfer, .. } => {
                 (to, xfer)
             }
-            Handoff::HandedOver { to, xfer, .. } => (to, xfer),
-            Handoff::None => return,
+            Handoff::HandedOver { .. } | Handoff::None => return,
         };
         if to != from || x != xfer {
             return; // de un intento anterior
         }
-        if !matches!(p.handoff, Handoff::HandedOver { .. }) {
-            // Aquí cambia la autoridad: desde este instante el jugador queda congelado en este shard.
-            p.queue.clear();
-            p.handoff = Handoff::HandedOver {
-                to,
-                xfer,
-                pos: p.state.pos,
-                last_processed: p.last_processed,
-                since: tick,
-                last_sent: tick,
-            };
-        }
-        self.resend_handover(session);
-    }
-
-    fn resend_handover(&mut self, session: SessionId) {
-        let Some(p) = self.players.get(&session) else {
-            return;
-        };
-        if let Handoff::HandedOver {
-            to,
-            xfer,
-            pos,
-            last_processed,
-            ..
-        } = p.handoff
-        {
-            let player = p.player_id;
-            self.peer_send(
-                to,
-                &PeerMsg::Handover {
+        // Aquí cambia la autoridad: desde este instante el jugador queda congelado en este shard.
+        p.queue.clear();
+        p.handoff = Handoff::HandedOver { to, xfer };
+        let (account, pos, last_processed, epoch) =
+            (p.player_id, p.state.pos, p.last_processed, p.epoch + 1);
+        let dir_active = self.dir_active();
+        if let Some(c) = self.cluster.as_mut() {
+            c.outbox.insert(
+                account,
+                HoOut {
+                    to,
                     xfer,
-                    player,
+                    epoch,
                     pos,
                     last_processed,
+                    committed: !dir_active,
+                    since: tick,
+                    last_sent: tick,
+                },
+            );
+        }
+        // A disco antes de decir nada a nadie: la cuenta deja de ser residente y pasa a estar «en
+        // traspaso» en un solo lote.
+        if let Some(pe) = self.persist.as_mut() {
+            let mut b = Batch::new();
+            b.delete(k_player(account));
+            b.put(
+                k_ho(account),
+                HoRec {
+                    to,
+                    xfer,
+                    epoch,
+                    pos,
+                    last_processed,
+                    stage: if dir_active {
+                        HoStage::Committing
+                    } else {
+                        HoStage::Committed
+                    },
+                }
+                .encode(),
+            );
+            pe.saved_pos.remove(&account);
+            pe.apply_critical(&b);
+        }
+        self.send_outbox_msg(account);
+    }
+
+    /// Envía lo que toca de un traspaso entregado: la petición al directorio mientras no esté anotado,
+    /// y el estado de la cuenta al destino cuando ya lo está.
+    fn send_outbox_msg(&mut self, account: u64) {
+        let tick = self.tick;
+        let Some(c) = self.cluster.as_mut() else {
+            return;
+        };
+        let dir = c.dir_peer();
+        let Some(ho) = c.outbox.get_mut(&account) else {
+            return;
+        };
+        ho.last_sent = tick;
+        let (to, xfer, epoch, pos, last_processed, committed) = (
+            ho.to,
+            ho.xfer,
+            ho.epoch,
+            ho.pos,
+            ho.last_processed,
+            ho.committed,
+        );
+        if committed {
+            self.peer_send_durable(
+                to,
+                PeerMsg::Handover {
+                    xfer,
+                    player: account,
+                    pos,
+                    last_processed,
+                    epoch,
+                },
+            );
+        } else if let Some(dir) = dir {
+            c.stats.dir_transfers_out += 1;
+            self.peer_send_durable(
+                dir,
+                PeerMsg::DirTransfer {
+                    xfer,
+                    account,
+                    epoch: epoch - 1,
+                    to,
                 },
             );
         }
     }
 
-    fn on_handover_ack(&mut self, from: ShardId, xfer: u32, player: u64) {
-        let Some(&session) = self.by_entity.get(&player) else {
+    /// Reenvíos de los traspasos de jugador entregados. Con persistencia no se rinden nunca (tras el
+    /// plazo reintentan despacio): la cuenta ya no es de este shard y su estado solo vive aquí hasta que
+    /// el destino lo acuse. Sin persistencia, pasado el plazo se abandonan (como en la 0.4).
+    fn cluster_outbox_timers(&mut self) {
+        let tick = self.tick;
+        let persistent = self.persist.is_some();
+        let slow = self.persist.as_ref().map(|p| p.cfg.slow_retry_ticks);
+        let Some(c) = self.cluster.as_mut() else {
             return;
         };
-        if let Some(Handoff::HandedOver { to, xfer: x, .. }) =
-            self.players.get(&session).map(|p| p.handoff)
-        {
-            if to == from && x == xfer {
-                self.finish_handover(session, to);
+        let (retry, timeout) = (c.cfg.retry_ticks, c.cfg.handoff_timeout_ticks);
+        let slow = slow.unwrap_or(retry).max(retry);
+        let mut due: Vec<u64> = Vec::new();
+        let mut give_up: Vec<u64> = Vec::new();
+        for (&a, ho) in c.outbox.iter() {
+            let age = tick.wrapping_sub(ho.since);
+            if !persistent && age > timeout {
+                give_up.push(a);
+                continue;
+            }
+            let every = if persistent && age > timeout {
+                slow
+            } else {
+                retry
+            };
+            if tick.wrapping_sub(ho.last_sent) >= every {
+                due.push(a);
+            }
+        }
+        due.sort_unstable();
+        give_up.sort_unstable();
+        c.stats.handover_retries += due.len() as u64;
+        for a in give_up {
+            self.finish_outbox(a, false);
+        }
+        for a in due {
+            self.send_outbox_msg(a);
+            // Si el cliente sigue conectado aquí (por ejemplo su conexión al destino se perdió), se le
+            // vuelve a indicar adónde ir.
+            let to = self
+                .cluster
+                .as_ref()
+                .and_then(|c| c.outbox.get(&a).map(|h| h.to));
+            if let (Some(to), Some(&s)) = (to, self.by_entity.get(&a)) {
+                self.send_redirect(s, to);
             }
         }
     }
 
-    /// El jugador ya es del destino: aquí queda solo como copia hasta que caduque o se la refresquen.
-    fn finish_handover(&mut self, session: SessionId, to: ShardId) {
-        let tick = self.tick;
-        let Some(p) = self.players.remove(&session) else {
-            return;
-        };
-        if self.by_entity.get(&p.entity) == Some(&session) {
-            self.by_entity.remove(&p.entity);
-        }
-        if let Some(c) = self.cluster.as_mut() {
-            c.stats.handoffs_completed += 1;
-            c.ghosts.insert(
-                p.entity,
-                Ghost {
-                    seen: tick,
-                    sent_tick: 0,
-                    from: to,
-                },
-            );
+    fn on_handover_ack(&mut self, from: ShardId, xfer: u32, player: u64) {
+        let matches = self.cluster.as_ref().is_some_and(|c| {
+            c.outbox
+                .get(&player)
+                .is_some_and(|h| h.to == from && h.xfer == xfer && h.committed)
+        });
+        if matches {
+            self.finish_outbox(player, true);
         }
     }
 
-    /// El cliente del jugador entregado se desconectó de este shard (lo normal tras pasar al nuevo).
+    /// El traspaso terminó (el destino lo acusó, o se abandonó): la cuenta ya no es de este shard.
+    fn finish_outbox(&mut self, account: u64, acked: bool) {
+        let tick = self.tick;
+        let persistent = self.persist.is_some();
+        let Some(c) = self.cluster.as_mut() else {
+            return;
+        };
+        let Some(ho) = c.outbox.remove(&account) else {
+            return;
+        };
+        if acked {
+            let ticks = tick.wrapping_sub(ho.since);
+            c.stats.handover_acked += 1;
+            c.stats.handover_ticks_sum += u64::from(ticks);
+            c.stats.handover_ticks_max = c.stats.handover_ticks_max.max(ticks);
+        } else {
+            c.stats.handovers_unacked += 1;
+        }
+        c.stats.handoffs_completed += 1;
+        c.ghosts.insert(
+            account,
+            Ghost {
+                seen: tick,
+                sent_tick: 0,
+                from: ho.to,
+            },
+        );
+        // Queda una lápida con la época: un `HANDOVER` repetido que llegara tarde no resucita nada.
+        if let Some(pe) = self.persist.as_mut() {
+            let mut b = Batch::new();
+            b.delete(k_ho(account));
+            b.put(
+                k_tomb(account),
+                TombRec {
+                    epoch: ho.epoch,
+                    to: ho.to,
+                }
+                .encode(),
+            );
+            pe.apply(&b);
+        }
+        // Si el cliente sigue conectado aquí con el jugador congelado, esa entrada sobra.
+        if let Some(s) = self.by_entity.get(&account).copied() {
+            if self.players.get(&s).is_some_and(|p| p.frozen()) {
+                self.players.remove(&s);
+                self.by_entity.remove(&account);
+                if persistent {
+                    self.net.kick(s);
+                }
+            }
+        }
+    }
+
+    /// El cliente del jugador entregado se desconectó de este shard (lo normal tras pasar al nuevo). El
+    /// traspaso sigue adelante sin él: su estado está en el buzón de salida.
     pub(super) fn cluster_handed_over_gone(&mut self, p: &super::Player, to: ShardId) {
         let tick = self.tick;
         if let Some(c) = self.cluster.as_mut() {
-            c.stats.handoffs_completed += 1;
             c.ghosts.insert(
                 p.entity,
                 Ghost {
@@ -1175,6 +1665,126 @@ impl<L: Link> GameServer<L> {
             c.stats.handoffs_aborted += 1;
         }
         self.peer_send(to, &PeerMsg::Abort { xfer, player });
+    }
+
+    /// Respuesta del directorio a una petición de cambio de dueño.
+    fn on_dir_result(
+        &mut self,
+        xfer: u32,
+        account: u64,
+        status: DirStatus,
+        shard: ShardId,
+        epoch: u64,
+    ) {
+        let Some(c) = self.cluster.as_mut() else {
+            return;
+        };
+        c.stats.dir_results_in += 1;
+        let Some(ho) = c.outbox.get_mut(&account) else {
+            return; // de un intento anterior, o ya resuelto
+        };
+        if ho.xfer != xfer || ho.committed {
+            return;
+        }
+        match status {
+            DirStatus::Committed => {
+                ho.committed = true;
+                let rec = HoRec {
+                    to: ho.to,
+                    xfer,
+                    epoch: ho.epoch,
+                    pos: ho.pos,
+                    last_processed: ho.last_processed,
+                    stage: HoStage::Committed,
+                };
+                // El cambio de dueño está decidido y ya consta en el directorio: se anota aquí también
+                // antes de enviar el estado al destino.
+                if let Some(pe) = self.persist.as_mut() {
+                    let mut b = Batch::new();
+                    b.put(k_ho(account), rec.encode());
+                    pe.apply_critical(&b);
+                }
+                self.send_outbox_msg(account);
+            }
+            DirStatus::Rejected | DirStatus::Unknown => {
+                self.abort_outbox(account, status, shard, epoch)
+            }
+        }
+    }
+
+    /// El directorio no acepta el cambio: la cuenta no estaba donde creíamos. No debería ocurrir salvo
+    /// que alguien haya tocado el directorio o haya dos copias de la cuenta; se deja como está lo que el
+    /// directorio dice y se cuenta.
+    fn abort_outbox(
+        &mut self,
+        account: u64,
+        status: DirStatus,
+        dir_shard: ShardId,
+        dir_epoch: u64,
+    ) {
+        let tick = self.tick;
+        let Some(c) = self.cluster.as_mut() else {
+            return;
+        };
+        let me = c.cfg.shard;
+        let cooldown = c.cfg.handoff_cooldown_ticks;
+        let Some(ho) = c.outbox.remove(&account) else {
+            return;
+        };
+        match status {
+            DirStatus::Unknown => c.stats.dir_unknown += 1,
+            _ => c.stats.dir_rejected += 1,
+        }
+        c.stats.handoffs_aborted += 1;
+        // Que el destino olvide la llegada.
+        self.peer_send(
+            ho.to,
+            &PeerMsg::Abort {
+                xfer: ho.xfer,
+                player: account,
+            },
+        );
+        // Si el directorio no conoce la cuenta, o dice que vive aquí, la cuenta sigue siendo de este
+        // shard (con la época del directorio si la dio); si dice que vive en otro, deja de serlo.
+        let keep = status == DirStatus::Unknown || dir_shard == me;
+        let epoch = if status == DirStatus::Unknown {
+            ho.epoch - 1
+        } else {
+            dir_epoch
+        };
+        if let Some(pe) = self.persist.as_mut() {
+            let mut b = Batch::new();
+            b.delete(k_ho(account));
+            if keep {
+                b.put(k_player(account), PlayerRec { pos: ho.pos, epoch }.encode());
+            } else {
+                b.put(
+                    k_tomb(account),
+                    TombRec {
+                        epoch: dir_epoch,
+                        to: dir_shard,
+                    }
+                    .encode(),
+                );
+            }
+            pe.apply_critical(&b);
+        }
+        let session = self.by_entity.get(&account).copied();
+        match (keep, session) {
+            (true, Some(s)) => {
+                // El jugador vuelve a la vida donde estaba.
+                if let Some(p) = self.players.get_mut(&s) {
+                    p.handoff = Handoff::None;
+                    p.epoch = epoch;
+                    p.cooldown_until = tick.wrapping_add(cooldown);
+                }
+                if let Some(pe) = self.persist.as_mut() {
+                    pe.saved_pos.insert(account, ho.pos);
+                }
+            }
+            (false, Some(s)) => self.kick(s),
+            _ => {}
+        }
     }
 
     // ------------------------------------------------------------------ jugadores: destino
@@ -1231,6 +1841,24 @@ impl<L: Link> GameServer<L> {
         player: u64,
         pos: [i32; 3],
         last_processed: u32,
+        epoch: u64,
+    ) {
+        if self.persist.is_some() {
+            self.on_handover_durable(from, xfer, player, pos, last_processed, epoch);
+        } else {
+            self.on_handover_volatile(from, xfer, player, pos, last_processed, epoch);
+        }
+    }
+
+    /// Sin almacén (como en la 0.4): hace falta que el cliente ya esté aquí para adoptar al jugador.
+    fn on_handover_volatile(
+        &mut self,
+        from: ShardId,
+        xfer: u32,
+        player: u64,
+        pos: [i32; 3],
+        last_processed: u32,
+        epoch: u64,
     ) {
         let tick = self.tick;
         let Some(c) = self.cluster.as_mut() else {
@@ -1249,14 +1877,109 @@ impl<L: Link> GameServer<L> {
         let Some(session) = a.session else {
             return; // el cliente aún no ha llegado: no se puede completar
         };
-        let cooldown = c.cfg.handoff_cooldown_ticks;
         let owed = tick.wrapping_sub(a.first_activate.unwrap_or(tick));
         c.arrivals.remove(&player);
         c.ghosts.remove(&player);
         c.stats.arrivals_completed += 1;
-
-        let Some(p) = self.players.get_mut(&session) else {
+        if !self.activate_arrival(session, pos, last_processed, epoch, owed) {
             return; // su sesión ya no existe: el jugador se pierde (el origen lo da por entregado)
+        }
+        self.peer_send(from, &PeerMsg::HandoverAck { xfer, player });
+    }
+
+    /// Con almacén: el estado de la cuenta se anota **antes** de acusar recibo, y no hace falta que el
+    /// cliente esté aquí (si no está, la cuenta queda residente y entra cuando se conecte).
+    fn on_handover_durable(
+        &mut self,
+        from: ShardId,
+        xfer: u32,
+        player: u64,
+        pos: [i32; 3],
+        last_processed: u32,
+        epoch: u64,
+    ) {
+        let tick = self.tick;
+        if epoch <= self.known_epoch(player) {
+            // Una repetición (ya adoptado) o de una época superada: se acusa para que el origen pare.
+            if let Some(c) = self.cluster.as_mut() {
+                c.stats.handovers_stale += 1;
+            }
+            self.peer_send_durable(from, PeerMsg::HandoverAck { xfer, player });
+            return;
+        }
+        let Some(c) = self.cluster.as_mut() else {
+            return;
+        };
+        if c.outbox.contains_key(&player) {
+            // Esta cuenta salió de aquí y su traspaso aún no tiene acuse: no se puede volver a adoptar
+            // hasta saber cómo terminó (el origen reenvía; mientras tanto el destino acusará el nuestro,
+            // porque ya conoce una época igual o mayor).
+            c.stats.handovers_deferred += 1;
+            return;
+        }
+        let arrival = c
+            .arrivals
+            .get(&player)
+            .filter(|a| a.from == from && a.xfer == xfer)
+            .map(|a| (a.session, a.first_activate));
+        if arrival.is_none() && self.by_entity.contains_key(&player) {
+            // La cuenta está conectada aquí con otra época: dos copias. No se adopta.
+            c.stats.handover_conflicts += 1;
+            return;
+        }
+        if let Some(pe) = self.persist.as_mut() {
+            let mut b = Batch::new();
+            b.put(k_player(player), PlayerRec { pos, epoch }.encode());
+            b.delete(k_tomb(player));
+            pe.apply_critical(&b);
+        }
+        let session = arrival
+            .and_then(|(s, first)| s.map(|s| (s, first)))
+            .filter(|(s, _)| self.players.contains_key(s));
+        match session {
+            Some((session, first)) => {
+                let owed = tick.wrapping_sub(first.unwrap_or(tick));
+                if let Some(c) = self.cluster.as_mut() {
+                    c.arrivals.remove(&player);
+                    c.ghosts.remove(&player);
+                    c.stats.arrivals_completed += 1;
+                }
+                self.activate_arrival(session, pos, last_processed, epoch, owed);
+                if let Some(pe) = self.persist.as_mut() {
+                    pe.saved_pos.insert(player, pos);
+                }
+            }
+            None => {
+                // El cliente no está aquí (se cayó, o este shard acaba de reiniciarse): la cuenta queda
+                // residente y entrará con este estado cuando se conecte.
+                if let Some(c) = self.cluster.as_mut() {
+                    if arrival.is_some() {
+                        c.arrivals.remove(&player);
+                    }
+                    c.stats.offline_adoptions += 1;
+                }
+            }
+        }
+        self.peer_send_durable(from, PeerMsg::HandoverAck { xfer, player });
+    }
+
+    /// Pone al jugador de una sesión ya conectada en el estado que trae el traspaso y le da la bienvenida.
+    /// `false` si su sesión ya no existe.
+    fn activate_arrival(
+        &mut self,
+        session: SessionId,
+        pos: [i32; 3],
+        last_processed: u32,
+        epoch: u64,
+        owed: u32,
+    ) -> bool {
+        let tick = self.tick;
+        let cooldown = self
+            .cluster
+            .as_ref()
+            .map_or(0, |c| c.cfg.handoff_cooldown_ticks);
+        let Some(p) = self.players.get_mut(&session) else {
+            return false;
         };
         p.state = PlayerState { pos };
         p.last_queued = last_processed;
@@ -1267,6 +1990,7 @@ impl<L: Link> GameServer<L> {
         p.handoff = Handoff::None;
         p.cooldown_until = tick.wrapping_add(cooldown);
         p.catchup = owed.min(self.cfg.input_queue_max as u32);
+        p.epoch = epoch;
         let p_entity = p.entity;
         let position = vec3_from_q(pos);
         if self.world.position(p_entity).is_some() {
@@ -1293,6 +2017,38 @@ impl<L: Link> GameServer<L> {
             let msg = proto::frame(hdr, proto::WELCOME, &proto::welcome_body(&welcome));
             let _ = self.net.send(session, &msg);
         }
-        self.peer_send(from, &PeerMsg::HandoverAck { xfer, player });
+        true
+    }
+
+    /// El directorio dice dónde vive una cuenta. Se guarda hasta que su cliente (que vuelve a pedir
+    /// entrar cada pocos cientos de milisegundos) la use, y se atiende ya a quien estuviera esperando.
+    fn on_dir_route(&mut self, account: u64, shard: ShardId, epoch: u64) {
+        let tick = self.tick;
+        let Some(c) = self.cluster.as_mut() else {
+            return;
+        };
+        c.stats.dir_routes_in += 1;
+        if !c.cfg.partition.is_valid(shard) {
+            c.stats.bus_malformed += 1;
+            return;
+        }
+        c.routes.insert(
+            account,
+            Route {
+                shard,
+                epoch,
+                at: tick,
+            },
+        );
+        let mut waiting: Vec<SessionId> = self
+            .players
+            .iter()
+            .filter(|(_, p)| p.player_id == account && !p.joined && p.join_requested)
+            .map(|(&s, _)| s)
+            .collect();
+        waiting.sort_unstable();
+        for s in waiting {
+            self.on_join(s);
+        }
     }
 }

@@ -11,3 +11,4 @@ tsofgw-net = { path = "../tsofgw-net" }
 tsofgw-world = { path = "../tsofgw-world" }
 tsofgw-transport = { path = "../tsofgw-transport" }
 tsofgw-pack = { path = "../tsofgw-pack" }
+tsofgw-store = { path = "../tsofgw-store" }

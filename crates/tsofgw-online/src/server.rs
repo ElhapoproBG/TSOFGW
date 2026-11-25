@@ -24,14 +24,17 @@ use tsofgw_transport::{
 use tsofgw_world::{Cell, EntityId, FastMap, Neighborhood, Rng, Vec3, World};
 
 mod cluster;
+mod durable;
 
 use crate::par;
-use crate::protocol::{self as proto, Welcome};
+use crate::persist::Persist;
+use crate::protocol as proto;
 use crate::replicate::{self, LodBand, ReplCtx};
 use crate::sim::{Input, MoveSim, PlayerState, HALF_EXTENT_Q};
 use crate::states::{Entities, Own};
-pub use cluster::{ClusterConfig, ClusterStats};
+pub use cluster::{ClusterConfig, ClusterStats, OutboxEntry};
 use cluster::{ClusterNode, Handoff};
+pub use durable::{AccountRecords, NpcDump};
 
 /// Los NPC usan identificadores desde aquí; las cuentas de jugador deben ser menores.
 pub const NPC_BASE: u64 = 1 << 48;
@@ -175,11 +178,17 @@ pub(crate) struct Player {
     /// Cluster: inputs extra que se permiten aplicar tras un traspaso (el tiempo que el jugador estuvo
     /// congelado entre shards no se le descuenta). Se agotan al vaciarse la cola.
     pub(crate) catchup: u32,
+    /// Época de la cuenta en este shard (0 si no se lleva cuenta de épocas: sin almacén).
+    pub(crate) epoch: u64,
+    /// Tick en que se conectó (para cerrar a quien lleva demasiado esperando entrar).
+    pub(crate) created_tick: u32,
+    /// El cliente ya envió `JOIN` (el directorio puede responder después de que lo enviara).
+    pub(crate) join_requested: bool,
 }
 
 impl Player {
     /// Un jugador recién conectado (aún sin `JOIN`).
-    pub(crate) fn new(entity: EntityId, player_id: u64) -> Player {
+    pub(crate) fn new(entity: EntityId, player_id: u64, tick: u32) -> Player {
         Player {
             entity,
             player_id,
@@ -198,6 +207,9 @@ impl Player {
             handoff: Handoff::None,
             cooldown_until: 0,
             catchup: 0,
+            epoch: 0,
+            created_tick: tick,
+            join_requested: false,
         }
     }
 
@@ -223,6 +235,8 @@ pub struct GameServer<L: Link> {
     /// Último instante (ms) con el que se llamó a `update`; el bus entre shards lo necesita.
     now_ms: u64,
     cluster: Option<ClusterNode>,
+    /// Almacén durable (véase [`GameServer::enable_persistence`]); sin él, todo vive en memoria.
+    persist: Option<Persist>,
 }
 
 pub(crate) fn vec3_from_q(p: [i32; 3]) -> Vec3 {
@@ -299,6 +313,7 @@ impl<L: Link> GameServer<L> {
             events: Vec::new(),
             now_ms: 0,
             cluster,
+            persist: None,
         }
     }
 
@@ -384,6 +399,8 @@ impl<L: Link> GameServer<L> {
             ran += 1;
         }
         self.next_tick_at = Some(next);
+        // Lo anotado en esta vuelta se sincroniza, y solo entonces salen las promesas que dependen de ello.
+        self.persist_flush();
     }
 
     fn on_event(&mut self, e: ServerEvent<L::Addr>) {
@@ -397,7 +414,7 @@ impl<L: Link> GameServer<L> {
                     return;
                 }
                 self.players
-                    .insert(session, Player::new(player_id, player_id));
+                    .insert(session, Player::new(player_id, player_id, self.tick));
             }
             ServerEvent::Message { session, data } => self.on_message(session, &data),
             ServerEvent::Disconnected { session, .. } => self.drop_player(session),
@@ -415,7 +432,8 @@ impl<L: Link> GameServer<L> {
             self.by_entity.remove(&p.entity);
         }
         match p.handoff {
-            // Ya era del otro shard: aquí solo queda como copia hasta que caduque.
+            // Ya era del otro shard: aquí solo queda como copia hasta que caduque. El traspaso sigue
+            // adelante sin la sesión (el estado está en el buzón de salida).
             Handoff::HandedOver { to, .. } => self.cluster_handed_over_gone(&p, to),
             other => {
                 if let Handoff::Preparing { to, xfer, .. } | Handoff::Redirecting { to, xfer, .. } =
@@ -423,6 +441,8 @@ impl<L: Link> GameServer<L> {
                 {
                     self.cluster_abort_for_gone(to, xfer, p.player_id);
                 }
+                // La cuenta se queda residente aquí, donde se fue.
+                self.persist_player_gone(p.entity, p.state.pos, p.epoch);
                 self.world.despawn(p.entity);
                 self.ents.remove_player(p.entity);
             }
@@ -463,58 +483,10 @@ impl<L: Link> GameServer<L> {
         p.sent.retain(|_, t| tick.wrapping_sub(*t) < 256);
 
         let mut bad = false;
+        let mut join = false;
         match kind {
             proto::JOIN => match proto::parse_join(body) {
-                Some(proto::PROTOCOL_VERSION) => {
-                    if !p.joined {
-                        // ¿Es un jugador que otro shard nos está traspasando? Entonces no aparece de cero:
-                        // se reclama la autoridad (en el siguiente tick) y la bienvenida llega con su estado.
-                        let arriving = self
-                            .cluster
-                            .as_mut()
-                            .is_some_and(|c| c.register_arrival(p.player_id, session));
-                        if !arriving {
-                            let mut pos = Self::spawn_position(&self.cfg, p.player_id);
-                            if let Some(c) = self.cluster.as_mut() {
-                                let v = c.region().clamp_inside(vec3_from_q(pos), 1.0);
-                                pos = [quantize(v.x), pos[1], quantize(v.z)];
-                                // Una copia con ese id solo puede ser de una sesión anterior: se sustituye.
-                                if c.take_ghost(p.entity) {
-                                    self.world.despawn(p.entity);
-                                    self.ents.remove_player(p.entity);
-                                }
-                            }
-                            p.state = PlayerState { pos };
-                            if self.world.spawn(p.entity, vec3_from_q(pos)) {
-                                self.ents.set_player(
-                                    p.entity,
-                                    EntityState {
-                                        pos,
-                                        data: KIND_PLAYER,
-                                    },
-                                );
-                                p.joined = true;
-                                self.by_entity.insert(p.entity, session);
-                                self.stats.joins += 1;
-                            } else {
-                                // La entidad ya existe: no debería pasar; se rechaza esta sesión.
-                                self.stats.refused += 1;
-                                kick = true;
-                            }
-                        }
-                    }
-                    let welcome = Welcome {
-                        entity: p.entity,
-                        tick,
-                        tick_ms: self.cfg.tick_ms as u16,
-                        pos: p.state.pos,
-                    };
-                    if p.joined {
-                        let hdr = p.endpoint.next_header();
-                        let msg = proto::frame(hdr, proto::WELCOME, &proto::welcome_body(&welcome));
-                        let _ = self.net.send(session, &msg);
-                    }
-                }
+                Some(proto::PROTOCOL_VERSION) => join = true,
                 _ => bad = true,
             },
             proto::INPUT => match proto::parse_input(body) {
@@ -545,6 +517,10 @@ impl<L: Link> GameServer<L> {
         }
         if kick {
             self.kick(session);
+            return;
+        }
+        if join {
+            self.on_join(session);
         }
     }
 
@@ -647,6 +623,9 @@ impl<L: Link> GameServer<L> {
             }
             self.world.move_to(id, Vec3::new(nx, pos.y, nz));
             self.ents.npc_mut(idx).pos = [quantize(nx), quantize(pos.y), quantize(nz)];
+            if let Some(pe) = self.persist.as_mut() {
+                pe.mark_npc(idx);
+            }
             simulated += 1;
             if let Some(c) = self.cluster.as_ref() {
                 if let Some(to) = c.cfg.partition.deep_owner(
@@ -723,6 +702,7 @@ impl<L: Link> GameServer<L> {
             let _ = self.net.send(o.session, &o.msg);
             self.stats.phase_send_us += t.elapsed().as_micros() as u64;
         }
+        self.persist_tick();
     }
 
     /// Expulsa a un jugador por cuenta (por ejemplo, desde una consola de administración).
