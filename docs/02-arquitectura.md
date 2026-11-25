@@ -10,8 +10,18 @@
 `Active` (corre) · `Hibernated` (conserva estado, no corre) · `Unloaded` (pendiente).
 Un nodo es Active si es demandado o si algún Active depende de él (cierre transitivo).
 
-## Contrato de nodo (v0)
-nombre, dependencias, capacidades requeridas (`net`, `disk`, `accounts`…), costo declarado (CPU/GPU/mem), `tick`.
+## Contrato de nodo (v1, implementado en H1)
+- **Identidad:** nombre y versión `(mayor, menor)`.
+- **Puertos tipados:** entradas y salidas con tipo (`Float`, `Transform`, `Frame`…). Al conectar se valida que existan los puertos y que los tipos coincidan; no se permiten ciclos ni entradas duplicadas.
+- **Capacidades:** permisos que el nodo pide (`net`, `disk`, `accounts`…).
+- **Costo declarado:** CPU y GPU en µs y memoria en KiB por tick.
+- **Estado transferible:** `export_state` / `import_state` para el hot-swap.
+
+## Presupuesto
+Con un presupuesto por tick, el planificador admite las raíces demandadas por prioridad mientras quepan junto con sus dependencias; las que no caben quedan en `shed()` y se hibernan.
+
+## Hot-swap
+`replace(id, nodo_nuevo)` conserva el id, las conexiones y el estado. Es compatible si: mismo nombre y versión mayor, menor igual o mayor, conserva todas las salidas, no exige entradas nuevas, mantiene las entradas ya conectadas y no pide permisos nuevos (salvo autorización explícita). Si no, se rechaza con un error que explica el motivo.
 
 ## IR y compilación (siguiente fase)
 El grafo se compila a planes de ejecución especializados; solo se recompila el subgrafo cambiado (hot-swap). Objetivo: 90–120 Hz estables en VR.
@@ -21,9 +31,9 @@ El mismo grafo se particiona: el planificador decide qué subgrafo corre en cada
 
 ## Hitos
 - H0 (hecho): grafo + apagado selectivo + FFI C.
-- H1: contratos tipados, costos declarados, hot-swap de un nodo.
-- H2: nodo wgpu (triángulo) + nodo de red.
-- H3: MMO mínimo, 200–500 jugadores en mundo continuo con celdas espaciales e interest management.
+- H1 (hecho): contratos tipados, costos declarados con presupuesto, hot-swap de un nodo.
+- H2: nodo wgpu (triángulo) + nodo de red + OpenXR + herramienta `tsofgw` (ver documento 05).
+- H3: inspector del grafo; MMO mínimo, 200–500 jugadores en mundo continuo con celdas espaciales e interest management.
 - H4: módulos firmados, sandbox WASM, identidad federada.
 
 ## Plataformas (VR primero, sin dejar fuera PC y consolas)
