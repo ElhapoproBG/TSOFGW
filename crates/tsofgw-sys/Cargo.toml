@@ -1,0 +1,7 @@
+[package]
+name = "tsofgw-sys"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Enlaces FFI a librerías C de apoyo"
+build = "build.rs"

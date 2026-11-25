@@ -1,0 +1,9 @@
+[package]
+name = "tsofgw-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "TSOFGW: grafo de interdependencias con apagado selectivo de nodos"
+
+[dependencies]
+tsofgw-sys = { path = "../tsofgw-sys" }
