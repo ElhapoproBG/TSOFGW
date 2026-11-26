@@ -1,15 +1,21 @@
-//! Bus entre shards sobre UDP real, autenticado con una clave de cluster.
+//! Bus entre shards sobre UDP real, **cifrado y autenticado** con una clave de cluster (desde la 0.6.0).
 //!
 //! Cada mensaje del bus ([`crate::bus::PeerMsg`]) viaja en **un** datagrama:
 //!
 //! ```text
-//! BUS  0x20 | versión(1) | desde(2) | hacia(2) | contador(8) | reloj_ms(8) | config(8) | carga | etiqueta(16)
+//! BUS  0x20 | versión(1)=2 | desde(2) | hacia(2) | arranque(4) | contador(8) | reloj_ms(8) | config(8)
+//!      | carga CIFRADA | etiqueta(16)
 //! ```
-//! * **Autenticidad e integridad**: la etiqueta es HMAC-SHA256 truncado a 128 bits, calculado con una
-//!   clave derivada de la clave de cluster, sobre toda la cabecera y la carga. Incluye `desde` y `hacia`:
-//!   un datagrama no se puede redirigir a otro shard ni reflejar hacia quien lo envió.
-//! * **Anti-replay**: ventana de 128 contadores por shard emisor ([`ReplayWindow`]). El contador de cada
-//!   emisor arranca en el reloj de pared (µs), así que un shard que se reinicia nunca repite contadores.
+//! * **Confidencialidad, autenticidad e integridad**: ChaCha20-Poly1305 (`tsofgw-aead`). La cabecera
+//!   completa es dato asociado (autenticada, visible) y la carga va cifrada. La clave sale de la clave de
+//!   cluster y es **una por emisor** (`desde`), así que dos shards nunca cifran con la misma clave. Un
+//!   datagrama no se puede redirigir a otro shard ni reflejar hacia quien lo envió (`desde` y `hacia`
+//!   están autenticados).
+//! * **El nonce no se repite**: es `arranque ‖ contador`. El contador de cada emisor arranca en el reloj
+//!   de pared (µs) y crece en cada envío; `arranque` es una sal aleatoria de 32 bits que se elige en cada
+//!   arranque del proceso, para que un reinicio con el reloj retrasado (NTP, una máquina virtual
+//!   restaurada) no pueda repetir una pareja (clave, nonce): haría falta además la misma sal (2^-32).
+//! * **Anti-replay**: ventana de 128 contadores por shard emisor ([`ReplayWindow`]).
 //! * **Frescura**: se rechaza un datagrama cuyo `reloj_ms` difiera del reloj local más de
 //!   [`DEFAULT_MAX_SKEW_MS`]. Es lo que impide reinyectar capturas antiguas en un shard recién
 //!   reiniciado (su ventana de contadores empieza vacía). Exige relojes sincronizados (NTP).
@@ -21,22 +27,27 @@
 //! * **Sin fragmentación**: un mensaje mayor que [`MAX_PEER_MSG`] no se envía (se cuenta). Los mensajes
 //!   grandes —los fantasmas— los trocea la lógica del servidor en trozos independientes.
 //!
-//! No cifra: los mensajes van en claro (autenticados). Es un bus para una **red privada** entre los
-//! servidores de un mismo operador; quien conozca la clave de cluster puede hablar como cualquier shard.
+//! Lo que un espía ve: que dos shards hablan, cuántos datagramas, su tamaño y su ritmo, y los números de
+//! shard de la cabecera; no el contenido. **La clave de cluster sigue siendo confianza total**: quien la
+//! tiene descifra todo el tráfico y puede hablar como cualquier shard (y como el directorio de sesiones).
+//! No hay secreto hacia adelante: si la clave se filtra, también se pueden descifrar las capturas
+//! antiguas. Es un bus para una red entre los servidores de un mismo operador.
 
 use std::io::ErrorKind;
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use tsofgw_pack::{ct_eq, HmacKey};
-use tsofgw_transport::ReplayWindow;
+use tsofgw_aead::{open_in_place, seal_in_place};
+use tsofgw_pack::HmacKey;
+use tsofgw_transport::{Entropy, OsEntropy, ReplayWindow};
 
 use crate::bus::{PeerBus, MAX_PEER_MSG};
 use crate::partition::ShardId;
 
 pub const BUS_PACKET: u8 = 0x20;
-pub const BUS_VERSION: u8 = 1;
-pub const HEADER_LEN: usize = 1 + 1 + 2 + 2 + 8 + 8 + 8;
+/// Versión 2: cifrada, con sal de arranque en la cabecera (0.6.0). La versión 1 (en claro) se descarta.
+pub const BUS_VERSION: u8 = 2;
+pub const HEADER_LEN: usize = 1 + 1 + 2 + 2 + 4 + 8 + 8 + 8;
 pub const TAG_LEN: usize = 16;
 pub const MAX_DATAGRAM: usize = 1200;
 /// Diferencia máxima tolerada entre el reloj de un datagrama y el local.
@@ -59,48 +70,83 @@ pub fn system_wall_ms() -> u64 {
 }
 
 /// Clave del bus derivada de la clave de cluster (separación de dominio: la clave de cluster en sí no
-/// se usa nunca directamente para firmar).
-pub fn bus_key(cluster_key: &[u8]) -> HmacKey {
-    HmacKey::new(&HmacKey::new(cluster_key).mac(&[b"tsofgw/bus-key/v1"]))
+/// se usa nunca directamente para cifrar ni firmar).
+#[derive(Clone)]
+pub struct BusKey {
+    master: HmacKey,
 }
 
-/// Construye un datagrama del bus.
-pub fn seal(
-    key: &HmacKey,
-    from: ShardId,
-    to: ShardId,
-    counter: u64,
-    wall_ms: u64,
-    config: u64,
-    payload: &[u8],
-) -> Vec<u8> {
-    let mut p = Vec::with_capacity(HEADER_LEN + payload.len() + TAG_LEN);
-    p.push(BUS_PACKET);
-    p.push(BUS_VERSION);
-    p.extend_from_slice(&from.to_le_bytes());
-    p.extend_from_slice(&to.to_le_bytes());
-    p.extend_from_slice(&counter.to_le_bytes());
-    p.extend_from_slice(&wall_ms.to_le_bytes());
-    p.extend_from_slice(&config.to_le_bytes());
-    p.extend_from_slice(payload);
-    let full = key.mac(&[&p]);
-    p.extend_from_slice(&full[..TAG_LEN]);
-    p
+impl std::fmt::Debug for BusKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "BusKey {{ <oculta> }}")
+    }
 }
 
-/// Los campos de un datagrama bien formado (con la etiqueta aún sin verificar).
-#[derive(Debug, PartialEq, Eq)]
-pub struct Parsed<'a> {
+impl BusKey {
+    /// La clave AEAD que usa el shard `from` para cifrar lo que envía (y los demás para abrirlo).
+    pub fn sender_key(&self, from: ShardId) -> [u8; 32] {
+        self.master
+            .mac(&[b"tsofgw/bus-aead/v2", &from.to_le_bytes()])
+    }
+}
+
+pub fn bus_key(cluster_key: &[u8]) -> BusKey {
+    BusKey {
+        master: HmacKey::new(&HmacKey::new(cluster_key).mac(&[b"tsofgw/bus-key/v2"])),
+    }
+}
+
+/// Los campos de la cabecera de un datagrama.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Header {
     pub from: ShardId,
     pub to: ShardId,
+    /// Sal aleatoria del arranque del emisor (parte del nonce).
+    pub boot: u32,
     pub counter: u64,
     pub wall_ms: u64,
     pub config: u64,
+}
+
+fn nonce_of(boot: u32, counter: u64) -> [u8; tsofgw_aead::NONCE_LEN] {
+    let mut n = [0u8; tsofgw_aead::NONCE_LEN];
+    n[..4].copy_from_slice(&boot.to_le_bytes());
+    n[4..].copy_from_slice(&counter.to_le_bytes());
+    n
+}
+
+/// Construye un datagrama del bus con la clave AEAD del emisor ya derivada.
+pub fn seal_with(sender_key: &[u8; 32], h: &Header, payload: &[u8]) -> Vec<u8> {
+    let mut p = Vec::with_capacity(HEADER_LEN + payload.len() + TAG_LEN);
+    p.push(BUS_PACKET);
+    p.push(BUS_VERSION);
+    p.extend_from_slice(&h.from.to_le_bytes());
+    p.extend_from_slice(&h.to.to_le_bytes());
+    p.extend_from_slice(&h.boot.to_le_bytes());
+    p.extend_from_slice(&h.counter.to_le_bytes());
+    p.extend_from_slice(&h.wall_ms.to_le_bytes());
+    p.extend_from_slice(&h.config.to_le_bytes());
+    p.extend_from_slice(payload);
+    let (aad, body) = p.split_at_mut(HEADER_LEN);
+    let tag = seal_in_place(sender_key, &nonce_of(h.boot, h.counter), aad, body);
+    p.extend_from_slice(&tag);
+    p
+}
+
+/// Construye un datagrama del bus (deriva la clave del emisor de `key`).
+pub fn seal(key: &BusKey, h: &Header, payload: &[u8]) -> Vec<u8> {
+    seal_with(&key.sender_key(h.from), h, payload)
+}
+
+/// Los campos de un datagrama bien formado (con la etiqueta aún sin verificar; la carga sigue cifrada).
+#[derive(Debug, PartialEq, Eq)]
+pub struct Parsed<'a> {
+    pub head: Header,
     pub payload: &'a [u8],
 }
 
 /// Interpreta la estructura de un datagrama sin comprobar su etiqueta: sirve para descartar lo evidente
-/// antes de gastar un HMAC.
+/// antes de gastar un descifrado.
 pub fn parse(d: &[u8]) -> Option<Parsed<'_>> {
     if d.len() < HEADER_LEN + 1 + TAG_LEN
         || d.len() > MAX_DATAGRAM
@@ -110,28 +156,45 @@ pub fn parse(d: &[u8]) -> Option<Parsed<'_>> {
         return None;
     }
     let u16_at = |i: usize| u16::from_le_bytes([d[i], d[i + 1]]);
+    let u32_at = |i: usize| u32::from_le_bytes([d[i], d[i + 1], d[i + 2], d[i + 3]]);
     let u64_at = |i: usize| {
         let mut b = [0u8; 8];
         b.copy_from_slice(&d[i..i + 8]);
         u64::from_le_bytes(b)
     };
     Some(Parsed {
-        from: u16_at(2),
-        to: u16_at(4),
-        counter: u64_at(6),
-        wall_ms: u64_at(14),
-        config: u64_at(22),
+        head: Header {
+            from: u16_at(2),
+            to: u16_at(4),
+            boot: u32_at(6),
+            counter: u64_at(10),
+            wall_ms: u64_at(18),
+            config: u64_at(26),
+        },
         payload: &d[HEADER_LEN..d.len() - TAG_LEN],
     })
 }
 
-/// ¿La etiqueta del datagrama es válida para esta clave?
-pub fn verify(key: &HmacKey, d: &[u8]) -> bool {
-    if d.len() < TAG_LEN {
-        return false;
-    }
-    let (signed, tag) = d.split_at(d.len() - TAG_LEN);
-    ct_eq(&key.mac(&[signed])[..TAG_LEN], tag)
+/// Verifica y descifra un datagrama con la clave AEAD del emisor. `None` si no se autentica.
+pub fn open_with(sender_key: &[u8; 32], d: &[u8]) -> Option<Vec<u8>> {
+    let p = parse(d)?;
+    let (clear_and_body, tag) = d.split_at(d.len() - TAG_LEN);
+    let (aad, body) = clear_and_body.split_at(HEADER_LEN);
+    let mut buf = body.to_vec();
+    open_in_place(
+        sender_key,
+        &nonce_of(p.head.boot, p.head.counter),
+        aad,
+        &mut buf,
+        tag,
+    )
+    .then_some(buf)
+}
+
+/// Como [`open_with`], derivando la clave del emisor (el campo `desde`) de `key`.
+pub fn open(key: &BusKey, d: &[u8]) -> Option<Vec<u8>> {
+    let from = parse(d)?.head.from;
+    open_with(&key.sender_key(from), d)
 }
 
 /// Lo que vio el bus. Todo lo que no es `received - rejected` llegó a la lógica del servidor.
@@ -178,7 +241,9 @@ pub struct UdpBus {
     me: ShardId,
     socket: UdpSocket,
     peers: Vec<Option<SocketAddr>>,
-    key: HmacKey,
+    /// Mi clave AEAD de emisor y la de cada uno de los demás (para abrir lo que mandan).
+    keys: Vec<[u8; 32]>,
+    boot: u32,
     config: u64,
     next_counter: u64,
     replay: Vec<ReplayWindow>,
@@ -208,11 +273,17 @@ impl UdpBus {
             .set_nonblocking(true)
             .map_err(|e| format!("socket del bus: {e}"))?;
         let clock: Box<dyn Fn() -> u64> = Box::new(system_wall_ms);
+        let master = bus_key(cluster_key);
+        let mut salt = [0u8; 4];
+        OsEntropy.fill(&mut salt);
         Ok(UdpBus {
             me,
             socket,
             peers: vec![None; shards],
-            key: bus_key(cluster_key),
+            keys: (0..shards)
+                .map(|i| master.sender_key(i as ShardId))
+                .collect(),
+            boot: u32::from_le_bytes(salt),
             config: 0,
             next_counter: clock().saturating_mul(1000),
             replay: vec![ReplayWindow::default(); shards],
@@ -228,6 +299,13 @@ impl UdpBus {
     pub fn with_clock(mut self, clock: Box<dyn Fn() -> u64>) -> Self {
         self.next_counter = clock().saturating_mul(1000);
         self.clock = clock;
+        self
+    }
+
+    /// Fija la sal de arranque (parte del nonce). Solo para pruebas reproducibles: en un servidor real
+    /// la elige el sistema al azar en cada arranque.
+    pub fn with_boot_salt(mut self, boot: u32) -> Self {
+        self.boot = boot;
         self
     }
 
@@ -275,15 +353,15 @@ impl PeerBus for UdpBus {
         };
         let counter = self.next_counter;
         self.next_counter += 1;
-        let d = seal(
-            &self.key,
-            self.me,
+        let head = Header {
+            from: self.me,
             to,
+            boot: self.boot,
             counter,
-            (self.clock)(),
-            self.config,
-            &data,
-        );
+            wall_ms: (self.clock)(),
+            config: self.config,
+        };
+        let d = seal_with(&self.keys[self.me as usize], &head, &data);
         match self.socket.send_to(&d, addr) {
             Ok(_) => {
                 self.stats.sent += 1;
@@ -315,33 +393,34 @@ impl PeerBus for UdpBus {
                 self.stats.bad_format += 1;
                 continue;
             };
-            let from = p.from as usize;
-            if from >= self.peers.len() || p.from == self.me {
+            let h = p.head;
+            let from = h.from as usize;
+            if from >= self.peers.len() || h.from == self.me {
                 self.stats.unknown_peer += 1;
                 continue;
             }
-            if p.to != self.me {
+            if h.to != self.me {
                 self.stats.misrouted += 1;
                 continue;
             }
-            if !verify(&self.key, d) {
+            let Some(plain) = open_with(&self.keys[from], d) else {
                 self.stats.bad_tag += 1;
                 continue;
-            }
-            if p.config != self.config {
+            };
+            if h.config != self.config {
                 self.stats.config_mismatch += 1;
                 continue;
             }
-            if wall.abs_diff(p.wall_ms) > self.max_skew_ms {
+            if wall.abs_diff(h.wall_ms) > self.max_skew_ms {
                 self.stats.stale += 1;
                 continue;
             }
-            if !self.replay[from].accept(p.counter) {
+            if !self.replay[from].accept(h.counter) {
                 self.stats.replays += 1;
                 continue;
             }
             self.stats.delivered += 1;
-            out.push((p.from, p.payload.to_vec()));
+            out.push((h.from, plain));
         }
     }
 
@@ -366,6 +445,18 @@ mod tests {
     use std::time::{Duration, Instant};
 
     const KEY: &[u8] = b"clave-de-cluster-de-prueba";
+
+    /// Cabecera de prueba (con una sal de arranque fija).
+    fn h(from: ShardId, to: ShardId, counter: u64, wall_ms: u64, config: u64) -> Header {
+        Header {
+            from,
+            to,
+            boot: 7,
+            counter,
+            wall_ms,
+            config,
+        }
+    }
 
     /// `n` buses sobre loopback, todos conectados entre sí.
     fn mesh(n: usize, key: &[u8]) -> Vec<UdpBus> {
@@ -405,43 +496,148 @@ mod tests {
     #[test]
     fn sellar_y_abrir_ida_y_vuelta_y_cualquier_alteracion_se_detecta() {
         let key = bus_key(KEY);
-        let d = seal(&key, 3, 5, 1234, 99, 42, b"hola");
+        let head = h(3, 5, 1234, 99, 42);
+        let d = seal(&key, &head, b"hola");
+        assert_eq!(d.len(), HEADER_LEN + 4 + TAG_LEN);
         let p = parse(&d).unwrap();
-        assert_eq!(
-            p,
-            Parsed {
-                from: 3,
-                to: 5,
-                counter: 1234,
-                wall_ms: 99,
-                config: 42,
-                payload: b"hola"
-            }
-        );
-        assert!(verify(&key, &d));
-        assert!(!verify(&bus_key(b"otra-clave-distinta-1"), &d));
+        assert_eq!(p.head, head);
+        assert_ne!(p.payload, b"hola", "la carga viaja cifrada");
+        assert_eq!(open(&key, &d).as_deref(), Some(&b"hola"[..]));
+        assert_eq!(open(&bus_key(b"otra-clave-distinta-1"), &d), None);
         // Cambiar cualquier bit de cualquier byte invalida el datagrama (o su estructura).
         for i in 0..d.len() {
             for bit in 0..8 {
                 let mut m = d.clone();
                 m[i] ^= 1 << bit;
                 assert!(
-                    parse(&m).is_none() || !verify(&key, &m),
+                    parse(&m).is_none() || open(&key, &m).is_none(),
                     "byte {i} bit {bit} no se detectó"
                 );
             }
         }
         // Truncados, alargados y vacíos.
-        assert!(parse(&d[..d.len() - 1]).is_some() && !verify(&key, &d[..d.len() - 1]));
+        assert!(parse(&d[..d.len() - 1]).is_some() && open(&key, &d[..d.len() - 1]).is_none());
         assert!(parse(&[]).is_none());
         assert!(parse(&d[..HEADER_LEN + TAG_LEN]).is_none(), "sin carga");
         let mut big = d.clone();
         big.resize(MAX_DATAGRAM + 1, 0);
         assert!(parse(&big).is_none());
         // La carga máxima cabe exactamente.
-        let full = seal(&key, 0, 1, 1, 1, 0, &vec![7u8; MAX_PEER_MSG]);
+        let full = seal(&key, &h(0, 1, 1, 1, 0), &vec![7u8; MAX_PEER_MSG]);
         assert_eq!(full.len(), MAX_DATAGRAM);
         assert!(parse(&full).is_some());
+        assert_eq!(open(&key, &full).unwrap(), vec![7u8; MAX_PEER_MSG]);
+    }
+
+    #[test]
+    fn el_contenido_no_viaja_en_claro_y_cada_emisor_tiene_su_clave() {
+        let key = bus_key(KEY);
+        let secreto =
+            b"NPC 77 -> (1234.5, 0.0, 987.25) rng=0xDEADBEEF; jugador 42 cruza al shard 3";
+        let d = seal(&key, &h(0, 1, 5, 1, 0), secreto);
+        assert!(
+            !d.windows(8).any(|w| secreto.windows(8).any(|s| s == w)),
+            "ningún trozo del contenido aparece en claro"
+        );
+        // La clave de cada emisor es distinta.
+        assert_ne!(key.sender_key(0), key.sender_key(1));
+        // Un datagrama cifrado por el shard 0 no se hace pasar por el shard 1: cambiar `desde` lo rompe
+        // (la clave y los datos asociados cambian).
+        let mut como_1 = d.clone();
+        como_1[2..4].copy_from_slice(&1u16.to_le_bytes());
+        assert!(open(&key, &como_1).is_none());
+        // Aunque el atacante tenga la clave de otro emisor: su datagrama no vale como del shard 0.
+        let con_clave_de_1 = seal_with(&key.sender_key(1), &h(0, 1, 5, 1, 0), secreto);
+        assert!(open(&key, &con_clave_de_1).is_none());
+        // Otra clave de cluster: otras claves de emisor.
+        assert_ne!(
+            key.sender_key(0),
+            bus_key(b"otra-clave-de-cluster-1").sender_key(0)
+        );
+    }
+
+    #[test]
+    fn la_sal_de_arranque_y_el_contador_cambian_el_nonce_y_por_tanto_el_cifrado() {
+        let key = bus_key(KEY);
+        let payload = vec![0u8; 64];
+        let base = h(0, 1, 100, 5, 0);
+        let a = seal(&key, &base, &payload);
+        // Mismo contador tras un reinicio con el reloj retrasado, pero con otra sal: otro flujo.
+        let b = seal(&key, &Header { boot: 8, ..base }, &payload);
+        let c = seal(
+            &key,
+            &Header {
+                counter: 101,
+                ..base
+            },
+            &payload,
+        );
+        let cuerpo = |d: &[u8]| d[HEADER_LEN..d.len() - TAG_LEN].to_vec();
+        assert_ne!(cuerpo(&a), cuerpo(&b));
+        assert_ne!(cuerpo(&a), cuerpo(&c));
+        // (Y por qué hace falta la sal: con la misma sal y el mismo contador el flujo se repetiría.)
+        assert_eq!(cuerpo(&a), cuerpo(&seal(&key, &base, &payload)));
+        // Dos arranques reales eligen sales distintas (con probabilidad 1 - 2^-32).
+        let x = UdpBus::bind(0, "127.0.0.1:0", 2, KEY).unwrap();
+        let y = UdpBus::bind(0, "127.0.0.1:0", 2, KEY).unwrap();
+        assert_ne!(x.boot, y.boot);
+    }
+
+    #[test]
+    fn un_espia_entre_dos_shards_reales_no_ve_el_contenido() {
+        let mut b = mesh(2, KEY);
+        let mut s1 = b.pop().unwrap();
+        let mut s0 = b.pop().unwrap();
+        // El espía se hace pasar por el shard 1 ante el 0: recibe lo que el 0 envía, lo guarda y lo
+        // reenvía al 1 de verdad.
+        let spy = UdpSocket::bind("127.0.0.1:0").unwrap();
+        spy.set_nonblocking(true).unwrap();
+        s0.set_peer(1, spy.local_addr().unwrap()).unwrap();
+        let secreto: Vec<u8> = b"TRASPASO-SECRETO-jugador-4242-posicion-1.5,0,9.25-"
+            .iter()
+            .cycle()
+            .take(900)
+            .copied()
+            .collect();
+        s0.send(0, 1, secreto.clone());
+        s0.send(0, 1, secreto.clone());
+        let mut capturados = Vec::new();
+        let end = Instant::now() + Duration::from_secs(2);
+        let mut buf = [0u8; 2048];
+        while capturados.len() < 2 && Instant::now() < end {
+            if let Ok((n, _)) = spy.recv_from(&mut buf) {
+                capturados.push(buf[..n].to_vec());
+                spy.send_to(&buf[..n], s1.local_addr().unwrap()).unwrap();
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(capturados.len(), 2);
+        for d in &capturados {
+            assert!(
+                !d.windows(10).any(|w| secreto.windows(10).any(|s| s == w)),
+                "el espía leyó contenido"
+            );
+        }
+        // Lo reenviado sin tocar llega entero al shard de verdad (el espía no rompe nada), una sola vez
+        // cada uno de los dos datagramas.
+        let got = wait(&mut s1, 2);
+        assert_eq!(got, vec![(0, secreto.clone()), (0, secreto)]);
+        assert_ne!(capturados[0], capturados[1], "mismo texto, distinto nonce");
+    }
+
+    #[test]
+    fn un_datagrama_de_la_version_anterior_se_descarta_como_formato() {
+        let mut b = mesh(2, KEY);
+        let mut s1 = b.pop().unwrap();
+        let mut s0 = b.pop().unwrap();
+        let raw = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut v1 = vec![0u8; 80];
+        v1[0] = BUS_PACKET;
+        v1[1] = 1; // la versión 1 iba en claro
+        raw.send_to(&v1, s1.local_addr().unwrap()).unwrap();
+        flush(&mut s0, &mut s1);
+        assert_eq!(s1.stats().bad_format, 1);
+        assert_eq!(s1.stats().delivered, 1, "solo el testigo");
     }
 
     #[test]
@@ -493,19 +689,19 @@ mod tests {
         let evil = bus_key(b"clave-de-un-atacante-xx");
         let good = bus_key(KEY);
         // Firmado con otra clave.
-        raw.send_to(&seal(&evil, 0, 1, 5, wall, 0, b"mal"), target)
+        raw.send_to(&seal(&evil, &h(0, 1, 5, wall, 0), b"mal"), target)
             .unwrap();
         // Bien firmado pero con una etiqueta alterada.
-        let mut tampered = seal(&good, 0, 1, 6, wall, 0, b"mal");
+        let mut tampered = seal(&good, &h(0, 1, 6, wall, 0), b"mal");
         *tampered.last_mut().unwrap() ^= 1;
         raw.send_to(&tampered, target).unwrap();
         // Bien firmado, pero para otro shard.
-        raw.send_to(&seal(&good, 0, 0, 7, wall, 0, b"mal"), target)
+        raw.send_to(&seal(&good, &h(0, 0, 7, wall, 0), b"mal"), target)
             .unwrap();
         // Desde un shard que no existe y desde sí mismo.
-        raw.send_to(&seal(&good, 9, 1, 8, wall, 0, b"mal"), target)
+        raw.send_to(&seal(&good, &h(9, 1, 8, wall, 0), b"mal"), target)
             .unwrap();
-        raw.send_to(&seal(&good, 1, 1, 9, wall, 0, b"mal"), target)
+        raw.send_to(&seal(&good, &h(1, 1, 9, wall, 0), b"mal"), target)
             .unwrap();
         // Basura de todas las formas.
         for junk in [
@@ -519,10 +715,16 @@ mod tests {
             raw.send_to(&junk, target).unwrap();
         }
         // Reloj muy atrasado y muy adelantado.
-        raw.send_to(&seal(&good, 0, 1, 10, wall - 3_600_000, 0, b"mal"), target)
-            .unwrap();
-        raw.send_to(&seal(&good, 0, 1, 11, wall + 3_600_000, 0, b"mal"), target)
-            .unwrap();
+        raw.send_to(
+            &seal(&good, &h(0, 1, 10, wall - 3_600_000, 0), b"mal"),
+            target,
+        )
+        .unwrap();
+        raw.send_to(
+            &seal(&good, &h(0, 1, 11, wall + 3_600_000, 0), b"mal"),
+            target,
+        )
+        .unwrap();
         flush(&mut s0, &mut s1);
         let st = s1.stats();
         assert_eq!(st.delivered, 1, "solo el testigo: {st:?}");
@@ -547,7 +749,7 @@ mod tests {
         // Contadores justo por debajo de los que usará el emisor real para el testigo.
         let base = s0.next_counter - 1000;
         // Orden 3, 1, 2 (todos nuevos) y luego repeticiones de cada uno.
-        let dg = |c: u64, m: &[u8]| seal(&key, 0, 1, base + c, wall, 0, m);
+        let dg = |c: u64, m: &[u8]| seal(&key, &h(0, 1, base + c, wall, 0), m);
         for c in [3u64, 1, 2, 3, 1, 2, 2] {
             raw.send_to(&dg(c, &[c as u8]), target).unwrap();
         }
@@ -594,11 +796,7 @@ mod tests {
             .with_clock(clock(&now));
         let old = seal(
             &key,
-            0,
-            1,
-            now.get() * 1000,
-            now.get() - 3_600_000,
-            0,
+            &h(0, 1, now.get() * 1000, now.get() - 3_600_000, 0),
             b"vieja",
         );
         let raw = UdpSocket::bind("127.0.0.1:0").unwrap();

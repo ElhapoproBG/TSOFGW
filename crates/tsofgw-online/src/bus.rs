@@ -40,9 +40,9 @@ pub const PEER_VERSION: u8 = 2;
 /// Tope de entidades por lista en un mensaje de fantasmas.
 pub const MAX_GHOSTS_PER_LIST: usize = 50_000;
 /// Tamaño máximo de un mensaje del bus. Cabe en un único datagrama UDP de 1200 bytes con la cabecera y
-/// la etiqueta de autenticación del bus real, así que no hay fragmentación ni reensamblado entre shards:
+/// la etiqueta del bus real, así que no hay fragmentación ni reensamblado entre shards:
 /// perder un datagrama pierde solo lo que llevaba. Los dos buses (real y simulado) lo hacen cumplir.
-pub const MAX_PEER_MSG: usize = 1154;
+pub const MAX_PEER_MSG: usize = 1150;
 
 /// Transporte de mensajes entre shards. No garantiza entrega ni orden: la lógica que lo usa
 /// reenvía lo que importa y tolera duplicados.

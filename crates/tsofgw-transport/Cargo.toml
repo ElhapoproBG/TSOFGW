@@ -4,7 +4,8 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "TSOFGW: transporte UDP autenticado (handshake con cookie, MAC por paquete, anti-replay, fragmentación)"
+description = "TSOFGW: transporte UDP autenticado (handshake con cookie, cifrado y etiqueta por paquete, anti-replay, fragmentación)"
 
 [dependencies]
 tsofgw-pack = { path = "../tsofgw-pack" }
+tsofgw-aead = { path = "../tsofgw-aead" }

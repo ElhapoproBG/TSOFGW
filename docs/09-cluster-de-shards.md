@@ -79,20 +79,20 @@ Una abstracción (`PeerBus`) con dos implementaciones: `SimBus` (determinista, c
 | `DirLogin` / `DirRoute` | solo con directorio (0.5.0): un shard pregunta dónde vive una cuenta y el directorio contesta con `(shard, época)` |
 | `DirTransfer` / `DirResult` | solo con directorio (0.5.0): el cambio de dueño de una cuenta (*compare-and-swap* sobre la época) y su respuesta (`Committed`, `Rejected` o `Unknown`) |
 
-**Todo mensaje cabe en un datagrama** (`MAX_PEER_MSG` = 1154 B): no hay fragmentación ni reensamblado entre shards. Las listas de fantasmas se parten en trozos de tamaño exacto (`ghost_chunks`, que calcula las longitudes sin codificar), y `SimBus` descarta y cuenta lo que no cabría para que las pruebas demuestren que todo lo que se envía cabría en UDP.
+**Todo mensaje cabe en un datagrama** (`MAX_PEER_MSG` = 1150 B desde la 0.6.0; eran 1154 antes de que la cabecera ganase la sal de arranque): no hay fragmentación ni reensamblado entre shards. Las listas de fantasmas se parten en trozos de tamaño exacto (`ghost_chunks`, que calcula las longitudes sin codificar), y `SimBus` descarta y cuenta lo que no cabría para que las pruebas demuestren que todo lo que se envía cabría en UDP.
 
 ### Datagrama del bus UDP
 
 ```
- 0x20 | ver | de (2) | para (2) | contador (8) | reloj ms (8) | config (8) | carga | etiqueta (16)
- └──────────────── 30 B de cabecera ─────────────────┘         ≤ 1154 B        HMAC-SHA256/128
+ 0x20 | ver=2 | de (2) | para (2) | arranque (4) | contador (8) | reloj ms (8) | config (8) | carga cifrada | etiqueta (16)
+ └────────────────────── 34 B de cabecera ───────────────────────┘          ≤ 1150 B        Poly1305
 ```
 
-La etiqueta se calcula con `bus_key = HMAC(clave_de_cluster, "tsofgw/bus-key/v1")` sobre todo lo anterior. El receptor comprueba **en este orden**, y cada rechazo se cuenta por separado: formato → origen válido y distinto de mí → destino soy yo → etiqueta → resumen de configuración → frescura del reloj (±30 s) → ventana anti‑replay por origen. Además:
+Desde la 0.6.0 el datagrama va **cifrado y autenticado con ChaCha20-Poly1305** (documento 11): la cabecera entera es dato asociado, la carga va cifrada, la clave es una por shard emisor (`HMAC(bus_key, "tsofgw/bus-aead/v2" ‖ de)`) y el nonce es `arranque ‖ contador`, con `arranque` una sal aleatoria que elige cada proceso al arrancar. Hasta la 0.5 la etiqueta era `HMAC(clave_de_cluster, "tsofgw/bus-key/v1")` sobre todo lo anterior y la carga iba en claro. El receptor comprueba **en este orden**, y cada rechazo se cuenta por separado: formato → origen válido y distinto de mí → destino soy yo → etiqueta → resumen de configuración → frescura del reloj (±30 s) → ventana anti‑replay por origen. Además:
 
 - **No responde nunca** a lo que recibe y **solo envía a las direcciones configuradas** (`--peers`): no se le puede usar para amplificar ni para reflejar tráfico.
 - El contador parte de `reloj_ms × 1000`, así que **sigue creciendo tras un reinicio** y las capturas antiguas no se repiten.
-- **Resumen de configuración** (`ClusterConfig::digest`): una huella de lo que debe ser igual en todos los shards (rejilla, si hay directorio, tick, radios, NPC —cuántos, velocidad y semilla— y margen). Un shard con otra configuración es auténtico pero **incompatible**: sus datagramas se rechazan y se cuentan aparte («por otra configuración de mundo»), y no mezcla mundos distintos. Lo que es política local (hilos, límites de jugadores, reintentos…) no cuenta. **La 0.5.0 cambió el formato de `Handover` (lleva la época) y la huella (ahora incluye si hay directorio): un shard de la 0.4.x y uno de la 0.5.0 se rechazan mutuamente como «otra configuración de mundo». Actualiza todo el clúster a la vez.**
+- **Resumen de configuración** (`ClusterConfig::digest`): una huella de lo que debe ser igual en todos los shards (rejilla, si hay directorio, tick, radios, NPC —cuántos, velocidad y semilla— y margen). Un shard con otra configuración es auténtico pero **incompatible**: sus datagramas se rechazan y se cuentan aparte («por otra configuración de mundo»), y no mezcla mundos distintos. Lo que es política local (hilos, límites de jugadores, reintentos…) no cuenta. **La 0.5.0 cambió el formato de `Handover` (lleva la época) y la huella (ahora incluye si hay directorio): un shard de la 0.4.x y uno de la 0.5.0 se rechazan mutuamente como «otra configuración de mundo». Actualiza todo el clúster a la vez.** La 0.6.0 cambió además el formato del datagrama (versión 2, cifrado): un shard de la 0.5 y uno de la 0.6 se descartan mutuamente como «formato imposible».
 - Lectura acotada (8192 datagramas por vuelta) y tolerancia a `ConnectionReset` de Windows.
 
 ## 6. Garantías y cómo se comprueban
@@ -149,8 +149,8 @@ Para guardar el estado en disco y usar el directorio de sesiones (`--data-dir`, 
 ## 9. Límites conocidos (para no confundir intención con realidad)
 
 - **Solo medido en bucle local**: no hay mediciones en una red de verdad ni en varias máquinas. Los tiempos son de un sandbox de 2 núcleos.
-- **El bus está autenticado pero no cifrado.** Está pensado para una red privada entre servidores; no expongas sus puertos a internet. Necesita relojes sincronizados (NTP) con menos de 30 s de diferencia.
-- **Quien tenga la clave de clúster puede hacerse pasar por cualquier shard** (inyectar fantasmas o traspasos). Es una clave de infraestructura: trátala como tal y rótala si se filtra.
+- **El bus va cifrado desde la 0.6.0, con criptografía propia sin auditar y sin secreto hacia adelante** (documento 11). Está pensado para una red privada entre servidores; no expongas sus puertos a internet. Necesita relojes sincronizados (NTP) con menos de 30 s de diferencia.
+- **Quien tenga la clave de clúster puede hacerse pasar por cualquier shard** (inyectar fantasmas o traspasos). Es una clave de infraestructura: trátala como tal y rótala si se filtra. Con la 0.6 también **descifra** todo el bus (y las capturas antiguas).
 - **Sin directorio de sesiones, la unicidad de una cuenta es de mejor esfuerzo:** cada shard garantiza «una cuenta, una sesión» solo localmente. Con el directorio (0.5.0, documento 10) una cuenta vive en un solo shard; el directorio es un único proceso, sin alta disponibilidad.
 - **Sin `--data-dir`, un shard que se reinicia pierde su estado, y un `HANDOVER` perdido durante una partición larga de red puede perder a un jugador.** Con persistencia (0.5.0) no ocurre (documento 10); es opcional y no es el modo por defecto.
 - **Reparto estático** en rejilla: no hay equilibrado dinámico de carga ni fusión/división de regiones.

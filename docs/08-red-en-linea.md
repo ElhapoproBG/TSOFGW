@@ -25,8 +25,8 @@ Esta capa (introducida en 0.3.0 y ampliada en 0.4.0 y 0.5.0) convierte los bloqu
 - Timeouts, paquetes de mantenimiento, límite de paquetes por segundo y por sesión, límite de sesiones.
 
 **No garantiza (todavía)**
-- **Confidencialidad:** los paquetes viajan en claro, autenticados pero no cifrados. Falta un cifrado AEAD de una biblioteca auditada; no se implementó criptografía propia.
-- **Credenciales asimétricas ni secreto hacia adelante:** quien tenga la clave maestra puede suplantar a cualquier cuenta. Es un esquema para desarrollo y redes privadas.
+- **Secreto hacia adelante y confianza en el cifrado:** desde la 0.6 la carga de cada paquete va cifrada con ChaCha20-Poly1305 (documento 11), pero es una implementación propia **sin auditar**, y las claves de sesión salen de la clave de la cuenta y dos nonces: si esa clave se filtra, se descifran las capturas. El handshake va en claro (la cuenta es visible).
+- **Credenciales asimétricas:** quien tenga la clave maestra puede suplantar a cualquier cuenta. Es un esquema para desarrollo y redes privadas.
 - **Migración de dirección:** si cambia la IP o el puerto del cliente, debe reconectar.
 - **Entrega fiable ni orden:** es UDP con autenticidad. La capa de juego lo tolera (inputs redundantes, snapshots delta con línea base confirmada).
 
@@ -146,7 +146,7 @@ El trabajo total se conserva (la suma casi no cambia: el costo de los fantasmas 
 - **Cliente congelado tras cambiar de shard (0.4.0):** al pasar a un shard con la cuenta de ticks atrasada, el cliente descartaba todos sus snapshots como «viejos». Lo encontró una prueba endurecida a propósito (documento 09, sección 8).
 
 ## 8. Pendiente
-- **Cifrado AEAD** de los datos y del bus entre shards, y credenciales asimétricas (Ed25519) emitidas por la autoridad.
+- Sustituir el cifrado propio por una biblioteca auditada, intercambio de claves efímero (secreto hacia adelante) y credenciales asimétricas (Ed25519) emitidas por la autoridad.
 - **Simulación de NPC en paralelo** (hoy solo la replicación usa varios hilos) y medir el escalado con más de 2 núcleos.
 - **Migración de dirección** del cliente y control de congestión.
 - **Reconexión automática de los clientes** tras una caída de un shard (hoy solo la hacen los bancos de pruebas) y **checkpoints incrementales** para mundos grandes (documento 10, sección 11).

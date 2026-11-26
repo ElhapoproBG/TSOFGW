@@ -8,7 +8,7 @@ use tsofgw_net::EntityState;
 use tsofgw_online::bus::{NpcXfer, PeerMsg};
 use tsofgw_online::cluster_scenario::ClusterScenario;
 use tsofgw_online::cluster_udp::UdpCluster;
-use tsofgw_online::udp_bus::{bus_key, seal, system_wall_ms};
+use tsofgw_online::udp_bus::{bus_key, seal, system_wall_ms, Header};
 use tsofgw_online::{ClusterStats, GameConfig, NPC_BASE};
 
 const KEY: &[u8] = b"clave-de-cluster-de-las-pruebas";
@@ -121,7 +121,15 @@ fn un_intruso_en_el_bus_no_consigue_nada_y_queda_registrado() {
                 ];
                 for m in msgs {
                     counter += 1;
-                    let d = seal(&wrong, from, to, counter, wall, 0, &m.encode());
+                    let head = Header {
+                        from,
+                        to,
+                        boot: 1,
+                        counter,
+                        wall_ms: wall,
+                        config: 0,
+                    };
+                    let d = seal(&wrong, &head, &m.encode());
                     raw.send_to(&d, c.bus_addrs[to as usize]).unwrap();
                     forged += 1;
                 }

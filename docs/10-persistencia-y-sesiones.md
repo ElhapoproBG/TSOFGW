@@ -22,7 +22,7 @@ decide en qué shard vive cada cuenta, y la regla que lo une todo es una sola:
            └──────────────┘
 ```
 
-> ⚠️ **Los datos en disco están autenticados, no cifrados**, y la red sigue sin cifrar (README y `SECURITY.md`).
+> ⚠️ **Los datos en disco están autenticados, no cifrados**. La red va cifrada desde la 0.6 (documento 11), con criptografía propia sin auditar (README y `SECURITY.md`).
 > Quien lea la carpeta de datos ve las cuentas y sus posiciones; quien la modifique sin la clave es detectado, pero
 > **restaurar una copia vieja de la carpeta no se detecta**.
 
@@ -353,8 +353,8 @@ el resultado de arriba). Lo que la CI ha confirmado de verdad está en el docume
 
 ## 11. Límites conocidos
 
-- **No hay cifrado**: ni de la red (jugadores y bus) ni de lo que se guarda en disco. **Quien tenga la clave de clúster
-  puede hacerse pasar por cualquier shard y por el directorio**; es confianza total.
+- **Lo que se guarda en disco no está cifrado** (la red sí, desde la 0.6: documento 11). **Quien tenga la clave de clúster
+  descifra el bus y puede hacerse pasar por cualquier shard y por el directorio**; es confianza total.
 - **El directorio es un solo proceso**, sin alta disponibilidad, sin arrendamientos y sin sustitución automática. Mientras
   está caído nadie entra ni cruza bordes con una cuenta (lo que ya juega sigue jugando). Se reinicia a mano y se reconstruye
   a mano si se pierde su carpeta.

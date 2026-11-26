@@ -8,7 +8,8 @@
 | `tsofgw-world` | Rejilla espacial 3D, consultas por radio, gestión de interés con histéresis, regiones activas, reparto en shards (rendezvous hashing) | Implementado y probado |
 | `tsofgw-net` | Codificación binaria, snapshots completos y delta, cabecera con seq/ack, predicción y reconciliación | Implementado y probado (sin transporte) |
 | `tsofgw-hal` | Interfaces de gráficos, XR y entrada; perfiles `vr`, `vr-120`, `pc`, `consola`; backends headless | Interfaces y headless; sin backends reales |
-| `tsofgw-transport` | Transporte UDP autenticado: handshake con cookie, MAC por paquete, anti-replay, fragmentación, sesiones, red simulada | Implementado y probado; sin cifrado |
+| `tsofgw-aead` | ChaCha20-Poly1305 (RFC 8439), propio, sin dependencias | Implementado y probado contra OpenSSL; **sin auditar** (0.6.0) |
+| `tsofgw-transport` | Transporte UDP cifrado y autenticado: handshake con cookie, ChaCha20-Poly1305 por paquete, anti-replay, fragmentación, sesiones, red simulada | Implementado y probado; cifrado propio sin auditar, sin secreto hacia adelante |
 | `tsofgw-online` | Protocolo de juego, servidor autoritativo (créditos de input, regiones activas, interés, snapshots delta; replicación en varios hilos, niveles de detalle y presupuesto de ancho de banda), cliente con predicción, bots, **clúster de shards** (fantasmas, traspaso de NPC y de jugadores, bus UDP autenticado), banco de pruebas | Implementado y probado |
 | `tsofgw-pack` | SHA-256, HMAC, manifiestos de módulo, niveles de confianza, política de permisos, revocación | Implementado; firmas asimétricas pendientes |
 | `tsofgw-sys` | FFI a C con respaldo en Rust puro | Implementado |

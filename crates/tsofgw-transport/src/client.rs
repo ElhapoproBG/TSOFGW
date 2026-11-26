@@ -279,16 +279,16 @@ impl<L: Link> SecureClient<L> {
             self.stats.unknown_session += 1;
             return;
         }
-        if !wire::verify_tag(&l.keys.s2c, pkt) {
+        let Some(plain) = wire::open_data(&l.keys.s2c, pkt) else {
             self.stats.bad_tag += 1;
             return;
-        }
+        };
         if !l.replay.accept(d.counter) {
             self.stats.replays += 1;
             return;
         }
         l.last_seen = now;
-        match l.reasm.push(now, d.msg_id, d.idx, d.count, d.payload) {
+        match l.reasm.push(now, d.msg_id, d.idx, d.count, &plain) {
             Push::Complete(data) if !data.is_empty() => events.push(ClientEvent::Message(data)),
             Push::Invalid => self.stats.malformed += 1,
             _ => {}
@@ -303,7 +303,7 @@ impl<L: Link> SecureClient<L> {
         let Some(l) = self.live.as_mut() else {
             return;
         };
-        if id != l.session || !wire::verify_tag(&l.keys.s2c, pkt) {
+        if id != l.session || !wire::verify_disconnect(&l.keys.s2c, pkt) {
             self.stats.bad_tag += 1;
             return;
         }

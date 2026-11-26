@@ -1,0 +1,9 @@
+[package]
+name = "tsofgw-aead"
+description = "Cifrado autenticado ChaCha20-Poly1305 (RFC 8439) sin dependencias, para el transporte y el bus de TSOFGW"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]

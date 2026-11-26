@@ -583,3 +583,298 @@ fn udp_real_handshake_y_mensajes() {
     assert_eq!(got_srv, Some(vec![9u8; 5000]));
     assert_eq!(got_cli, Some(b"bienvenido".to_vec()));
 }
+
+// ------------------------------------------------------------------------------------------------
+// Confidencialidad (0.6.0): DATA y DISCONNECT van cifrados con ChaCha20-Poly1305
+// ------------------------------------------------------------------------------------------------
+
+/// Texto reconocible de `len` bytes: si cualquier trozo suyo aparece en un datagrama, el contenido
+/// viajó en claro.
+fn marcador(len: usize) -> Vec<u8> {
+    b"TSOFGW-MARCADOR-SECRETO-"
+        .iter()
+        .cycle()
+        .take(len)
+        .copied()
+        .collect()
+}
+
+/// ¿Aparece en `hay` alguna ventana de `w` bytes del marcador?
+fn contiene_trozo_del_marcador(hay: &[u8], w: usize) -> bool {
+    let m = marcador(48);
+    m.windows(w).any(|n| hay.windows(w).any(|h| h == n))
+}
+
+#[test]
+fn nada_del_contenido_viaja_en_claro_y_el_tamano_no_crece() {
+    let mut r = Rig::new(SimConfig {
+        latency_ms: 10,
+        ..Default::default()
+    });
+    r.net.start_log();
+    let c = r.add_client(authority().issue(9), 21);
+    r.step(300);
+    assert!(r.clients[c].is_connected());
+    let session = r
+        .srv_events
+        .iter()
+        .find_map(|e| match e {
+            ServerEvent::Connected { session, .. } => Some(*session),
+            _ => None,
+        })
+        .unwrap();
+    // Mensajes de varios tamaños en los dos sentidos, incluidos varios fragmentos y uno de 0 bytes de
+    // relleno exacto de un fragmento.
+    let tamanos = [
+        1usize,
+        15,
+        16,
+        17,
+        100,
+        1000,
+        3000,
+        wire::MAX_FRAGMENT_PAYLOAD,
+    ];
+    for &n in &tamanos {
+        r.clients[c].send(&marcador(n)).unwrap();
+        r.server.send(session, &marcador(n)).unwrap();
+        r.step(100);
+    }
+    assert_eq!(
+        r.messages_at_server().len(),
+        tamanos.len(),
+        "todo llegó al servidor"
+    );
+    let del_servidor = r.messages_at_client(c);
+    assert_eq!(del_servidor.len(), tamanos.len(), "y al cliente");
+    for (m, &n) in del_servidor.iter().zip(&tamanos) {
+        assert_eq!(m, &marcador(n));
+    }
+
+    let log = r.net.take_log();
+    let datos: Vec<&Vec<u8>> = log
+        .iter()
+        .map(|(_, _, d)| d)
+        .filter(|d| d[0] == wire::DATA)
+        .collect();
+    assert!(datos.len() >= 2 * tamanos.len(), "hubo tráfico de datos");
+    for d in &log {
+        assert!(
+            !contiene_trozo_del_marcador(&d.2, 8),
+            "un datagrama de {} bytes lleva trozos del contenido en claro",
+            d.2.len()
+        );
+    }
+    // Cifrar no agranda nada: cabecera (17) + carga + etiqueta (16), como antes.
+    let con_marcador: usize = datos
+        .iter()
+        .map(|d| d.len() - wire::DATA_HEADER - wire::FRAG_HEADER - 16)
+        .sum();
+    let esperado: usize = tamanos.iter().map(|n| 2 * n).sum();
+    assert_eq!(
+        con_marcador, esperado,
+        "bytes de carga en la red: tanto como en claro"
+    );
+}
+
+#[test]
+fn el_mismo_mensaje_enviado_dos_veces_no_se_parece() {
+    let mut r = Rig::new(SimConfig::default());
+    let c = r.add_client(authority().issue(3), 22);
+    r.step(200);
+    r.net.start_log();
+    r.clients[c].send(&marcador(200)).unwrap();
+    r.clients[c].send(&marcador(200)).unwrap();
+    let log = r.net.take_log();
+    let datos: Vec<_> = log.iter().filter(|(_, _, d)| d[0] == wire::DATA).collect();
+    assert_eq!(datos.len(), 2);
+    let (a, b) = (&datos[0].2, &datos[1].2);
+    assert_eq!(a.len(), b.len());
+    // Mismo texto en claro, contadores distintos: ni cifrado ni etiqueta coinciden (nonce distinto).
+    let cuerpo = |p: &Vec<u8>| p[wire::DATA_HEADER + wire::FRAG_HEADER..p.len() - 16].to_vec();
+    assert_ne!(cuerpo(a), cuerpo(b));
+    assert_ne!(a[a.len() - 16..], b[b.len() - 16..]);
+}
+
+#[test]
+fn un_paquete_de_un_sentido_no_vale_en_el_otro() {
+    let mut r = Rig::new(SimConfig::default());
+    let c = r.add_client(authority().issue(4), 23);
+    r.step(200);
+    let session = r
+        .srv_events
+        .iter()
+        .find_map(|e| match e {
+            ServerEvent::Connected { session, .. } => Some(*session),
+            _ => None,
+        })
+        .unwrap();
+    r.srv_events.clear();
+    r.net.start_log();
+    r.server.send(session, b"orden del servidor").unwrap();
+    let (de_srv, a_cli, data) = r
+        .net
+        .take_log()
+        .into_iter()
+        .find(|(_, _, d)| d[0] == wire::DATA)
+        .unwrap();
+    r.step(5);
+    assert_eq!(r.messages_at_client(c).len(), 1);
+    // Reflejado hacia el servidor como si lo enviara el cliente: otra clave por sentido, se rechaza.
+    let mut atacante = r.net.endpoint();
+    atacante.send_as(a_cli, de_srv, &data);
+    r.step(5);
+    assert!(r.messages_at_server().is_empty());
+    assert_eq!(r.server.stats().bad_tag, 1);
+}
+
+#[test]
+fn quien_conoce_la_cuenta_pero_no_su_clave_no_forja_ni_lee_nada() {
+    let mut r = Rig::new(SimConfig::default());
+    let c = r.add_client(authority().issue(5), 24);
+    r.step(200);
+    let session = r
+        .srv_events
+        .iter()
+        .find_map(|e| match e {
+            ServerEvent::Connected { session, .. } => Some(*session),
+            _ => None,
+        })
+        .unwrap();
+    r.srv_events.clear();
+    r.net.start_log();
+    r.clients[c].send(b"original").unwrap();
+    let (from, to, data) = r.net.take_log().into_iter().next().unwrap();
+    r.step(5);
+    r.messages_at_server();
+    // Un atacante construye un DATA bien formado para esa sesión con una clave que se inventa.
+    let mut forged = data.clone();
+    for b in forged[wire::DATA_HEADER + wire::FRAG_HEADER..].iter_mut() {
+        *b ^= 0x5a;
+    }
+    // Contador nuevo (para que no lo frene el anti-replay y llegue a la etiqueta).
+    forged[5..13].copy_from_slice(&1_000_000u64.to_le_bytes());
+    let mut atacante = r.net.endpoint();
+    atacante.send_as(from, to, &forged);
+    r.step(5);
+    assert!(r.messages_at_server().is_empty());
+    assert_eq!(r.server.stats().bad_tag, 1);
+    assert!(r.server.session_count() == 1 && r.clients[c].is_connected());
+    // Un DISCONNECT inventado tampoco expulsa a nadie.
+    let mut falso = vec![wire::DISCONNECT];
+    falso.extend_from_slice(&session.to_le_bytes());
+    falso.extend_from_slice(&2_000_000u64.to_le_bytes());
+    falso.extend_from_slice(&[0xAB; 16]);
+    atacante.send_as(from, to, &falso);
+    r.step(5);
+    assert!(r.clients[c].is_connected());
+    assert_eq!(r.server.stats().bad_tag, 2);
+}
+
+#[test]
+fn un_hello_de_la_version_anterior_se_ignora() {
+    let net = SimNet::new(SimConfig::default());
+    let mut server = SecureServer::new(
+        net.endpoint(),
+        authority(),
+        ServerConfig::default(),
+        Box::new(DeterministicEntropy(1)),
+    );
+    let mut atacante = net.endpoint();
+    let mut ev = Vec::new();
+    let mut hello = wire::hello(&[7u8; 16]);
+    assert_eq!(hello[1], wire::PROTOCOL_VERSION);
+    assert_eq!(
+        wire::PROTOCOL_VERSION,
+        2,
+        "los paquetes cifrados son la versión 2"
+    );
+    hello[1] = 1;
+    let antes = net.stats().sent;
+    atacante.send(server.link().addr(), &hello);
+    server.poll(1, &mut ev);
+    assert_eq!(
+        net.stats().sent,
+        antes + 1,
+        "solo el HELLO: no hubo respuesta"
+    );
+    assert_eq!(server.session_count(), 0);
+}
+
+#[test]
+fn udp_real_con_un_espia_en_medio_no_ve_el_contenido_y_el_juego_funciona() {
+    use std::net::UdpSocket;
+    let srv_link = UdpLink::bind("127.0.0.1:0").unwrap();
+    let srv_addr = srv_link.local_addr().unwrap();
+    let mut server = SecureServer::new(
+        srv_link,
+        authority(),
+        ServerConfig::default(),
+        Box::new(OsEntropy),
+    );
+    // El «espía» se interpone: el cliente cree que habla con él, y él reenvía a ambos lados y guarda
+    // una copia de cada datagrama.
+    let spy = UdpSocket::bind("127.0.0.1:0").unwrap();
+    spy.set_nonblocking(true).unwrap();
+    let spy_addr = spy.local_addr().unwrap();
+    let mut client = SecureClient::new(
+        UdpLink::bind("127.0.0.1:0").unwrap(),
+        spy_addr,
+        authority().issue(11),
+        ClientConfig::default(),
+        Box::new(OsEntropy),
+    );
+    let mut capturado: Vec<Vec<u8>> = Vec::new();
+    let mut cliente_addr = None;
+    let mut buf = [0u8; 2048];
+
+    let t0 = std::time::Instant::now();
+    let (mut sev, mut cev) = (Vec::new(), Vec::new());
+    let (mut enviado, mut got_srv, mut got_cli, mut session) = (false, None, None, None);
+    while t0.elapsed().as_millis() < 8000 && (got_srv.is_none() || got_cli.is_none()) {
+        let now = t0.elapsed().as_millis() as u64;
+        while let Ok((n, from)) = spy.recv_from(&mut buf) {
+            capturado.push(buf[..n].to_vec());
+            if from == srv_addr {
+                if let Some(c) = cliente_addr {
+                    spy.send_to(&buf[..n], c).unwrap();
+                }
+            } else {
+                cliente_addr = Some(from);
+                spy.send_to(&buf[..n], srv_addr).unwrap();
+            }
+        }
+        server.poll(now, &mut sev);
+        client.poll(now, &mut cev);
+        for e in sev.drain(..) {
+            match e {
+                ServerEvent::Connected { session: s, .. } => session = Some(s),
+                ServerEvent::Message { data, .. } => got_srv = Some(data),
+                _ => {}
+            }
+        }
+        for e in cev.drain(..) {
+            if let ClientEvent::Message(d) = e {
+                got_cli = Some(d);
+            }
+        }
+        if client.is_connected() && !enviado {
+            client.send(&marcador(5000)).unwrap(); // se fragmenta
+            enviado = true;
+        }
+        if let Some(s) = session.take() {
+            server.send(s, &marcador(3000)).unwrap();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert_eq!(got_srv, Some(marcador(5000)));
+    assert_eq!(got_cli, Some(marcador(3000)));
+    assert!(capturado.len() >= 8, "el espía vio el tráfico");
+    for d in &capturado {
+        assert!(
+            !contiene_trozo_del_marcador(d, 8),
+            "el espía leyó contenido en un datagrama de {} bytes",
+            d.len()
+        );
+    }
+}

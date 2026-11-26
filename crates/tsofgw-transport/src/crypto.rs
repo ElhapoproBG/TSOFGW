@@ -1,5 +1,9 @@
 //! Credenciales, derivación de claves de sesión y ventana anti-replay.
 //!
+//! Desde la 0.6.0 las claves de sesión son claves de **ChaCha20-Poly1305** (`tsofgw-aead`): los datos de
+//! cada paquete van cifrados y autenticados. El handshake (HELLO, CHALLENGE, AUTH, ACCEPT) sigue yendo
+//! en claro y autenticado con HMAC-SHA256: el número de cuenta es visible para quien escuche.
+//!
 //! Esquema (clave compartida por cuenta, **para desarrollo y redes privadas**):
 //! * La *autoridad* (servicio de cuentas) tiene una clave maestra y emite a cada cuenta una clave
 //!   `HMAC(maestra, "tsofgw/player-key/v1" ‖ id)`. El servidor de juego deriva la misma clave al vuelo,
@@ -11,7 +15,7 @@ use tsofgw_pack::HmacKey;
 
 pub const NONCE_LEN: usize = 16;
 pub const COOKIE_LEN: usize = 16;
-pub const TAG_LEN: usize = 16;
+pub const TAG_LEN: usize = tsofgw_aead::TAG_LEN;
 
 /// Clave de una cuenta. Su `Debug` no muestra la clave.
 #[derive(Clone)]
@@ -92,10 +96,20 @@ pub(crate) fn accept_mac(
     out
 }
 
-/// Claves de cada sentido de una sesión.
+/// Claves AEAD de cada sentido de una sesión (cliente→servidor y servidor→cliente).
+///
+/// Cada sesión estrena claves (salen de los dos nonces y del identificador de sesión), y cada sentido
+/// tiene la suya: por eso basta un contador creciente por sentido como nonce de ChaCha20-Poly1305,
+/// sin repetir nunca una pareja (clave, nonce).
 pub(crate) struct SessionKeys {
-    pub c2s: HmacKey,
-    pub s2c: HmacKey,
+    pub c2s: [u8; 32],
+    pub s2c: [u8; 32],
+}
+
+impl std::fmt::Debug for SessionKeys {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "SessionKeys {{ <ocultas> }}")
+    }
 }
 
 pub(crate) fn derive_session(
@@ -105,23 +119,23 @@ pub(crate) fn derive_session(
     session_id: u32,
 ) -> SessionKeys {
     let master = key.mac(&[
-        b"tsofgw/session/v1",
+        b"tsofgw/session/v2",
         client_nonce,
         server_nonce,
         &session_id.to_le_bytes(),
     ]);
     let master = HmacKey::new(&master);
     SessionKeys {
-        c2s: HmacKey::new(&master.mac(&[b"c2s"])),
-        s2c: HmacKey::new(&master.mac(&[b"s2c"])),
+        c2s: master.mac(&[b"aead-c2s"]),
+        s2c: master.mac(&[b"aead-s2c"]),
     }
 }
 
-pub(crate) fn tag(key: &HmacKey, signed: &[u8]) -> [u8; TAG_LEN] {
-    let full = key.mac(&[signed]);
-    let mut out = [0u8; TAG_LEN];
-    out.copy_from_slice(&full[..TAG_LEN]);
-    out
+/// Nonce de 96 bits de un paquete: 4 bytes a cero y el contador de 64 bits del paquete.
+pub(crate) fn nonce_for(counter: u64) -> [u8; tsofgw_aead::NONCE_LEN] {
+    let mut n = [0u8; tsofgw_aead::NONCE_LEN];
+    n[4..].copy_from_slice(&counter.to_le_bytes());
+    n
 }
 
 /// Ventana de 128 contadores: rechaza repetidos y los demasiado viejos.
@@ -209,8 +223,17 @@ mod tests {
         let k = HmacKey::new(b"k");
         let (cn, sn) = ([1u8; 16], [2u8; 16]);
         let s = derive_session(&k, &cn, &sn, 7);
-        assert_ne!(tag(&s.c2s, b"x"), tag(&s.s2c, b"x"));
+        assert_ne!(s.c2s, s.s2c);
         let s2 = derive_session(&k, &cn, &sn, 8);
-        assert_ne!(tag(&s.c2s, b"x"), tag(&s2.c2s, b"x"));
+        assert_ne!(s.c2s, s2.c2s);
+        assert_ne!(s.s2c, s2.s2c);
+        // Otros nonces o otra clave de cuenta: otras claves de sesión.
+        let s3 = derive_session(&k, &[3u8; 16], &sn, 7);
+        assert_ne!(s.c2s, s3.c2s);
+        let s4 = derive_session(&HmacKey::new(b"k2"), &cn, &sn, 7);
+        assert_ne!(s.c2s, s4.c2s);
+        // Y son deterministas: las dos puntas llegan a lo mismo.
+        let again = derive_session(&k, &cn, &sn, 7);
+        assert_eq!((s.c2s, s.s2c), (again.c2s, again.s2c));
     }
 }

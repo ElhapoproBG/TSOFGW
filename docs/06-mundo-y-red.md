@@ -30,6 +30,6 @@ Son cifras de un entorno concreto: sirven para comparar perfiles y detectar regr
 
 ## Límites conocidos
 - Las entidades fantasma y el traspaso entre servidores existen desde 0.4.0 (documento 09), pero el clúster usa una **rejilla geométrica fija** (`Partition`) y no el `ShardMap` con rendezvous hashing de este documento; unir ambos (reparto flexible que se reequilibra al añadir o quitar shards) está pendiente.
-- El transporte real está en el documento 08 (UDP autenticado, sin cifrado todavía); este documento describe los bloques de codificación.
+- El transporte real está en el documento 08 (UDP cifrado y autenticado desde la 0.6; documento 11); este documento describe los bloques de codificación.
 - Las posiciones se cuantizan con un rango de ±33 millones de unidades por eje.
 - El costo declarado de los nodos es una declaración, no una medición. En la demo con 100 000 entidades y 200 jugadores, el tiempo real supera el presupuesto del perfil de consola aunque el costo declarado quepa. La medición del costo real y su comparación con el declarado es una tarea pendiente.

@@ -4,10 +4,10 @@ Motor dinámico y open source para mundos inmersivos de realidad virtual a gran 
 No es un juego: es la base sobre la que se programa, construida como un **grafo de interdependencias**.
 
 > ## ⚠️ No apto para exponerse a internet
-> *Not suitable for exposure to the internet.* TSOFGW 0.5 es un prototipo para desarrollo, pruebas y redes de confianza:
+> *Not suitable for exposure to the internet.* TSOFGW 0.6 es un prototipo para desarrollo, pruebas y redes de confianza:
 >
-> - **La red no está cifrada**, ni la de jugadores ni el bus entre shards: los paquetes se autentican, pero se pueden leer.
-> - **Quien tenga la clave de clúster puede hacerse pasar por cualquier shard y por el directorio de sesiones**, y quien tenga la clave maestra, por cualquier cuenta.
+> - **Desde la 0.6 la red va cifrada** (jugadores y bus entre shards, ChaCha20-Poly1305), pero **con criptografía propia que nadie ha auditado**, **sin secreto hacia adelante** (si una clave se filtra, se descifran las capturas antiguas) y con el número de cuenta visible en el handshake. [`docs/11-cifrado.md`](docs/11-cifrado.md)
+> - **Quien tenga la clave de clúster descifra todo el bus y puede hacerse pasar por cualquier shard y por el directorio de sesiones**, y quien tenga la clave maestra, por cualquier cuenta.
 > - **Lo que se guarda en disco está autenticado, no cifrado**: quien lea la carpeta de datos ve las cuentas y sus posiciones, y restaurar una copia vieja de la carpeta no se detecta.
 > - **El directorio de sesiones es un solo proceso**, sin alta disponibilidad ni sustitución automática.
 > - Nada de esto ha pasado una auditoría externa.
@@ -32,7 +32,8 @@ No es un juego: es la base sobre la que se programa, construida como un **grafo 
 | `tsofgw-world` | Rejilla espacial, interés, regiones activas, shards |
 | `tsofgw-net` | Snapshots delta, seq/ack, predicción |
 | `tsofgw-hal` | Interfaces de plataforma, perfiles, backends headless |
-| `tsofgw-transport` | UDP autenticado: handshake con cookie, MAC por paquete, anti-replay, fragmentación |
+| `tsofgw-aead` | ChaCha20-Poly1305 (RFC 8439) propio y sin auditar, comprobado contra OpenSSL; lo usan el transporte y el bus |
+| `tsofgw-transport` | UDP cifrado y autenticado: handshake con cookie, ChaCha20-Poly1305 por paquete, anti-replay, fragmentación |
 | `tsofgw-online` | Servidor autoritativo, cliente con predicción, bots, banco de pruebas, clúster de shards, persistencia y directorio de sesiones |
 | `tsofgw-store` | Almacén durable: diario con checkpoints autenticados (HMAC), recuperación tras caídas, medio de archivos y de memoria con fallos inyectables |
 | `tsofgw-soft` | Rasterizador por software, PNG y comparación de imágenes |
@@ -59,7 +60,7 @@ Requiere Rust 1.90 o superior (`rustup update`). No hace falta compilador de C.
 
 ## Estado
 
-Versión 0.5.1, prototipo (**no apto para exponerse a internet**, ver arriba y `SECURITY.md`). Incluye un servidor autoritativo con transporte UDP autenticado (sin cifrado todavía), cliente con predicción, replicación en varios hilos con niveles de detalle y presupuesto de ancho de banda, un **clúster de shards** (el mundo repartido entre procesos, con entidades fantasma, traspaso de NPC y de jugadores y un bus UDP autenticado), y desde la 0.5.0 **persistencia y directorio de sesiones** (`docs/10-persistencia-y-sesiones.md`), todo con pruebas de carga medidas. Dibuja con un rasterizador por software verificado (`tsofgw render`); el backend de GPU con wgpu (`gpu/`) compila y dibuja lo mismo que el rasterizador por software, comprobado en la integración continua con Vulkan por software (todavía no en una GPU real); OpenXR no está empezado. Lo que está verificado y lo que no (sin sandbox, firmas solo HMAC, sin cifrado de la red ni del disco, directorio de un solo proceso, medido solo en bucle local) está en `docs/07-estado-y-pendientes.md`; el estado de la integración continua (Linux, Windows y macOS) se ve en la pestaña *Actions* del repositorio.
+Versión 0.6.0, prototipo (**no apto para exponerse a internet**, ver arriba y `SECURITY.md`). Incluye un servidor autoritativo con transporte UDP cifrado y autenticado (criptografía propia sin auditar, `docs/11-cifrado.md`), cliente con predicción, replicación en varios hilos con niveles de detalle y presupuesto de ancho de banda, un **clúster de shards** (el mundo repartido entre procesos, con entidades fantasma, traspaso de NPC y de jugadores y un bus UDP autenticado), y desde la 0.5.0 **persistencia y directorio de sesiones** (`docs/10-persistencia-y-sesiones.md`), todo con pruebas de carga medidas. Dibuja con un rasterizador por software verificado (`tsofgw render`); el backend de GPU con wgpu (`gpu/`) compila y dibuja lo mismo que el rasterizador por software, comprobado en la integración continua con Vulkan por software (todavía no en una GPU real); OpenXR no está empezado. Lo que está verificado y lo que no (sin sandbox, firmas solo HMAC, cifrado de red propio sin auditar y sin secreto hacia adelante, disco sin cifrar, directorio de un solo proceso, medido solo en bucle local) está en `docs/07-estado-y-pendientes.md`; el estado de la integración continua (Linux, Windows y macOS) se ve en la pestaña *Actions* del repositorio.
 
 ## Documentación
 
@@ -73,7 +74,8 @@ Versión 0.5.1, prototipo (**no apto para exponerse a internet**, ver arriba y `
 8. `docs/08-red-en-linea.md` — transporte, servidor autoritativo, escala y pruebas de carga
 9. `docs/09-cluster-de-shards.md` — un mundo repartido entre varios servidores
 10. `docs/10-persistencia-y-sesiones.md` — persistencia en disco, directorio de sesiones y cómo se probó
-11. `SECURITY.md` — qué protege hoy el motor, qué no y el plan de seguridad
+11. `docs/11-cifrado.md` — cifrado de la red: qué garantiza, qué no, cómo se probó
+12. `SECURITY.md` — qué protege hoy el motor, qué no y el plan de seguridad
 
 ## Licencia
 

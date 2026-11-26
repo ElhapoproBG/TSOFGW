@@ -1,5 +1,29 @@
 # Cambios
 
+## 0.6.0 — La red va cifrada (con criptografía propia, sin auditar)
+Cierra el punto 3 de la lista de deuda: hasta la 0.5 los dos canales de red (jugadores y bus entre shards) iban autenticados pero **en claro**. Desde ahora van cifrados con ChaCha20-Poly1305 (RFC 8439). **Es incompatible con la 0.5.x**: cambian el protocolo de jugadores (versión 2; un HELLO de la versión anterior se ignora) y el datagrama del bus (versión 2; cabecera de 34 B y `MAX_PEER_MSG` = 1150). Actualiza servidores y clientes a la vez. El formato del disco no cambia.
+
+**Lo nuevo**
+- **Crate `tsofgw-aead`** (solo biblioteca estándar, `#![forbid(unsafe_code)]`): ChaCha20, Poly1305 (limbos de 26 bits) y el AEAD del RFC 8439. Comprueba la etiqueta **antes** de descifrar y deja el búfer intacto si falla. **Es código propio y nadie lo ha auditado**; está aislado para poder cambiarlo por una biblioteca auditada (por ejemplo la `chacha20poly1305` de RustCrypto).
+- **Transporte de jugadores:** cada paquete de datos lleva la cabecera en claro pero autenticada (dato asociado) y la carga cifrada; una clave por sentido y sesión (`aead-c2s`, `aead-s2c`), nonce = contador. El tamaño del paquete no crece respecto a la etiqueta anterior (16 B). El handshake sigue en claro y autenticado con HMAC.
+- **Bus entre shards:** una clave por shard emisor derivada de la clave de clúster; nonce = sal aleatoria de arranque (4 B) ‖ contador. Orden de comprobación del receptor: formato, origen, destino, descifrado y etiqueta, huella de configuración, reloj, ventana anti-replay.
+- **Aviso del CLI** y documentación reescritos; documento nuevo `docs/11-cifrado.md`.
+
+**Cómo se probó**
+- Vectores del RFC 8439 (§2.3.2, 2.4.2, 2.5.2, 2.6.2, 2.8.2) y, **contra OpenSSL**, 23 vectores AEAD, 458 de Poly1305 y 6 bloques de ChaCha20; se regeneran en la CI con `ci/generar_vectores_aead.py` y deben ser idénticos a los guardados.
+- Pruebas de red: nada del contenido viaja en claro, el mismo mensaje enviado dos veces no se parece, un paquete de un sentido no vale en el otro, quien conoce la cuenta pero no su clave no forja ni lee, y un espía interpuesto sobre UDP real no ve el contenido mientras el juego funciona (jugadores y bus).
+- **Mutaciones:** 12 mutantes nuevos (C1–C12; 35 en total), 12 de 12 detectados. **Hallazgo (C1):** sobrevivía un mutante en la reducción final de Poly1305 (h ≥ 2^130−5): ninguna prueba la ejercitaba. Se añadieron vectores fabricados (r pequeña, bloques 0xFF) a los de OpenSSL y ahora se detecta.
+- 320 pruebas pasan con y sin el compilador de C; Clippy y formato limpios.
+- **Coste medido:** 322 MB/s (3,66 µs por paquete de 1180 B) en un sandbox de 2 núcleos; en la prueba de carga (60 clientes, 2000 NPC, 8 s, 5 ejecuciones alternadas) el tick medio fue de 388–604 µs en la 0.5.1 y 358–419 µs en la 0.6.0: no se distingue del ruido.
+
+**Lo que NO da**
+- Auditoría: es criptografía propia; tampoco se ha medido si es de tiempo constante.
+- **Secreto hacia adelante:** quien obtenga una clave descifra lo que capturó. La clave de clúster descifra todo el bus.
+- Ocultar metadatos: el handshake revela la cuenta; se ven tamaños y ritmo.
+- El disco sigue autenticado, no cifrado.
+
+**Lectura de la CI de la 0.5.1** (commit `d68ce30`, ejecución n.º 8): éxito, 7 trabajos en verde; Windows: 290 pruebas pasan, 0 fallan; la tormenta de caídas hizo 11 reinicios con 32 cuentas, 0 perdidas y 0 duplicadas.
+
 ## 0.5.1 — La CI de la 0.5.0 y un aviso de Clippy en Windows
 Es la lectura de la CI de la 0.5.0, y una corrección de una línea. No cambia el comportamiento, el formato del bus ni el del disco: los shards 0.5.0 y 0.5.1 se entienden entre sí.
 

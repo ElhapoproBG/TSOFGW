@@ -3,7 +3,8 @@
 //! # Qué garantiza
 //! * **Autenticación mutua** con una clave por cuenta ([`Authority`], [`Credentials`]): el servidor sabe
 //!   qué cuenta es el cliente y el cliente sabe que habla con un servidor que conoce su clave.
-//! * **Integridad y autenticidad por paquete** (HMAC-SHA256 truncado a 128 bits, una clave por sentido).
+//! * **Confidencialidad, integridad y autenticidad por paquete** (desde la 0.6, ChaCha20-Poly1305 de
+//!   `tsofgw-aead`, una clave por sentido y sesión; la cabecera va autenticada y la carga cifrada).
 //! * **Anti-replay**: ventana de 128 contadores por sentido.
 //! * **Resistencia a suplantación de origen**: HELLO → CHALLENGE con *cookie* atada a la dirección; el
 //!   servidor no guarda nada hasta verificar AUTH, y ninguna respuesta es mayor que lo que la provoca.
@@ -11,10 +12,13 @@
 //! * Sesiones con timeout, mantenimiento de la conexión y límite de paquetes por segundo.
 //!
 //! # Qué NO garantiza (todavía)
-//! * **Confidencialidad**: los paquetes van en claro (autenticados, no cifrados). Falta un cifrado AEAD
-//!   de una biblioteca auditada; no se implementa criptografía propia.
-//! * **Secreto hacia adelante** ni credenciales asimétricas: la clave maestra de la autoridad permite
-//!   suplantar cualquier cuenta. Es un esquema para desarrollo y redes privadas.
+//! * **Una implementación de cifrado auditada**: `tsofgw-aead` es código propio, comprobado contra los
+//!   vectores del RFC 8439 y contra OpenSSL, pero nadie lo ha auditado (documento 11).
+//! * **Secreto hacia adelante** ni credenciales asimétricas: las claves de sesión salen de la clave de la
+//!   cuenta y de dos nonces, así que una clave filtrada descifra lo capturado, y la clave maestra de la
+//!   autoridad permite suplantar cualquier cuenta. Es un esquema para desarrollo y redes privadas.
+//! * **Ocultar metadatos**: el handshake va en claro (el número de cuenta se ve), y el tamaño y el ritmo
+//!   de los paquetes también.
 //! * **Migración de dirección** (cambio de IP/puerto): el cliente debe reconectar.
 //! * **Entrega fiable ni orden**: es un datagrama con garantías de autenticidad, como UDP.
 //! * Un tercero que *falsifique la dirección de origen de un jugador* y repita su AUTH mientras la cookie

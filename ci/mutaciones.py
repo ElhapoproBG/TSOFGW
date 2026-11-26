@@ -40,10 +40,18 @@ CL = "crates/tsofgw-online/src/server/cluster.rs"
 DU = "crates/tsofgw-online/src/server/durable.rs"
 DI = "crates/tsofgw-online/src/directory.rs"
 ST = "crates/tsofgw-store/src/lib.rs"
+AE = "crates/tsofgw-aead/src/lib.rs"
+WI = "crates/tsofgw-transport/src/wire.rs"
+CR = "crates/tsofgw-transport/src/crypto.rs"
+TS = "crates/tsofgw-transport/src/server.rs"
+UB = "crates/tsofgw-online/src/udp_bus.rs"
 
 # Pruebas que ve cada familia de mutantes.
 PRUEBAS_ONLINE = ["-p", "tsofgw-online", "--test", "persist"]
 PRUEBAS_STORE = ["-p", "tsofgw-store"]
+PRUEBAS_AEAD = ["-p", "tsofgw-aead"]
+PRUEBAS_TRANSPORT = ["-p", "tsofgw-transport"]
+PRUEBAS_BUS = ["-p", "tsofgw-online", "--lib", "udp_bus"]
 
 
 @dataclass
@@ -220,6 +228,91 @@ MUTANTES = [
         "        if false && arrival.is_none() && self.by_entity.contains_key(&player) {",
         PRUEBAS_ONLINE,
     ),
+    # ------------------------------------------------------------------ el cifrado (0.6.0)
+    Mutante(
+        "C1", "Poly1305 no hace la reducción final módulo 2^130-5 (falla solo con ciertos valores)",
+        AE,
+        "        let mask = (g4 >> 31).wrapping_sub(1);",
+        "        let mask = 0u32;",
+        PRUEBAS_AEAD,
+    ),
+    Mutante(
+        "C2", "los datos asociados no se rellenan hasta 16 bytes antes de autenticar (etiqueta distinta a la del estándar)",
+        AE,
+        "    pad16(&mut p, aad.len());\n",
+        "",
+        PRUEBAS_AEAD,
+    ),
+    Mutante(
+        "C3", "open_in_place descifra y deja el texto en claro en el buffer aunque la etiqueta falle",
+        AE,
+        "    let expected = aead_tag(key, nonce, aad, buf);\n    if !ct_eq(&expected, tag) {\n        return false;\n    }\n    chacha20_xor(key, 1, nonce, buf);\n    true",
+        "    let expected = aead_tag(key, nonce, aad, buf);\n    chacha20_xor(key, 1, nonce, buf);\n    if !ct_eq(&expected, tag) {\n        return false;\n    }\n    true",
+        PRUEBAS_AEAD,
+    ),
+    Mutante(
+        "C4", "el contador de bloque de ChaCha20 da la vuelta en silencio (el flujo de claves se repetiría)",
+        AE,
+        "        ctr = ctr\n            .checked_add(1)\n            .expect(\"ChaCha20: contador de bloque agotado\");",
+        "        ctr = ctr.wrapping_add(1);",
+        PRUEBAS_AEAD,
+    ),
+    Mutante(
+        "C5", "el transporte descifra pero no comprueba la etiqueta de los DATA (acepta paquetes alterados)",
+        WI,
+        "    open_in_place(key, &nonce_for(counter), aad, &mut buf, t).then_some(buf)",
+        "    let _ = open_in_place(key, &nonce_for(counter), aad, &mut buf, t);\n    Some(buf)",
+        PRUEBAS_TRANSPORT,
+    ),
+    Mutante(
+        "C6", "el transporte no comprueba la etiqueta de los DISCONNECT (cualquiera expulsa a un jugador)",
+        WI,
+        "    open_in_place(key, &nonce_for(counter), aad, &mut [], t)\n}",
+        "    let _ = open_in_place(key, &nonce_for(counter), aad, &mut [], t);\n    true\n}",
+        PRUEBAS_TRANSPORT,
+    ),
+    Mutante(
+        "C7", "el nonce del transporte ignora el contador (todos los paquetes cifran con el mismo flujo)",
+        CR,
+        "    n[4..].copy_from_slice(&counter.to_le_bytes());",
+        "    let _ = counter;",
+        PRUEBAS_TRANSPORT,
+    ),
+    Mutante(
+        "C8", "los dos sentidos de una sesión usan la misma clave (un paquete se puede reflejar hacia atrás)",
+        CR,
+        "        s2c: master.mac(&[b\"aead-s2c\"]),",
+        "        s2c: master.mac(&[b\"aead-c2s\"]),",
+        PRUEBAS_TRANSPORT,
+    ),
+    Mutante(
+        "C9", "el servidor acepta un HELLO de cualquier versión del protocolo (también la anterior, sin cifrar)",
+        TS,
+        "        if pkt.len() < wire::HELLO_LEN || pkt[1] != wire::PROTOCOL_VERSION {",
+        "        if pkt.len() < wire::HELLO_LEN {",
+        PRUEBAS_TRANSPORT,
+    ),
+    Mutante(
+        "C10", "todos los shards cifran el bus con la misma clave (la de «desde» no entra en la derivación)",
+        UB,
+        "            .mac(&[b\"tsofgw/bus-aead/v2\", &from.to_le_bytes()])",
+        "            .mac(&[b\"tsofgw/bus-aead/v2\", &0u16.to_le_bytes()])",
+        PRUEBAS_BUS,
+    ),
+    Mutante(
+        "C11", "el nonce del bus ignora la sal de arranque (un reinicio con el reloj atrasado repetiría nonces)",
+        UB,
+        "    n[..4].copy_from_slice(&boot.to_le_bytes());",
+        "    let _ = boot;",
+        PRUEBAS_BUS,
+    ),
+    Mutante(
+        "C12", "el bus descifra pero no comprueba la etiqueta (acepta datagramas forjados)",
+        UB,
+        "    open_in_place(\n        sender_key,\n        &nonce_of(p.head.boot, p.head.counter),\n        aad,\n        &mut buf,\n        tag,\n    )\n    .then_some(buf)",
+        "    let _ = open_in_place(\n        sender_key,\n        &nonce_of(p.head.boot, p.head.counter),\n        aad,\n        &mut buf,\n        tag,\n    );\n    Some(buf)",
+        PRUEBAS_BUS,
+    ),
 ]
 
 
@@ -316,12 +409,15 @@ def main() -> int:
             copy_function=shutil.copy,
         )
 
-        # 1. Sin defectos, todo debe pasar.
-        for nombre, args in (("almacén", PRUEBAS_STORE), ("persistencia del cluster", PRUEBAS_ONLINE)):
-            if not any(m.pruebas == args for m in ms):
+        # 1. Sin defectos, todo debe pasar (una vez por cada grupo de pruebas que se vaya a usar).
+        vistos = []
+        for m in ms:
+            if m.pruebas in vistos:
                 continue
+            vistos.append(m.pruebas)
+            nombre = " ".join(m.pruebas)
             print(f"base ({nombre}): ", end="", flush=True)
-            ok, compila, falladas, out, dt = cargo(copia, target, args, extra, a.timeout)
+            ok, compila, falladas, out, dt = cargo(copia, target, m.pruebas, extra, a.timeout)
             if not ok:
                 print(f"FALLA sin defectos ({dt:.0f} s): no se puede probar nada así.")
                 print(out[-3000:])

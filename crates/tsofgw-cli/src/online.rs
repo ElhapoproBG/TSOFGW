@@ -181,8 +181,8 @@ pub(crate) fn resolve(addr: &str) -> Result<SocketAddr, String> {
         .ok_or(format!("no se pudo resolver {addr}"))
 }
 
-/// Aviso de seguridad si algún canal escucha fuera del bucle local: la red de esta versión no está cifrada y
-/// no es apta para exponerse a internet (ver `SECURITY.md`). Devuelve `None` si todo es local.
+/// Aviso de seguridad si algún canal escucha fuera del bucle local: la red de esta versión va cifrada con
+/// criptografía propia sin auditar y no es apta para exponerse a internet (ver `SECURITY.md`). Devuelve `None` si todo es local.
 pub(crate) fn exposure_warning(listening: &[(&str, SocketAddr)]) -> Option<String> {
     let exposed: Vec<String> = listening
         .iter()
@@ -194,9 +194,10 @@ pub(crate) fn exposure_warning(listening: &[(&str, SocketAddr)]) -> Option<Strin
     }
     Some(format!(
         "ADVERTENCIA: escuchando fuera del bucle local ({}). TSOFGW {} NO está pensado para exponerse a internet: \
-         la red no está cifrada (ni la de jugadores ni el bus entre shards), quien tenga la clave de clúster puede \
-         suplantar a cualquier shard, y el directorio de sesiones (si lo usas) es un solo proceso sin réplica. Úsalo en \
-         una red privada o de confianza; detalles en SECURITY.md.",
+         el cifrado de la red (jugadores y bus entre shards) es propio y nadie lo ha auditado, no hay secreto hacia \
+         adelante, quien tenga la clave de clúster descifra el bus y puede suplantar a cualquier shard, y el directorio \
+         de sesiones (si lo usas) es un solo proceso sin réplica. Úsalo en una red privada o de confianza; detalles en \
+         SECURITY.md.",
         exposed.join(", "),
         env!("CARGO_PKG_VERSION")
     ))

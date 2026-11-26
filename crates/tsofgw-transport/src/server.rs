@@ -308,10 +308,10 @@ impl<L: Link> SecureServer<L> {
             self.stats.addr_mismatch += 1;
             return;
         }
-        if !wire::verify_tag(&s.keys.c2s, pkt) {
+        let Some(plain) = wire::open_data(&s.keys.c2s, pkt) else {
             self.stats.bad_tag += 1;
             return;
-        }
+        };
         if !s.replay.accept(d.counter) {
             self.stats.replays += 1;
             return;
@@ -329,7 +329,7 @@ impl<L: Link> SecureServer<L> {
         let first = !s.confirmed;
         s.confirmed = true;
         let player_id = s.player_id;
-        let pushed = s.reasm.push(now, d.msg_id, d.idx, d.count, d.payload);
+        let pushed = s.reasm.push(now, d.msg_id, d.idx, d.count, &plain);
 
         if first {
             self.pending = self.pending.saturating_sub(1);
@@ -372,7 +372,7 @@ impl<L: Link> SecureServer<L> {
             self.stats.unknown_session += 1;
             return;
         };
-        if s.addr != from || !wire::verify_tag(&s.keys.c2s, pkt) {
+        if s.addr != from || !wire::verify_disconnect(&s.keys.c2s, pkt) {
             self.stats.bad_tag += 1;
             return;
         }
