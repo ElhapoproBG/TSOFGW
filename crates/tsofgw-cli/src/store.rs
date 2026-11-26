@@ -45,6 +45,8 @@ pub fn cmd_directory(args: &[String]) -> Result<(), String> {
             "--grid",
             "--peers",
             "--bind",
+            "--replicas",
+            "--replica",
             "--cluster-key-file",
             "--data-dir",
             "--duration",
@@ -70,9 +72,47 @@ pub fn cmd_directory(args: &[String]) -> Result<(), String> {
     let dir = flag(args, "--data-dir").ok_or(
         "falta --data-dir (el directorio guarda dónde vive cada cuenta: sin disco no sirve)",
     )?;
-    let bind = flag(args, "--bind").ok_or(
-        "falta --bind DIR (la dirección del bus del directorio: la que reciben los shards con --directory)",
-    )?;
+    // Grupo replicado: `--replicas A0,A1,A2 --replica I` (las direcciones de bus de todas, en orden, y cuál es esta).
+    let replicas = flag(args, "--replicas")
+        .map(|l| parse_addr_list(&l, "--replicas"))
+        .transpose()?;
+    let replica: usize = num(args, "--replica", 0)?;
+    let nrep = replicas.as_ref().map_or(1, Vec::len);
+    match &replicas {
+        Some(l) => {
+            if !matches!(l.len(), 3 | 5 | 7) {
+                return Err(format!(
+                    "--replicas: un grupo de 3, 5 o 7 réplicas (hay {}); para una sola usa --bind",
+                    l.len()
+                ));
+            }
+            if flag(args, "--replica").is_none() {
+                return Err("con --replicas indica cuál es esta con --replica I (0-based)".into());
+            }
+            if replica >= l.len() {
+                return Err(format!(
+                    "--replica {replica}: el grupo tiene {} réplicas (0..{})",
+                    l.len(),
+                    l.len() - 1
+                ));
+            }
+        }
+        None => {
+            if flag(args, "--replica").is_some() {
+                return Err("--replica solo tiene sentido con --replicas".into());
+            }
+        }
+    }
+    let bind = match (flag(args, "--bind"), &replicas) {
+        (Some(b), _) => b,
+        (None, Some(l)) => l[replica].to_string(),
+        (None, None) => {
+            return Err(
+                "falta --bind DIR (la dirección del bus del directorio: la que reciben los shards con --directory)"
+                    .into(),
+            )
+        }
+    };
     let duration: u64 = num(args, "--duration", 0)?;
     let compact_mb: u64 = num(
         args,
@@ -95,10 +135,18 @@ pub fn cmd_directory(args: &[String]) -> Result<(), String> {
     // que hay directorio): así el bus descarta a quien venga con otra.
     let mut cluster = ClusterConfig::new(0, partition, &game)?;
     cluster.directory = true;
-    let mut bus =
-        UdpBus::bind(n as ShardId, &bind, n + 1, &key)?.with_config_digest(cluster.digest(&game));
+    cluster.dir_replicas = nrep;
+    let mut bus = UdpBus::bind((n + replica) as ShardId, &bind, n + nrep, &key)?
+        .with_config_digest(cluster.digest(&game));
     for (j, a) in peers.iter().enumerate() {
         bus.set_peer(j as ShardId, *a)?;
+    }
+    if let Some(l) = &replicas {
+        for (j, a) in l.iter().enumerate() {
+            if j != replica {
+                bus.set_peer((n + j) as ShardId, *a)?;
+            }
+        }
     }
     let local = bus
         .local_addr()
@@ -111,6 +159,9 @@ pub fn cmd_directory(args: &[String]) -> Result<(), String> {
         n,
         DirectoryConfig {
             compact_bytes: compact_mb << 20,
+            replicas: nrep,
+            replica,
+            ..DirectoryConfig::default()
         },
         open_mode(args),
     )?;
@@ -152,6 +203,19 @@ pub fn cmd_directory(args: &[String]) -> Result<(), String> {
         if now - last_report >= 5000 {
             last_report = now;
             let st = d.stats();
+            if nrep > 1 {
+                println!(
+                    "[{:>5} s] réplica {replica}/{nrep}: {} | término {} | aplicado hasta {} | diario {} entradas | propuestas {} redirigidas {} sin líder {}",
+                    now / 1000,
+                    if d.is_leader() { "LÍDER" } else { "seguidora" },
+                    d.raft_term(),
+                    d.applied_index(),
+                    d.raft_log_len(),
+                    st.proposed,
+                    st.redirects,
+                    st.no_leader
+                );
+            }
             println!(
                 "[{:>5} s] cuentas {} (por shard {:?}) | entradas {} | cambios de dueño: confirmados {}, repetidos {}, rechazados {}, desconocidos {} | mal formados {} | commits {}",
                 now / 1000,

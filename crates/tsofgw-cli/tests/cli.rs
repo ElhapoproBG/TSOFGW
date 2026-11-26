@@ -1488,3 +1488,231 @@ fn un_cluster_con_directorio_sobrevive_a_un_kill_9_de_un_shard_y_del_directorio(
     );
     assert!(!otra.status.success());
 }
+
+#[test]
+fn un_directorio_replicado_con_raft_sobrevive_a_un_kill_9_de_su_lider() {
+    let d = temp("cluster-raft-kill9");
+    assert!(tsofgw(&d, &["keygen", "-o", "m.key"]).status.success());
+    assert!(tsofgw(&d, &["keygen", "-o", "c.key"]).status.success());
+    // Puertos libres: clientes y bus de los dos shards, y el bus de las tres réplicas del directorio.
+    let p = free_udp_ports(7);
+    let (c0, c1, b0, b1) = (p[0], p[1], p[2], p[3]);
+    let reps: Vec<String> = p[4..7].iter().map(|x| format!("127.0.0.1:{x}")).collect();
+    let peers = format!("127.0.0.1:{b0},127.0.0.1:{b1}");
+    let replicas = reps.join(",");
+    let shard = |name: &str, i: u16, bind: u16, secs: u64| {
+        Proc::spawn(
+            &d,
+            name,
+            &[
+                "serve",
+                "--master-file",
+                "m.key",
+                "--cluster-key-file",
+                "c.key",
+                "--shard",
+                &i.to_string(),
+                "--grid",
+                "2x1",
+                "--peers",
+                &peers,
+                "--bind",
+                &format!("127.0.0.1:{bind}"),
+                "--npcs",
+                "1000",
+                "--spawn-half",
+                "10",
+                "--data-dir",
+                &format!("datos{i}"),
+                "--directory",
+                &replicas,
+                "--duration",
+                &secs.to_string(),
+            ],
+        )
+    };
+    let replica = |name: &str, i: usize, secs: u64| {
+        Proc::spawn(
+            &d,
+            name,
+            &[
+                "directory",
+                "--grid",
+                "2x1",
+                "--peers",
+                &peers,
+                "--cluster-key-file",
+                "c.key",
+                "--replicas",
+                &replicas,
+                "--replica",
+                &i.to_string(),
+                "--data-dir",
+                &format!("datos-dir{i}"),
+                "--npcs",
+                "1000",
+                "--duration",
+                &secs.to_string(),
+            ],
+        )
+    };
+    let shards = format!("127.0.0.1:{c0},127.0.0.1:{c1}");
+    let bots = |secs: u64| {
+        tsofgw(
+            &d,
+            &[
+                "bots",
+                "--master-file",
+                "m.key",
+                "--connect",
+                &format!("127.0.0.1:{c0}"),
+                "--shards",
+                &shards,
+                "--count",
+                "10",
+                "--patrol",
+                "8",
+                "--patrol-ms",
+                "4000",
+                "--duration",
+                &secs.to_string(),
+            ],
+        )
+    };
+    let cambios = |out: &str| {
+        let l = out
+            .lines()
+            .rev()
+            .find(|l| l.contains("cambios de shard"))
+            .unwrap_or_else(|| panic!("sin informe de bots:\n{out}"));
+        number_after(l, "cambios de shard")
+    };
+    let check_bots = |o: &Output, what: &str| -> String {
+        let out = text(&o.stdout);
+        assert!(o.status.success(), "{what}: {out}\n{}", text(&o.stderr));
+        assert!(out.contains("jugando 10/10"), "{what}: {out}");
+        assert!(out.contains("(0 fallidos)"), "{what}: {out}");
+        assert!(cambios(&out) >= 2, "{what}: nadie cruzó el borde:\n{out}");
+        out
+    };
+
+    let mut r = vec![
+        Some(replica("r0", 0, 52)),
+        Some(replica("r1", 1, 52)),
+        Some(replica("r2", 2, 52)),
+    ];
+    sleep_ms(400);
+    let mut s0 = shard("s0", 0, c0, 52);
+    sleep_ms(300);
+    let mut s1 = shard("s1", 1, c1, 52);
+    // Espera a que alguna réplica imprima su estado (cada 5 s) diciendo quién lidera.
+    let leader_of = |r: &[Option<Proc>]| -> Option<usize> {
+        r.iter().position(|p| {
+            p.as_ref().is_some_and(|p| {
+                p.log()
+                    .lines()
+                    .rev()
+                    .find(|l| l.contains("réplica "))
+                    .is_some_and(|l| l.contains("LÍDER"))
+            })
+        })
+    };
+    let end = Instant::now() + Duration::from_secs(20);
+    while leader_of(&r).is_none() && Instant::now() < end {
+        sleep_ms(200);
+    }
+    let leader = leader_of(&r).unwrap_or_else(|| {
+        panic!(
+            "ninguna réplica dice ser líder:\n{}",
+            r.iter().flatten().map(|p| p.log()).collect::<String>()
+        )
+    });
+    check_bots(&bots(8), "fase 1, con las tres");
+
+    // Corte de luz del líder: queda una mayoría (2 de 3) y el cluster debe seguir cruzando bordes.
+    r[leader].as_mut().unwrap().kill9();
+    let muerta = r[leader].take().unwrap();
+    sleep_ms(1500);
+    // Los patrulleros caminan +4 s y -4 s según el reloj de su proceso: con ciclos completos (múltiplos de 8 s)
+    // acaban donde empezaron y la fase siguiente vuelve a arrancar junto al borde.
+    check_bots(&bots(16), "fase 2, sin el líder");
+
+    // Vuelve con su carpeta, se pone al día y el cluster sigue.
+    let mut vuelta = replica("r-vuelta", leader, 26);
+    sleep_ms(3000);
+    check_bots(&bots(8), "fase 3, con la réplica de vuelta");
+
+    // Fin: todo se cierra limpio.
+    let (st0, t0) = s0.finish(90);
+    let (st1, t1) = s1.finish(90);
+    let (stv, tv) = vuelta.finish(90);
+    for (st, t) in [(&st0, &t0), (&st1, &t1), (&stv, &tv)] {
+        assert!(st.success(), "{t}");
+        assert!(t.contains("Cierre limpio"), "{t}");
+        assert!(!t.contains("ERROR"), "{t}");
+    }
+    assert!(
+        tv.contains("restaurado"),
+        "la réplica no restauró su carpeta:\n{tv}"
+    );
+    assert!(tv.contains(&format!("réplica {leader}/3")), "{tv}");
+    drop(muerta);
+    for (i, p) in r.iter_mut().enumerate() {
+        if let Some(p) = p {
+            let (st, t) = p.finish(90);
+            assert!(st.success(), "réplica {i}: {t}");
+            assert!(t.contains("Cierre limpio"), "réplica {i}: {t}");
+            assert!(!t.contains("ERROR"), "réplica {i}: {t}");
+        }
+    }
+    // Cada réplica guardó las 10 cuentas, también la que cayó y volvió.
+    for i in 0..3 {
+        let o = tsofgw(
+            &d,
+            &[
+                "store",
+                "info",
+                "--data-dir",
+                &format!("datos-dir{i}"),
+                "--directory",
+                "--cluster-key-file",
+                "c.key",
+            ],
+        );
+        assert!(o.status.success(), "réplica {i}: {}", text(&o.stderr));
+        let t = text(&o.stdout);
+        assert_eq!(number_after(&t, "cuentas:"), 10, "réplica {i}:\n{t}");
+    }
+    let i0 = tsofgw(
+        &d,
+        &[
+            "store",
+            "info",
+            "--data-dir",
+            "datos0",
+            "--shard",
+            "0",
+            "--cluster-key-file",
+            "c.key",
+        ],
+    );
+    let i1 = tsofgw(
+        &d,
+        &[
+            "store",
+            "info",
+            "--data-dir",
+            "datos1",
+            "--shard",
+            "1",
+            "--cluster-key-file",
+            "c.key",
+        ],
+    );
+    let (t0, t1) = (text(&i0.stdout), text(&i1.stdout));
+    assert_eq!(
+        number_after(&t0, "cuentas residentes:") + number_after(&t1, "cuentas residentes:"),
+        10,
+        "{t0}\n{t1}"
+    );
+}

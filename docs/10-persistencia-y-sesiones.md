@@ -49,7 +49,7 @@ jugadores se guardan cada `--player-save-ticks`, 100 ticks = 5 s por defecto; lo
 transporte (5 s) en notar que el servidor cayó y **no se reconectan solos** (con un cierre limpio se les avisa y lo
 notan al instante). Lo que nunca se pierde es quién es dueño de qué.
 
-**Lo que no hace:** no cifra nada; no tiene alta disponibilidad (el directorio es un solo proceso); no detecta que le
+**Lo que no hace:** no cifra nada; no tiene alta disponibilidad por omisión (el directorio es un solo proceso; desde la 0.8.0 puede replicarse: documento 12); no detecta que le
 devuelvan una copia vieja de la carpeta; no replica los datos a otra máquina. Véanse los límites en la sección 11.
 
 ## 2. El almacén (`tsofgw-store`)
@@ -199,9 +199,10 @@ shards (autenticado con la clave de clúster, como todo lo del bus):
   rearranque justo después. Si su disco falla, **descarta todas las respuestas** (también las de lectura: todas pasan por la misma cola
   que espera al `commit`) y no vuelve a contestar hasta reiniciarse: nadie entra ni cruza bordes con una cuenta mientras
   tanto; lo que ya está jugando sigue jugando.
-- **Es un solo proceso.** Sin réplica, sin elección de líder, sin arrendamientos, sin sustitución automática. Si cae,
+- **Por omisión es un solo proceso.** Sin réplica, sin elección de líder, sin arrendamientos, sin sustitución automática. Si cae,
   nadie puede entrar ni cruzar bordes hasta que vuelva (los traspasos esperan, sin perder a nadie; las pruebas lo
-  comprueban).
+  comprueban). **Desde la 0.8.0** puede ser un grupo de 3, 5 o 7 réplicas con Raft (documento 12): con la mayoría viva
+  se sigue sin que nadie lo note más que por un retraso.
 - **Si se pierde su carpeta**, se reconstruye a partir de los shards con el comando `store rebuild-directory`, **con todos
   los shards parados**: cada uno sabe qué cuentas tiene y cuáles está entregando. Si dos shards reclaman la misma cuenta
   con la misma época, la reconstrucción se niega a elegir por su cuenta y las lista (`--accept-conflicts` las anota en el
@@ -355,7 +356,7 @@ el resultado de arriba). Lo que la CI ha confirmado de verdad está en el docume
 
 - **Lo que se guarda en disco no está cifrado** (la red sí, desde la 0.6: documento 11). **Quien tenga la clave de clúster
   descifra el bus y puede hacerse pasar por cualquier shard y por el directorio**; es confianza total.
-- **El directorio es un solo proceso**, sin alta disponibilidad, sin arrendamientos y sin sustitución automática. Mientras
+- **El directorio es, por omisión, un solo proceso**, sin alta disponibilidad (con réplicas, 0.8.0: documento 12). Mientras
   está caído nadie entra ni cruza bordes con una cuenta (lo que ya juega sigue jugando). Se reinicia a mano y se reconstruye
   a mano si se pierde su carpeta.
 - **No se detecta el retroceso:** restaurar una copia vieja de una carpeta (o devolverle sus archivos de ayer) no se nota:

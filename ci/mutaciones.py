@@ -47,6 +47,8 @@ TS = "crates/tsofgw-transport/src/server.rs"
 UB = "crates/tsofgw-online/src/udp_bus.rs"
 XD = "crates/tsofgw-aead/src/x25519.rs"
 TCL = "crates/tsofgw-transport/src/client.rs"
+RA = "crates/tsofgw-online/src/raft.rs"
+RP = "crates/tsofgw-online/src/directory/repl.rs"
 
 # Pruebas que ve cada familia de mutantes.
 PRUEBAS_ONLINE = ["-p", "tsofgw-online", "--test", "persist"]
@@ -54,6 +56,7 @@ PRUEBAS_STORE = ["-p", "tsofgw-store"]
 PRUEBAS_AEAD = ["-p", "tsofgw-aead"]
 PRUEBAS_TRANSPORT = ["-p", "tsofgw-transport"]
 PRUEBAS_BUS = ["-p", "tsofgw-online", "--lib", "udp_bus"]
+PRUEBAS_RAFT = ["-p", "tsofgw-online", "--test", "raft", "--test", "dir_raft"]
 
 
 @dataclass
@@ -378,6 +381,105 @@ MUTANTES = [
         "                let Some(dh) = self.eph.agree(&server_eph) else {\n                    self.stats.bad_auth += 1;\n                    return;\n                };",
         "                let dh = self.eph.agree(&server_eph).unwrap_or([0u8; 32]);",
         PRUEBAS_TRANSPORT,
+    ),
+    # ------------------------------------------------------------------ Raft y el directorio replicado
+    Mutante(
+        "R1", "la mayoría es la mitad (con 3 réplicas bastan 1: dos líderes a la vez, o confirmar sin mayoría)",
+        RA,
+        "        self.n / 2 + 1\n",
+        "        self.n / 2\n",
+        PRUEBAS_RAFT,
+    ),
+    Mutante(
+        "R2", "el voto compara solo el índice del diario, no su término (gana quien tiene un diario más largo pero viejo)",
+        RA,
+        "        last_term > mt || (last_term == mt && last_index >= mi)",
+        "        last_term > mt || last_index >= mi",
+        PRUEBAS_RAFT,
+    ),
+    Mutante(
+        "R3", "el líder confirma entradas de términos anteriores contando réplicas (el error de la figura 8 de Raft)",
+        RA,
+        "            if self.term_at(n) == Some(self.term) {\n                let count",
+        "            if true {\n                let count",
+        PRUEBAS_RAFT,
+    ),
+    Mutante(
+        "R4", "una réplica vota a varios candidatos en el mismo término",
+        RA,
+        "        let can_vote = self.voted_for.is_none() || self.voted_for == Some(from);",
+        "        let can_vote = true;",
+        PRUEBAS_RAFT,
+    ),
+    Mutante(
+        "R5", "el voto no se guarda en disco antes de contestar (tras una caída vota otra vez)",
+        RA,
+        "            self.voted_for = Some(from);\n            self.persist.push(Persist::Meta {\n                term: self.term,\n                voted_for: self.voted_for,\n            });\n",
+        "            self.voted_for = Some(from);\n",
+        PRUEBAS_RAFT,
+    ),
+    Mutante(
+        "R6", "al descartar entradas en conflicto no se borran del disco (tras una caída reaparecen)",
+        RA,
+        "                    self.persist.push(Persist::TruncateFrom { index: idx });\n                }\n                _ => {}",
+        "                }\n                _ => {}",
+        PRUEBAS_RAFT,
+    ),
+    Mutante(
+        "R7", "el seguidor acepta entradas sin comprobar que su diario coincide en el punto anterior",
+        RA,
+        "            if ours != prev_term {\n                // Retrocede",
+        "            if false && ours != prev_term {\n                // Retrocede",
+        PRUEBAS_RAFT,
+    ),
+    Mutante(
+        "R8", "las entradas en conflicto no se descartan de la memoria del seguidor",
+        RA,
+        "                    self.log.truncate(keep);\n                    self.persist.push(Persist::TruncateFrom { index: idx });",
+        "                    let _ = keep;\n                    self.persist.push(Persist::TruncateFrom { index: idx });",
+        PRUEBAS_RAFT,
+    ),
+    Mutante(
+        "R9", "el directorio replicado responde y envía a las demás réplicas sin sincronizar su disco",
+        DI,
+        "            if self.store.unsynced() > 0 {\n                match self.store.commit() {\n                    Ok(()) => self.stats.commits += 1,\n                    Err(_) => {\n                        self.failed = true;\n                        self.stats.commit_errors += 1;\n                    }\n                }\n            }\n            if !self.failed {\n                match self.store.checkpoint_if_larger",
+        "            if false && self.store.unsynced() > 0 {\n                match self.store.commit() {\n                    Ok(()) => self.stats.commits += 1,\n                    Err(_) => {\n                        self.failed = true;\n                        self.stats.commit_errors += 1;\n                    }\n                }\n            }\n            if !self.failed {\n                match self.store.checkpoint_if_larger",
+        PRUEBAS_RAFT,
+    ),
+    Mutante(
+        "R10", "un traspaso de cuenta se aplica aunque la época no sea la actual (un mensaje viejo hace retroceder o saltar)",
+        RP,
+        "Some((shard, e)) if shard == from && e == epoch => match epoch.checked_add(1) {",
+        "Some((shard, e)) if shard == from => match e.checked_add(1) {",
+        PRUEBAS_RAFT,
+    ),
+    Mutante(
+        "R11", "una entrada de una cuenta que ya existe la reinicia en su shard de origen",
+        RP,
+        "                    Some(r) => r,\n                    None => {\n                        b.put(key(account), encode(home, 1));",
+        "                    Some(_) => {\n                        b.put(key(account), encode(home, 1));\n                        (home, 1)\n                    }\n                    None => {\n                        b.put(key(account), encode(home, 1));",
+        PRUEBAS_RAFT,
+    ),
+    Mutante(
+        "R12", "la instantánea de una réplica atrasada lleva una época inventada",
+        RP,
+        "            v.extend_from_slice(&epoch.to_le_bytes());\n        }\n        v\n",
+        "            v.extend_from_slice(&1u64.to_le_bytes());\n        }\n        v\n",
+        PRUEBAS_RAFT,
+    ),
+    Mutante(
+        "R13", "una carpeta de una réplica se abre como otra réplica o con otro tamaño de grupo",
+        RP,
+        "                if v != ident {",
+        "                if false && v != ident {",
+        PRUEBAS_RAFT,
+    ),
+    Mutante(
+        "R14", "una carpeta de un directorio sin réplicas se abre como réplica (mezcla dos mundos)",
+        RP,
+        "                if store.scan(P_ACCOUNT).next().is_some() {",
+        "                if false && store.scan(P_ACCOUNT).next().is_some() {",
+        PRUEBAS_RAFT,
     ),
 ]
 

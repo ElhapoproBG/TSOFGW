@@ -66,6 +66,9 @@ pub struct ClusterConfig {
     /// shards le preguntan dónde vive cada cuenta antes de dejarla entrar. Debe valer lo mismo en todos
     /// los shards y en el directorio; exige activar la persistencia en cada shard.
     pub directory: bool,
+    /// Réplicas del directorio (1, 3, 5 o 7; con una sola no hay consenso, como en la 0.5). Sus identificadores en
+    /// el bus son `shard_count .. shard_count + dir_replicas`. Debe valer lo mismo en todo el cluster.
+    pub dir_replicas: usize,
 }
 
 impl ClusterConfig {
@@ -88,6 +91,7 @@ impl ClusterConfig {
             handoff_timeout_ticks: 200,
             xfer_memory_ticks: 1200,
             directory: false,
+            dir_replicas: 1,
         };
         c.validate(game)?;
         Ok(c)
@@ -102,6 +106,7 @@ impl ClusterConfig {
         b.extend_from_slice(&nx.to_le_bytes());
         b.extend_from_slice(&nz.to_le_bytes());
         b.push(self.directory as u8);
+        b.push(self.dir_replicas as u8);
         for f in [
             half,
             game.interest_radius,
@@ -120,10 +125,18 @@ impl ClusterConfig {
         u64::from_le_bytes([h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]])
     }
 
-    /// Identificador del directorio de sesiones en el bus, si lo hay: el siguiente al último shard.
+    /// Identificador de la primera réplica del directorio de sesiones en el bus, si lo hay: el siguiente al
+    /// último shard.
     pub fn dir_peer(&self) -> Option<ShardId> {
         self.directory
             .then(|| self.partition.shard_count() as ShardId)
+    }
+
+    /// ¿Es `id` una réplica del directorio?
+    pub fn is_dir_peer(&self, id: ShardId) -> bool {
+        self.dir_peer().is_some_and(|base| {
+            id >= base && (id as usize) < base as usize + self.dir_replicas.max(1)
+        })
     }
 
     pub fn validate(&self, game: &GameConfig) -> Result<(), String> {
@@ -151,8 +164,13 @@ impl ClusterConfig {
                 ));
             }
         }
-        if self.directory && self.partition.shard_count() >= ShardId::MAX as usize {
-            return Err("con directorio no caben más de 65 534 shards".into());
+        if self.directory
+            && self.partition.shard_count() + self.dir_replicas >= ShardId::MAX as usize
+        {
+            return Err("con directorio no caben más de 65 534 pares (shards y réplicas)".into());
+        }
+        if self.directory && !matches!(self.dir_replicas, 1 | 3 | 5 | 7) {
+            return Err("las réplicas del directorio deben ser 1, 3, 5 o 7".into());
         }
         if self.ghost_ttl_ticks < 2 || self.retry_ticks == 0 {
             return Err("ghost_ttl_ticks debe ser ≥ 2 y retry_ticks ≥ 1".into());
@@ -219,6 +237,8 @@ pub struct ClusterStats {
     pub offline_adoptions: u64,
     /// Preguntas al directorio al entrar, respuestas recibidas y su resultado.
     pub dir_logins: u64,
+    pub dir_rotations: u64,
+    pub dir_redirects: u64,
     pub dir_routes_in: u64,
     pub dir_transfers_out: u64,
     pub dir_results_in: u64,
@@ -269,6 +289,8 @@ impl ClusterStats {
         self.handovers_deferred += other.handovers_deferred;
         self.offline_adoptions += other.offline_adoptions;
         self.dir_logins += other.dir_logins;
+        self.dir_rotations += other.dir_rotations;
+        self.dir_redirects += other.dir_redirects;
         self.dir_routes_in += other.dir_routes_in;
         self.dir_transfers_out += other.dir_transfers_out;
         self.dir_results_in += other.dir_results_in;
@@ -386,6 +408,10 @@ pub(crate) struct ClusterNode {
     /// Respuestas del directorio aún sin usar, y cuándo se preguntó por última vez cada cuenta.
     routes: FastMap<u64, Route>,
     asked: FastMap<u64, u32>,
+    /// A qué réplica del directorio se le pregunta ahora (la última que se creyó líder) y cuántas peticiones
+    /// seguidas llevan sin respuesta de ninguna.
+    dir_hint: ShardId,
+    dir_misses: u32,
     next_xfer: u32,
     pub stats: ClusterStats,
     inbox: Vec<(ShardId, Vec<u8>)>,
@@ -399,6 +425,10 @@ impl ClusterNode {
             .into_iter()
             .map(|s| (s, cfg.partition.rect(s)))
             .collect();
+        // Cada shard empieza por una réplica distinta, para no cargar a una sola mientras no se sabe quién lidera.
+        let dir_hint = cfg.dir_peer().map_or(0, |base| {
+            base + (cfg.shard as usize % cfg.dir_replicas.max(1)) as ShardId
+        });
         ClusterNode {
             cfg,
             bus,
@@ -410,6 +440,8 @@ impl ClusterNode {
             outbox: FastMap::default(),
             routes: FastMap::default(),
             asked: FastMap::default(),
+            dir_hint,
+            dir_misses: 0,
             next_xfer: 0,
             stats: ClusterStats::default(),
             inbox: Vec::new(),
@@ -427,8 +459,38 @@ impl ClusterNode {
     }
 
     /// Identificador del directorio en el bus, si lo hay.
+    /// La réplica a la que toca preguntar (la que se cree líder). `None` si no hay directorio.
     pub(super) fn dir_peer(&self) -> Option<ShardId> {
-        self.cfg.dir_peer()
+        self.cfg.directory.then_some(self.dir_hint)
+    }
+
+    /// Se va a enviar una petición al directorio: si varias seguidas no han recibido ni una respuesta (ni
+    /// siquiera una redirección), se prueba con la siguiente réplica.
+    pub(super) fn note_dir_send(&mut self) {
+        self.dir_misses += 1;
+        if self.dir_misses > 3 {
+            self.dir_misses = 0;
+            if let Some(base) = self.cfg.dir_peer() {
+                let n = self.cfg.dir_replicas.max(1) as u32;
+                let next = (self.dir_hint as u32 - base as u32 + 1) % n;
+                self.dir_hint = base + next as ShardId;
+                self.stats.dir_rotations += 1;
+            }
+        }
+    }
+
+    /// Llegó algo del directorio: hay alguien al otro lado.
+    pub(super) fn note_dir_reply(&mut self) {
+        self.dir_misses = 0;
+    }
+
+    /// Una réplica que no lidera nos dice quién cree que sí.
+    pub(super) fn on_dir_redirect(&mut self, leader: ShardId) {
+        self.stats.dir_redirects += 1;
+        self.dir_misses = 0;
+        if self.cfg.is_dir_peer(leader) {
+            self.dir_hint = leader;
+        }
     }
 
     pub(super) fn outbox_has(&self, account: u64) -> bool {
@@ -720,7 +782,7 @@ impl<L: Link> GameServer<L> {
             };
             c.stats.bus_msgs_in += 1;
             c.stats.bus_bytes_in += data.len() as u64;
-            let from_dir = c.dir_peer() == Some(from);
+            let from_dir = c.cfg.is_dir_peer(from);
             if from == c.cfg.shard || (!c.cfg.partition.is_valid(from) && !from_dir) {
                 c.stats.bus_malformed += 1;
                 continue;
@@ -738,8 +800,14 @@ impl<L: Link> GameServer<L> {
     fn on_peer(&mut self, from: ShardId, from_dir: bool, m: PeerMsg) {
         // El directorio solo habla con DirRoute y DirResult; ningún shard puede enviarlos; y DirLogin y
         // DirTransfer (que van al directorio) no tienen sentido en un shard.
-        let dir_reply = matches!(m, PeerMsg::DirRoute { .. } | PeerMsg::DirResult { .. });
-        let dir_request = matches!(m, PeerMsg::DirLogin { .. } | PeerMsg::DirTransfer { .. });
+        let dir_reply = matches!(
+            m,
+            PeerMsg::DirRoute { .. } | PeerMsg::DirResult { .. } | PeerMsg::DirRedirect { .. }
+        );
+        let dir_request = matches!(
+            m,
+            PeerMsg::DirLogin { .. } | PeerMsg::DirTransfer { .. } | PeerMsg::Raft(_)
+        );
         if dir_request || dir_reply != from_dir {
             if let Some(c) = self.cluster.as_mut() {
                 c.stats.bus_malformed += 1;
@@ -779,7 +847,12 @@ impl<L: Link> GameServer<L> {
                 epoch,
             } => self.on_dir_result(xfer, account, status, shard, epoch),
             // Ya filtrados arriba.
-            PeerMsg::DirLogin { .. } | PeerMsg::DirTransfer { .. } => {}
+            PeerMsg::DirRedirect { leader } => {
+                if let Some(c) = self.cluster.as_mut() {
+                    c.on_dir_redirect(leader);
+                }
+            }
+            PeerMsg::DirLogin { .. } | PeerMsg::DirTransfer { .. } | PeerMsg::Raft(_) => {}
         }
     }
 
@@ -1516,7 +1589,9 @@ impl<L: Link> GameServer<L> {
                     epoch,
                 },
             );
-        } else if let Some(dir) = dir {
+        } else if dir.is_some() {
+            c.note_dir_send();
+            let dir = c.dir_peer().unwrap_or(0);
             c.stats.dir_transfers_out += 1;
             self.peer_send_durable(
                 dir,
@@ -1680,6 +1755,7 @@ impl<L: Link> GameServer<L> {
             return;
         };
         c.stats.dir_results_in += 1;
+        c.note_dir_reply();
         let Some(ho) = c.outbox.get_mut(&account) else {
             return; // de un intento anterior, o ya resuelto
         };
@@ -2028,6 +2104,7 @@ impl<L: Link> GameServer<L> {
             return;
         };
         c.stats.dir_routes_in += 1;
+        c.note_dir_reply();
         if !c.cfg.partition.is_valid(shard) {
             c.stats.bus_malformed += 1;
             return;

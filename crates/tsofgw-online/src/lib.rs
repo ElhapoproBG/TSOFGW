@@ -20,6 +20,7 @@ pub mod par;
 pub mod partition;
 pub mod persist;
 pub mod protocol;
+pub mod raft;
 mod replicate;
 pub mod scenario;
 mod server;

@@ -44,7 +44,7 @@ Añade datos en disco y un nuevo proceso con autoridad sobre las cuentas; detall
 - **Copia vieja devuelta a su sitio (retroceso):** **no se detecta**. La clave autentica el contenido, no la frescura: quien pueda reemplazar la carpeta de un shard puede devolver el estado de ayer. Hace falta un ancla fuera de esa máquina (pendiente).
 - **Confidencialidad en reposo:** **no hay cifrado**; la carpeta contiene cuentas y posiciones en claro, autenticadas.
 - **Directorio comprometido o suplantado:** quien tenga la clave de clúster puede enviar `DirRoute` y `DirResult` falsos (reasignar cuentas, hacer que un shard crea que una cuenta es suya). Es la misma confianza total de siempre, con más alcance.
-- **Directorio caído:** nadie puede entrar ni cruzar bordes con una cuenta mientras no vuelva (lo que ya está jugando sigue jugando y no se pierde a nadie). Es un solo proceso, sin réplica ni sustitución automática.
+- **Directorio caído:** nadie puede entrar ni cruzar bordes con una cuenta mientras no vuelva (lo que ya está jugando sigue jugando y no se pierde a nadie). Por omisión es un solo proceso; con réplicas (0.8.0, documento 12) la caída de una minoría no lo detiene, la de la mayoría sí, igual que antes, y sin pérdida ni duplicados.
 - **Disco que falla:** el shard (o el directorio) deja de prometer lo que no está en disco y hay que reiniciarlo; nunca miente sobre lo escrito.
 
 ## Estado de implementación del sistema de módulos (0.1.0)

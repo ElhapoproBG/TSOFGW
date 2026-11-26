@@ -1,5 +1,32 @@
 # Cambios
 
+## 0.8.0 — El directorio de sesiones puede replicarse con Raft (propio, sin revisar)
+Atiende el último punto único de fallo que la 0.5.0 dejó apuntado: el directorio de sesiones era **un solo proceso**. Ahora puede ser un grupo de 3, 5 o 7 réplicas de acuerdo mediante **Raft** (escrito aquí desde el artículo, sin dependencias): la caída de una minoría no detiene a nadie más que unos instantes. Con una sola réplica (por omisión) todo es como en la 0.7. **Cambia el bus** (dos mensajes nuevos, `DirRedirect` y `Raft`, y la huella de configuración incluye el número de réplicas): actualiza todos los procesos a la vez. El formato del disco de shards y del directorio sin réplicas no cambia; **una carpeta de un modo no se abre en el otro** (se rechaza con un error claro). Documento nuevo: `docs/12-directorio-replicado.md`.
+
+**Lo nuevo**
+- **`tsofgw_online::raft`** (≈1400 líneas, sin entrada/salida): pre-votación, protección de líder, comprobación de quórum, replicación por lotes, confirmación solo de entradas del término actual, compactación e **instantáneas por trozos**. Su regla de oro: *primero al disco, después al mundo* (todo lo que pide guardar se sincroniza antes de enviar nada o contestar a un shard).
+- **Directorio replicado** (`directory/repl.rs`): cada petición de un shard (`DirLogin`, `DirTransfer`) pasa a ser un mandato de 13 o 25 B del diario; todas las réplicas lo aplican en el mismo orden y solo el líder contesta, y solo de lo que propuso en su liderazgo. `r/applied` se escribe en el mismo lote que los cambios de cuentas que provoca. La instantánea para una réplica atrasada son 18 B por cuenta.
+- **Los shards** mandan a una réplica «pista» de líder; una que no lidera contesta `DirRedirect` (o calla) y tras varias peticiones sin respuesta se prueba con otra.
+- **CLI:** `tsofgw directory ... --replicas R0,R1,R2 --replica I`, `tsofgw serve ... --directory R0,R1,R2`, `tsofgw loadtest ... --directory --dir-replicas 3|5|7`; cada réplica imprime papel, término, índice aplicado y contadores. Una prueba de humo de la CI corre la tormenta con 3 réplicas.
+- **Banco de pruebas:** el cluster simulado admite `dir_replicas`, caídas de réplicas (a veces la líder; con 5, dos a la vez) dentro de la tormenta, y vigila contra el estado del líder.
+
+**Cómo se probó**
+- **Simulación de Raft sola** (`tests/raft.rs`, 15 pruebas): pérdidas, duplicados, reordenación, particiones y caídas a mitad de un guardado, con 1, 3 y 5 réplicas; se vigila en cada paso que haya como mucho un líder por término, que lo confirmado no cambie ni difiera entre réplicas, que se aplique en orden y que el diario en disco sea contiguo. Más 5 casos «de libro» movidos a mano (ver Mutaciones).
+- **El cluster entero** (`tests/dir_raft.rs`, 10 pruebas), con 3 y 5 réplicas: reparto estable y réplicas idénticas; caída del líder; **sin mayoría** (ningún traspaso nuevo; nada se rompe; con ella todo sigue); réplica muy atrasada puesta al día con instantánea; tormenta de caídas con pérdidas del 2 %; directorio replicado perdido entero y reconstruido desde los shards; carpetas con identidad o modo equivocado; mensajes hostiles; traspasos de época vieja o de quien no es el dueño; y caídas en seco (cola rota, hueco, limpia) tras las que la réplica debe recuperar **exactamente** lo que había aplicado.
+- **Procesos reales** (`tests/cli.rs`): 3 réplicas, 2 shards y bots por UDP; `kill -9` al **líder**; el cluster sigue cruzando bordes con las otras dos; la réplica vuelve con su carpeta y el cluster sigue; las tres carpetas acaban con las mismas 10 cuentas y los shards cuadran. **Pasó 5 veces seguidas con el diseño final** (la primera versión falló, y no por el directorio: los bots patrullan según el reloj de su propio proceso y una fase de 12 s los dejaba alejándose del borde; ver documento 12, sección 5).
+- **Mutaciones: 14 mutantes nuevos (R1–R14; 58 en total).** **A la primera sobrevivieron 5 de 14** (R2: el voto no miraba el término del diario; R3: el error de la «figura 8»; R5: el voto no se guardaba; R6: los conflictos no se borraban del disco; R9: el directorio respondía sin sincronizar). La simulación aleatoria no encuentra por azar secuencias tan concretas. Se añadieron 6 pruebas dirigidas (los 3 casos de libro de votos y confirmación, conflicto en memoria y disco, rechazo por punto anterior y caída en seco del directorio) y ahora **se detectan los 14**.
+- **357 pruebas pasan** (331 en la 0.7.0). Clippy y formato limpios con y sin el compilador de C.
+- **Coste medido** (simulación, 4 shards, 60 clientes, 30 s): un traspaso de jugador tarda **59 ms de media sin réplicas y 114 ms con 3** (máximos 250 y 400 ms); los 107–108 traspasos se completan en ambos casos. Con disco real dominará el `fsync` de cada réplica: **no está medido**. Las pruebas de Raft en modo depuración tardan unos 95 s (con el equipo ocupado, hasta 3 min).
+
+**Lo que NO da**
+- **Revisión externa ni demostración formal** de Raft: está escrito desde el artículo y comprobado con simulación, procesos y mutantes, y nada más.
+- **Pertenencia dinámica:** el grupo es fijo (3, 5 o 7).
+- **Detección de retroceso:** una réplica que vuelve con una copia **vieja** de su carpeta pone en riesgo la seguridad si lo hacen varias a la vez.
+- Que la clave de clúster deje de ser total confianza (quien la tenga puede hacerse pasar por una réplica), ni cifrar el disco, ni dar secreto hacia adelante al bus.
+- Lecturas locales: toda petición, incluso una entrada de una cuenta ya conocida, pasa por el diario.
+
+**Lectura de la CI de la 0.7.0** (commit `6fcf904`, ejecución n.º 10): éxito global en 4 min 39 s. No pude leer el detalle por trabajo (los registros piden iniciar sesión).
+
 ## 0.7.0 — Secreto hacia adelante en el canal de los jugadores (X25519 propio, sin auditar)
 Atiende la limitación más importante que dejó la 0.6.0: con claves de sesión derivadas solo de la clave de la cuenta, quien la obtuviera más tarde descifraba todo lo capturado antes. Ahora el handshake de los jugadores incluye un intercambio de claves efímero X25519 (RFC 7748). **Es incompatible con la 0.6.x** (protocolo de jugadores versión 3; el servidor ignora los `HELLO` de las versiones 1 y 2): actualiza clientes y servidores juntos. El bus, el disco y el formato de guardado no cambian.
 

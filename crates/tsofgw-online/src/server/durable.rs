@@ -785,6 +785,8 @@ impl<L: Link> GameServer<L> {
         let Some(route) = c.route(account, tick) else {
             if c.should_ask_dir(account, tick) {
                 c.stats.dir_logins += 1;
+                c.note_dir_send();
+                let dir = c.dir_peer().unwrap_or(dir);
                 self.peer_send(dir, &PeerMsg::DirLogin { account, home });
             }
             return Login::Wait;

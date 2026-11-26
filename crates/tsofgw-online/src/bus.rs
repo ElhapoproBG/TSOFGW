@@ -147,6 +147,12 @@ pub enum PeerMsg {
         shard: ShardId,
         epoch: u64,
     },
+    /// Réplica del directorio → shard: «yo no soy el líder; prueba con `leader`» (0.8.0, directorio replicado).
+    DirRedirect {
+        leader: ShardId,
+    },
+    /// Entre réplicas del directorio: un mensaje de Raft (véase `raft::Msg`), opaco para el bus.
+    Raft(Vec<u8>),
 }
 
 /// Resultado de un `DirTransfer`.
@@ -409,6 +415,17 @@ impl PeerMsg {
                 w.varint(*shard as u64);
                 w.varint(*epoch);
             }
+            PeerMsg::DirRedirect { leader } => {
+                w.u8(14);
+                w.varint(*leader as u64);
+            }
+            PeerMsg::Raft(b) => {
+                w.u8(15);
+                w.varint(b.len() as u64);
+                for x in b {
+                    w.u8(*x);
+                }
+            }
             PeerMsg::PrepareAck { xfer, player }
             | PeerMsg::Activate { xfer, player }
             | PeerMsg::HandoverAck { xfer, player }
@@ -537,6 +554,20 @@ impl PeerMsg {
                     shard,
                     epoch,
                 }
+            }
+            14 => PeerMsg::DirRedirect {
+                leader: get_shard(&mut r)?,
+            },
+            15 => {
+                let n = r.varint()? as usize;
+                if n == 0 || n > MAX_PEER_MSG {
+                    return Err(DecodeError::BadReference);
+                }
+                let mut b = Vec::with_capacity(n);
+                for _ in 0..n {
+                    b.push(r.u8()?);
+                }
+                PeerMsg::Raft(b)
             }
             _ => return Err(DecodeError::BadReference),
         };

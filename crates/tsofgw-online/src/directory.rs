@@ -19,7 +19,13 @@
 //! `DirRoute` o `Committed` que llegó a un shard sigue siendo cierta aunque el directorio se caiga y
 //! rearranque justo después.
 //!
-//! # Límites (0.5.0)
+//! # Réplicas (0.8.0)
+//!
+//! Con `replicas = 3, 5 o 7` el directorio es **un grupo de réplicas de acuerdo con Raft** (módulo `repl` y
+//! [`crate::raft`]): la caída de una minoría no para a nadie. Con `replicas = 1` (por omisión) funciona como en la
+//! 0.5, sin diario ni elección. Una carpeta de un modo no se puede abrir en el otro.
+//!
+//! # Límites (sin réplicas, 0.5.0)
 //!
 //! * Es **un solo proceso**: si cae, nadie puede entrar ni cruzar bordes con una cuenta hasta que vuelva
 //!   (lo que ya está jugando sigue jugando; los traspasos esperan). No hay réplica, ni elección de líder,
@@ -28,7 +34,11 @@
 //!   No detecta que le devuelvan una copia vieja (véase `tsofgw-store`).
 //! * Los mensajes del bus no van cifrados y la clave de cluster da confianza total.
 
+mod repl;
+
 use tsofgw_store::{Batch, DynStore, Medium, OpenMode, Recovery, Store, StoreConfig};
+
+use crate::raft::RaftConfig;
 
 use crate::bus::{DirStatus, PeerBus, PeerMsg};
 use crate::partition::ShardId;
@@ -57,18 +67,44 @@ pub struct DirectoryStats {
     pub commit_errors: u64,
     pub compactions: u64,
     pub replies_dropped: u64,
+    // --- directorio replicado (0.8.0)
+    /// Mandatos propuestos al diario por este líder.
+    pub proposed: u64,
+    /// Peticiones repetidas que ya estaban en vuelo y no se volvieron a proponer.
+    pub inflight_dups: u64,
+    /// Peticiones que llegaron a una réplica que no lidera y se redirigieron al líder.
+    pub redirects: u64,
+    /// Peticiones que llegaron cuando no se conocía líder (se ignoran).
+    pub no_leader: u64,
+    /// Entradas del diario aplicadas al estado.
+    pub applied: u64,
+    /// Instantáneas instaladas.
+    pub restores: u64,
+    /// Compactaciones del diario de Raft.
+    pub log_compactions: u64,
+    /// Cuentas sembradas desde una reconstrucción.
+    pub seeded: u64,
 }
 
 #[derive(Debug, Clone)]
 pub struct DirectoryConfig {
     /// Si el diario pasa de estos bytes, se compacta con un checkpoint.
     pub compact_bytes: u64,
+    /// Réplicas del directorio: 1 (sin consenso) o 3, 5 o 7 (Raft).
+    pub replicas: usize,
+    /// Cuál de ellas es esta (0-based). Su identificador en el bus es `shards + replica`.
+    pub replica: usize,
+    /// Temporización de Raft (solo con réplicas).
+    pub raft: RaftConfig,
 }
 
 impl Default for DirectoryConfig {
     fn default() -> Self {
         DirectoryConfig {
             compact_bytes: 16 << 20,
+            replicas: 1,
+            replica: 0,
+            raft: RaftConfig::default(),
         }
     }
 }
@@ -99,6 +135,7 @@ pub struct Directory {
     cfg: DirectoryConfig,
     inbox: Vec<(ShardId, Vec<u8>)>,
     deferred: Vec<(ShardId, PeerMsg)>,
+    repl: Option<repl::Repl>,
     stats: DirectoryStats,
     failed: bool,
     critical: bool,
@@ -136,7 +173,15 @@ pub fn summarize_directory_store(store: &DynStore) -> DirectorySummary {
         ..DirectorySummary::default()
     };
     for (k, v) in store.scan(b"") {
-        if k == K_INIT {
+        if k == K_INIT
+            || k == repl::K_REPL
+            || k == repl::K_META
+            || k == repl::K_BASE
+            || k == repl::K_APPLIED
+        {
+            continue;
+        }
+        if k.starts_with(repl::P_ENTRY) {
             continue;
         }
         if k.starts_with(P_ACCOUNT) {
@@ -227,6 +272,21 @@ impl Directory {
                 return Err("almacén del directorio dañado: registro de cuenta".into());
             }
         }
+        let repl = if cfg.replicas > 1 {
+            Some(Directory::load_repl(
+                &mut store,
+                cfg.replicas,
+                cfg.replica,
+                shards,
+                cfg.raft.clone(),
+                0,
+            )?)
+        } else {
+            if store.get(repl::K_REPL).is_some() {
+                return Err("esta carpeta es de una réplica de un directorio replicado: ábrela con sus réplicas".into());
+            }
+            None
+        };
         Ok((
             Directory {
                 store,
@@ -235,6 +295,7 @@ impl Directory {
                 cfg,
                 inbox: Vec::new(),
                 deferred: Vec::new(),
+                repl,
                 stats: DirectoryStats::default(),
                 failed: false,
                 critical: false,
@@ -250,7 +311,7 @@ impl Directory {
 
     /// Identificador del directorio en el bus.
     pub fn peer_id(&self) -> ShardId {
-        self.shards as ShardId
+        (self.shards + self.cfg.replica) as ShardId
     }
 
     /// Carga las cuentas de una reconstrucción ([`rebuild_from_shards`]) en un directorio **vacío**.
@@ -317,20 +378,38 @@ impl Directory {
 
     /// Lee del bus lo que haya llegado, lo atiende y envía las respuestas (tras sincronizar el disco).
     pub fn update(&mut self, now_ms: u64) {
+        if let Some(r) = self.repl.as_mut() {
+            if !r.clock_set {
+                r.clock_set = true;
+                r.raft.restart_timers(now_ms);
+            }
+        }
         let mut inbox = std::mem::take(&mut self.inbox);
         self.bus.recv(now_ms, &mut inbox);
         for (from, data) in inbox.drain(..) {
             self.stats.msgs_in += 1;
-            if (from as usize) >= self.shards {
+            let from_replica = self.replica_index(from).is_some();
+            if (from as usize) >= self.shards && !from_replica {
                 self.stats.malformed += 1;
                 continue;
             }
+            if self.failed {
+                continue;
+            }
             match PeerMsg::decode(&data) {
+                Ok(PeerMsg::Raft(b)) if from_replica => self.on_raft_msg(now_ms, from, &b),
+                Ok(_) if from_replica => self.stats.malformed += 1,
+                Ok(m) if self.repl.is_some() => self.on_request_replicated(from, m),
                 Ok(m) => self.on_msg(from, m),
                 Err(_) => self.stats.malformed += 1,
             }
         }
         self.inbox = inbox;
+        if let Some(r) = self.repl.as_mut() {
+            if !self.failed {
+                r.raft.tick(now_ms);
+            }
+        }
         self.flush(now_ms);
     }
 
@@ -427,8 +506,52 @@ impl Directory {
         }
     }
 
+    /// Variante replicada de [`Directory::flush`]: guarda lo de Raft, aplica lo confirmado, sincroniza y solo
+    /// entonces envía mensajes entre réplicas y respuestas a los shards.
+    fn flush_replicated(&mut self, now_ms: u64) {
+        if !self.failed && self.repl_process().is_err() {
+            self.failed = true;
+            self.stats.commit_errors += 1;
+        }
+        if !self.failed {
+            if self.store.unsynced() > 0 {
+                match self.store.commit() {
+                    Ok(()) => self.stats.commits += 1,
+                    Err(_) => {
+                        self.failed = true;
+                        self.stats.commit_errors += 1;
+                    }
+                }
+            }
+            if !self.failed {
+                match self.store.checkpoint_if_larger(self.cfg.compact_bytes) {
+                    Ok(true) => self.stats.compactions += 1,
+                    Ok(false) => {}
+                    Err(_) => {
+                        self.failed = true;
+                        self.stats.commit_errors += 1;
+                    }
+                }
+            }
+        }
+        let mut out = std::mem::take(&mut self.deferred);
+        let raft_out = self.repl_outbox();
+        if self.failed {
+            self.stats.replies_dropped += out.len() as u64;
+            return;
+        }
+        out.extend(raft_out);
+        for (to, msg) in out {
+            self.stats.msgs_out += 1;
+            self.bus.send(now_ms, to, msg.encode());
+        }
+    }
+
     /// Sincroniza lo escrito en esta vuelta y solo entonces envía las respuestas.
     fn flush(&mut self, now_ms: u64) {
+        if self.repl.is_some() {
+            return self.flush_replicated(now_ms);
+        }
         if self.critical && !self.failed {
             match self.store.commit() {
                 Ok(()) => self.stats.commits += 1,

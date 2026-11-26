@@ -48,6 +48,10 @@ pub struct ClusterScenario {
     pub persist: Option<PersistConfig>,
     /// Hay un directorio de sesiones en el bus (exige `persist`).
     pub directory: bool,
+    /// Réplicas del directorio (1, 3, 5 o 7). Con más de una, el directorio es un grupo con Raft.
+    pub dir_replicas: usize,
+    /// Temporización de Raft de las réplicas del directorio.
+    pub dir_raft: crate::raft::RaftConfig,
     /// Los clientes que pierden la conexión vuelven a entrar solos, como haría un juego real.
     pub reconnect: Reconnect,
 }
@@ -106,6 +110,8 @@ impl Default for ClusterScenario {
             master: b"cluster-master-key".to_vec(),
             persist: None,
             directory: false,
+            dir_replicas: 1,
+            dir_raft: crate::raft::RaftConfig::default(),
             reconnect: Reconnect::default(),
         }
     }
@@ -210,6 +216,11 @@ pub struct ClusterRun {
     /// Los «discos»: siguen ahí cuando el proceso cae.
     pub media: Vec<MemMedium>,
     pub dir_medium: Option<MemMedium>,
+    /// Las réplicas del directorio cuando es un grupo (`dir_replicas > 1`); `None` = caída.
+    pub reps: Vec<Option<Directory>>,
+    pub rep_media: Vec<MemMedium>,
+    pub rep_restarts: u64,
+    rep_incarnation: Vec<u32>,
     pub now: u64,
     pub step_ms: u64,
     /// Cómo vuelven a entrar los bots que se desconectan.
@@ -295,13 +306,22 @@ impl ClusterRun {
         let partition = Partition::grid(s.grid.0, s.grid.1, dequantize(HALF_EXTENT_Q))?;
         let n = partition.shard_count();
         let net = SimNet::new(s.net.clone());
-        let bus = SimBus::new(n + usize::from(s.directory), s.bus.clone());
+        if s.directory && !matches!(s.dir_replicas, 1 | 3 | 5 | 7) {
+            return Err("las réplicas del directorio deben ser 1, 3, 5 o 7".into());
+        }
+        let nrep = if s.directory {
+            s.dir_replicas.max(1)
+        } else {
+            0
+        };
+        let bus = SimBus::new(n + nrep, s.bus.clone());
         let authority = Authority::new(&s.master);
         let mut shards = Vec::with_capacity(n);
         let mut media = Vec::new();
         for sh in 0..n as ShardId {
             let mut cluster = ClusterConfig::new(sh, partition.clone(), &s.game)?;
             cluster.directory = s.directory;
+            cluster.dir_replicas = s.dir_replicas.max(1);
             let mut g = GameServer::new_shard(
                 net.endpoint(),
                 authority.clone(),
@@ -328,7 +348,24 @@ impl ClusterRun {
         }
         let addrs: Vec<_> = shards.iter().map(|g| g.link().addr()).collect();
 
-        let (dir, dir_medium) = if s.directory {
+        let mut reps = Vec::new();
+        let mut rep_media = Vec::new();
+        let (dir, dir_medium) = if s.directory && s.dir_replicas > 1 {
+            for i in 0..s.dir_replicas {
+                let medium = MemMedium::new();
+                let (d, _) = Directory::open(
+                    Box::new(medium.clone()),
+                    &Directory::store_key(&s.master),
+                    Box::new(bus.end((n + i) as ShardId)),
+                    n,
+                    replica_config(s.dir_replicas, i, &s.dir_raft),
+                    OpenMode::Recover,
+                )?;
+                reps.push(Some(d));
+                rep_media.push(medium);
+            }
+            (None, None)
+        } else if s.directory {
             let medium = MemMedium::new();
             let (d, _) = Directory::open(
                 Box::new(medium.clone()),
@@ -366,6 +403,10 @@ impl ClusterRun {
             dir,
             media,
             dir_medium,
+            reps,
+            rep_media,
+            rep_restarts: 0,
+            rep_incarnation: vec![0; s.dir_replicas.max(1)],
             now: 0,
             step_ms: s.step_ms,
             reconnect: s.reconnect,
@@ -402,6 +443,9 @@ impl ClusterRun {
             }
         }
         if let Some(d) = self.dir.as_mut() {
+            d.update(self.now);
+        }
+        for d in self.reps.iter_mut().flatten() {
             d.update(self.now);
         }
         for b in self.bots.iter_mut().chain(self.extras.iter_mut()) {
@@ -448,7 +492,13 @@ impl ClusterRun {
     }
 
     pub fn any_down(&self) -> bool {
-        self.down.iter().any(|&d| d) || (self.scenario.directory && self.dir.is_none())
+        self.down.iter().any(|&d| d)
+            || (self.scenario.directory
+                && if self.scenario.dir_replicas > 1 {
+                    self.reps.iter().any(Option::is_none)
+                } else {
+                    self.dir.is_none()
+                })
     }
 
     /// Un servidor vacío que ocupa el sitio de un shard caído (no se actualiza nunca).
@@ -501,6 +551,7 @@ impl ClusterRun {
         let s = &self.scenario;
         let mut cluster = ClusterConfig::new(sh as ShardId, self.partition.clone(), &s.game)?;
         cluster.directory = s.directory;
+        cluster.dir_replicas = s.dir_replicas.max(1);
         let mut g = GameServer::new_shard(
             link,
             self.authority.clone(),
@@ -545,6 +596,57 @@ impl ClusterRun {
         self.shards[sh].shutdown()?;
         self.crash_shard(sh, CrashKind::Clean);
         self.restart_shard(sh)
+    }
+
+    /// Con réplicas: la que lidera ahora (y está viva), según ella misma.
+    pub fn leader_replica(&self) -> Option<usize> {
+        self.reps
+            .iter()
+            .position(|d| d.as_ref().is_some_and(|d| d.is_leader()))
+    }
+
+    /// La vista del directorio que vale para comprobar: el directorio solo, o el líder del grupo (que ya aplicó
+    /// todo lo que ha contestado). Sin líder, `None` y no se comprueba nada contra el directorio.
+    fn dir_view(&self) -> Option<&Directory> {
+        if self.scenario.dir_replicas > 1 {
+            self.leader_replica().and_then(|i| self.reps[i].as_ref())
+        } else {
+            self.dir.as_ref()
+        }
+    }
+
+    /// La réplica `i` del directorio muere de golpe.
+    pub fn crash_replica(&mut self, i: usize, kind: CrashKind) {
+        if self.reps.get_mut(i).and_then(Option::take).is_none() {
+            return;
+        }
+        self.rep_media[i].crash(kind);
+        let id = (self.partition.shard_count() + i) as ShardId;
+        self.bus.isolate(id, true);
+        self.bus.clear_inbox(id);
+    }
+
+    /// Arranca de nuevo la réplica `i` sobre su disco.
+    pub fn restart_replica(&mut self, i: usize) -> Result<(), String> {
+        if self.reps.get(i).is_none_or(Option::is_some) {
+            return Err("la réplica no está caída".into());
+        }
+        self.rep_incarnation[i] += 1;
+        let n = self.partition.shard_count();
+        let (d, _) = Directory::open(
+            Box::new(self.rep_media[i].clone()),
+            &Directory::store_key(&self.scenario.master),
+            Box::new(self.bus.end((n + i) as ShardId)),
+            n,
+            replica_config(self.scenario.dir_replicas, i, &self.scenario.dir_raft),
+            OpenMode::Recover,
+        )?;
+        let id = (n + i) as ShardId;
+        self.bus.clear_inbox(id);
+        self.bus.isolate(id, false);
+        self.reps[i] = Some(d);
+        self.rep_restarts += 1;
+        Ok(())
     }
 
     /// El proceso del directorio muere de golpe.
@@ -621,6 +723,12 @@ impl ClusterRun {
         }
         let refs: Vec<(ShardId, &DynStore)> = stores.iter().map(|(i, s)| (*i, s)).collect();
         let (entries, report) = crate::directory::rebuild_from_shards(&refs)?;
+        if self.scenario.dir_replicas > 1 {
+            for d in self.reps.iter_mut().flatten() {
+                d.queue_import(&entries)?;
+            }
+            return Ok(report);
+        }
         let d = self.dir.as_mut().ok_or("el directorio está caído")?;
         d.import(&entries)?;
         Ok(report)
@@ -733,12 +841,36 @@ impl ClusterRun {
     }
 
     /// Todo lo que cada shard vivo guarda de una cuenta, en texto (para diagnóstico).
+    fn replica_reports(&self) -> Vec<ReplicaReport> {
+        self.reps
+            .iter()
+            .enumerate()
+            .map(|(i, d)| match d {
+                None => ReplicaReport {
+                    index: i,
+                    up: false,
+                    ..Default::default()
+                },
+                Some(d) => ReplicaReport {
+                    index: i,
+                    up: true,
+                    leader: d.is_leader(),
+                    term: d.raft_term(),
+                    applied: d.applied_index(),
+                    log_len: d.raft_log_len(),
+                    stats: d.raft_stats().unwrap_or_default(),
+                    dir: d.stats().clone(),
+                },
+            })
+            .collect()
+    }
+
     pub fn describe_account(&self, account: u64) -> String {
         let mut o = format!(
             "cuenta {account}: suelo de época {:?}",
             self.epoch_floor.get(&account)
         );
-        if let Some(d) = &self.dir {
+        if let Some(d) = self.dir_view() {
             let _ = write!(o, ", directorio {:?}", d.lookup(account));
         }
         for (i, sh) in self.shards.iter().enumerate() {
@@ -757,7 +889,7 @@ impl ClusterRun {
         let (residents, transit) = self.scan_accounts();
         let mut bad: BTreeSet<u64> = BTreeSet::new();
         for (a, list) in &residents {
-            let wrong_dir = self.dir.as_ref().is_some_and(|d| {
+            let wrong_dir = self.dir_view().is_some_and(|d| {
                 d.lookup(*a)
                     .is_none_or(|(sh, ep)| !list.iter().any(|&(s, e)| s == sh && e == ep))
             });
@@ -798,7 +930,7 @@ impl ClusterRun {
             if list.len() > 1 {
                 inv.resident_duplicates += 1;
             }
-            if let Some(dir) = &self.dir {
+            if let Some(dir) = self.dir_view() {
                 match dir.lookup(*a) {
                     None => inv.dir_unknown += 1,
                     Some((sh, ep)) => {
@@ -911,12 +1043,13 @@ impl ClusterRun {
             shards: self.shards.iter().map(shard_report).collect(),
             invariants: self.check(false),
             restarts: self.restarts,
-            dir_restarts: self.dir_restarts,
+            dir_restarts: self.dir_restarts + self.rep_restarts,
             reconnects: self.reconnects,
-            directory: self.dir.as_ref().map(|d| DirectoryReport {
+            directory: self.dir_view().map(|d| DirectoryReport {
                 accounts: d.account_count(),
                 per_shard: d.accounts_per_shard(),
                 stats: d.stats().clone(),
+                replicas: self.replica_reports(),
             }),
             violations: self.violations.clone(),
             persistent: self.scenario.persist.is_some(),
@@ -943,6 +1076,28 @@ impl ClusterRun {
         for round in 0..rounds {
             self.run_for(800 + rng.next_u64() % 2500);
             // A veces cae el directorio en lugar de un shard.
+            if self.scenario.directory && self.scenario.dir_replicas > 1 && round % 4 == 3 {
+                // Cae una réplica: la líder una de cada dos veces. Las de una minoría pueden caer a la vez.
+                let victim = match self.leader_replica() {
+                    Some(l) if rng.next_u64().is_multiple_of(2) => l,
+                    _ => (rng.next_u64() % self.reps.len() as u64) as usize,
+                };
+                self.crash_replica(victim, pick_crash(&mut rng));
+                let mut down = vec![victim];
+                if self.reps.len() >= 5 && rng.next_u64().is_multiple_of(3) {
+                    let other = (victim + 1 + (rng.next_u64() % 4) as usize) % self.reps.len();
+                    if other != victim {
+                        self.crash_replica(other, pick_crash(&mut rng));
+                        down.push(other);
+                    }
+                }
+                self.run_for(300 + rng.next_u64() % 1500);
+                for i in down {
+                    self.restart_replica(i)?;
+                }
+                rep.directory_crashes += 1;
+                continue;
+            }
             if self.scenario.directory && round % 4 == 3 {
                 self.crash_directory(pick_crash(&mut rng));
                 self.run_for(300 + rng.next_u64() % 1500);
@@ -970,6 +1125,16 @@ impl ClusterRun {
             }
         }
         Ok(rep)
+    }
+}
+
+/// Configuración de la réplica `i` de un directorio replicado en el banco de pruebas.
+fn replica_config(replicas: usize, i: usize, raft: &crate::raft::RaftConfig) -> DirectoryConfig {
+    DirectoryConfig {
+        replicas,
+        replica: i,
+        raft: raft.clone(),
+        ..DirectoryConfig::default()
     }
 }
 
@@ -1225,6 +1390,21 @@ pub struct DirectoryReport {
     pub accounts: usize,
     pub per_shard: Vec<usize>,
     pub stats: crate::directory::DirectoryStats,
+    /// Una por réplica (vacío sin réplicas).
+    pub replicas: Vec<ReplicaReport>,
+}
+
+/// Una réplica del directorio al terminar.
+#[derive(Debug, Clone, Default)]
+pub struct ReplicaReport {
+    pub index: usize,
+    pub up: bool,
+    pub leader: bool,
+    pub term: u64,
+    pub applied: u64,
+    pub log_len: usize,
+    pub stats: crate::raft::RaftStats,
+    pub dir: crate::directory::DirectoryStats,
 }
 
 impl ClusterReport {
@@ -1418,6 +1598,34 @@ impl ClusterReport {
                 d.stats.logins,
                 d.stats.replies_dropped
             );
+            if !d.replicas.is_empty() {
+                let _ = writeln!(
+                    o,
+                    "  directorio replicado ({} réplicas): {} elecciones iniciadas, {} ganadas, {} renuncias, {} quórum perdido, {} instantáneas enviadas y {} instaladas, {} entradas truncadas por conflicto",
+                    d.replicas.len(),
+                    d.replicas.iter().map(|r| r.stats.elections_started).sum::<u64>(),
+                    d.replicas.iter().map(|r| r.stats.elections_won).sum::<u64>(),
+                    d.replicas.iter().map(|r| r.stats.stepped_down).sum::<u64>(),
+                    d.replicas.iter().map(|r| r.stats.quorum_lost).sum::<u64>(),
+                    d.replicas.iter().map(|r| r.stats.snapshots_sent).sum::<u64>(),
+                    d.replicas.iter().map(|r| r.stats.snapshots_installed).sum::<u64>(),
+                    d.replicas.iter().map(|r| r.stats.conflicts_truncated).sum::<u64>()
+                );
+                for r in &d.replicas {
+                    let _ = writeln!(
+                        o,
+                        "    réplica {}: {} | término {} | aplicado hasta {} | diario {} entradas | propuestas {} redirigidas {} sin líder {}",
+                        r.index,
+                        if !r.up { "CAÍDA" } else if r.leader { "líder" } else { "seguidora" },
+                        r.term,
+                        r.applied,
+                        r.log_len,
+                        r.dir.proposed,
+                        r.dir.redirects,
+                        r.dir.no_leader
+                    );
+                }
+            }
         }
         let a = &self.invariants.accounts;
         let _ = writeln!(

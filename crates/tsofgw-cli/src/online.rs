@@ -196,7 +196,7 @@ pub(crate) fn exposure_warning(listening: &[(&str, SocketAddr)]) -> Option<Strin
         "ADVERTENCIA: escuchando fuera del bucle local ({}). TSOFGW {} NO está pensado para exponerse a internet: \
          el cifrado de la red (jugadores y bus entre shards) es propio y nadie lo ha auditado, el bus no tiene secreto \
          hacia adelante, quien tenga la clave de clúster descifra el bus y puede suplantar a cualquier shard, y el directorio \
-         de sesiones (si lo usas) es un solo proceso sin réplica. Úsalo en una red privada o de confianza; detalles en \
+         de sesiones (si lo usas) es por omisión un solo proceso y, replicado con Raft, un protocolo propio sin revisar. Úsalo en una red privada o de confianza; detalles en \
          SECURITY.md.",
         exposed.join(", "),
         env!("CARGO_PKG_VERSION")
@@ -531,22 +531,35 @@ fn serve_shard(
             n - 1
         ));
     }
+    // `--directory A` (uno) o `--directory A0,A1,A2` (las réplicas Raft del directorio, en orden: 3, 5 o 7).
     let directory = flag(args, "--directory")
-        .map(|a| resolve(&a).map_err(|e| format!("--directory: {e}")))
+        .map(|a| parse_addr_list(&a, "--directory"))
         .transpose()?;
+    if let Some(d) = &directory {
+        if !matches!(d.len(), 1 | 3 | 5 | 7) {
+            return Err(format!(
+                "--directory: el directorio es una sola dirección o un grupo de 3, 5 o 7 réplicas (hay {})",
+                d.len()
+            ));
+        }
+    }
+    let dir_n = directory.as_ref().map_or(0, Vec::len);
     let bus_bind = flag(args, "--bus-bind").unwrap_or_else(|| peers[shard as usize].to_string());
     // Con directorio, el bus tiene un par más: el directorio, con el identificador siguiente al último shard.
-    let mut bus = UdpBus::bind(shard, &bus_bind, n + usize::from(directory.is_some()), &key)?;
+    let mut bus = UdpBus::bind(shard, &bus_bind, n + dir_n, &key)?;
     for (j, a) in peers.iter().enumerate() {
         if j != shard as usize {
             bus.set_peer(j as u16, *a)?;
         }
     }
-    if let Some(a) = directory {
-        bus.set_peer(n as u16, a)?;
+    if let Some(list) = &directory {
+        for (j, a) in list.iter().enumerate() {
+            bus.set_peer((n + j) as u16, *a)?;
+        }
     }
     let mut cluster = ClusterConfig::new(shard, partition, &cfg)?;
     cluster.directory = directory.is_some();
+    cluster.dir_replicas = dir_n.max(1);
     let bus_addr = bus
         .local_addr()
         .map_err(|e| format!("no se pudo leer la dirección del bus: {e}"))?;
@@ -712,6 +725,7 @@ pub fn cmd_loadtest(args: &[String]) -> Result<(), String> {
             "--patrol-ms",
             "--chaos",
             "--chaos-seed",
+            "--dir-replicas",
         ],
         &["--udp", "--lod", "--persist", "--directory"],
     )?;
@@ -733,7 +747,13 @@ pub fn cmd_loadtest(args: &[String]) -> Result<(), String> {
     if let Some(spec) = flag(args, "--shards") {
         return loadtest_cluster(args, &spec, clients, seconds, game, loss, dup);
     }
-    for f in ["--persist", "--directory", "--chaos", "--chaos-seed"] {
+    for f in [
+        "--persist",
+        "--directory",
+        "--chaos",
+        "--chaos-seed",
+        "--dir-replicas",
+    ] {
         if flag(args, f).is_some() || has(args, f) {
             return Err(format!("{f} solo tiene sentido con --shards"));
         }
@@ -782,6 +802,13 @@ fn loadtest_cluster(
     // tormenta de caídas: cada nivel exige el anterior y todos exigen la red simulada.
     let chaos: usize = num(args, "--chaos", 0)?;
     let directory = has(args, "--directory");
+    let dir_replicas: usize = num(args, "--dir-replicas", 1)?;
+    if !matches!(dir_replicas, 1 | 3 | 5 | 7) {
+        return Err("--dir-replicas debe ser 1, 3, 5 o 7".into());
+    }
+    if dir_replicas > 1 && !directory {
+        return Err("--dir-replicas solo tiene sentido con --directory".into());
+    }
     let persist = has(args, "--persist") || directory || chaos > 0;
     if !(0..=500).contains(&chaos) {
         return Err("--chaos debe estar entre 0 y 500 rondas".into());
@@ -818,6 +845,7 @@ fn loadtest_cluster(
         game,
         persist: persist.then(PersistConfig::default),
         directory,
+        dir_replicas,
         // Con persistencia los clientes que pierden la conexión vuelven a entrar solos, como en un juego
         // real; con directorio entran por cualquier shard y el cluster los lleva al suyo.
         reconnect: Reconnect {

@@ -4,12 +4,12 @@ Motor dinámico y open source para mundos inmersivos de realidad virtual a gran 
 No es un juego: es la base sobre la que se programa, construida como un **grafo de interdependencias**.
 
 > ## ⚠️ No apto para exponerse a internet
-> *Not suitable for exposure to the internet.* TSOFGW 0.7 es un prototipo para desarrollo, pruebas y redes de confianza:
+> *Not suitable for exposure to the internet.* TSOFGW 0.8 es un prototipo para desarrollo, pruebas y redes de confianza:
 >
 > - **Desde la 0.6 la red va cifrada** (jugadores y bus entre shards, ChaCha20-Poly1305) y desde la 0.7 el canal de los jugadores tiene **secreto hacia adelante** (X25519 efímero), pero **toda la criptografía es propia y nadie la ha auditado**, el **bus no tiene secreto hacia adelante** (si se filtra la clave de clúster, se descifran sus capturas antiguas) y el número de cuenta es visible en el handshake. [`docs/11-cifrado.md`](docs/11-cifrado.md)
 > - **Quien tenga la clave de clúster descifra todo el bus y puede hacerse pasar por cualquier shard y por el directorio de sesiones**, y quien tenga la clave maestra, por cualquier cuenta.
 > - **Lo que se guarda en disco está autenticado, no cifrado**: quien lea la carpeta de datos ve las cuentas y sus posiciones, y restaurar una copia vieja de la carpeta no se detecta.
-> - **El directorio de sesiones es un solo proceso**, sin alta disponibilidad ni sustitución automática.
+> - **El directorio de sesiones es, por omisión, un solo proceso** (sin alta disponibilidad). Desde la 0.8 puede ser un grupo de 3, 5 o 7 réplicas con **Raft propio, sin revisar por nadie** ni demostrado formalmente: tolera la caída de una minoría, no compensa una clave de clúster filtrada ni una copia vieja de un disco. [`docs/12-directorio-replicado.md`](docs/12-directorio-replicado.md)
 > - Nada de esto ha pasado una auditoría externa.
 >
 > Úsalo en bucle local o en una red privada. Qué protege y qué no, cómo usarlo con seguridad y el plan: [`SECURITY.md`](SECURITY.md).
@@ -60,7 +60,7 @@ Requiere Rust 1.90 o superior (`rustup update`). No hace falta compilador de C.
 
 ## Estado
 
-Versión 0.7.0, prototipo (**no apto para exponerse a internet**, ver arriba y `SECURITY.md`). Incluye un servidor autoritativo con transporte UDP cifrado y autenticado con secreto hacia adelante (criptografía propia sin auditar, `docs/11-cifrado.md`), cliente con predicción, replicación en varios hilos con niveles de detalle y presupuesto de ancho de banda, un **clúster de shards** (el mundo repartido entre procesos, con entidades fantasma, traspaso de NPC y de jugadores y un bus UDP autenticado), y desde la 0.5.0 **persistencia y directorio de sesiones** (`docs/10-persistencia-y-sesiones.md`), todo con pruebas de carga medidas. Dibuja con un rasterizador por software verificado (`tsofgw render`); el backend de GPU con wgpu (`gpu/`) compila y dibuja lo mismo que el rasterizador por software, comprobado en la integración continua con Vulkan por software (todavía no en una GPU real); OpenXR no está empezado. Lo que está verificado y lo que no (sin sandbox, firmas solo HMAC, cifrado de red propio sin auditar (sin secreto hacia adelante en el bus), disco sin cifrar, directorio de un solo proceso, medido solo en bucle local) está en `docs/07-estado-y-pendientes.md`; el estado de la integración continua (Linux, Windows y macOS) se ve en la pestaña *Actions* del repositorio.
+Versión 0.8.0, prototipo (**no apto para exponerse a internet**, ver arriba y `SECURITY.md`). Incluye un servidor autoritativo con transporte UDP cifrado y autenticado con secreto hacia adelante (criptografía propia sin auditar, `docs/11-cifrado.md`), cliente con predicción, replicación en varios hilos con niveles de detalle y presupuesto de ancho de banda, un **clúster de shards** (el mundo repartido entre procesos, con entidades fantasma, traspaso de NPC y de jugadores y un bus UDP autenticado), y desde la 0.5.0 **persistencia y directorio de sesiones** (`docs/10-persistencia-y-sesiones.md`), que desde la 0.8.0 puede replicarse con Raft (`docs/12-directorio-replicado.md`), todo con pruebas de carga medidas. Dibuja con un rasterizador por software verificado (`tsofgw render`); el backend de GPU con wgpu (`gpu/`) compila y dibuja lo mismo que el rasterizador por software, comprobado en la integración continua con Vulkan por software (todavía no en una GPU real); OpenXR no está empezado. Lo que está verificado y lo que no (sin sandbox, firmas solo HMAC, cifrado de red propio sin auditar (sin secreto hacia adelante en el bus), disco sin cifrar, directorio replicado con un Raft propio sin revisar, medido solo en bucle local) está en `docs/07-estado-y-pendientes.md`; el estado de la integración continua (Linux, Windows y macOS) se ve en la pestaña *Actions* del repositorio.
 
 ## Documentación
 
@@ -75,7 +75,8 @@ Versión 0.7.0, prototipo (**no apto para exponerse a internet**, ver arriba y `
 9. `docs/09-cluster-de-shards.md` — un mundo repartido entre varios servidores
 10. `docs/10-persistencia-y-sesiones.md` — persistencia en disco, directorio de sesiones y cómo se probó
 11. `docs/11-cifrado.md` — cifrado de la red: qué garantiza, qué no, cómo se probó
-12. `SECURITY.md` — qué protege hoy el motor, qué no y el plan de seguridad
+12. `docs/12-directorio-replicado.md` — directorio de sesiones replicado con Raft (0.8.0): diseño, uso, pruebas y límites
+13. `SECURITY.md` — qué protege hoy el motor, qué no y el plan de seguridad
 
 ## Licencia
 
