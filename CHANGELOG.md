@@ -1,5 +1,18 @@
 # Cambios
 
+## 0.5.1 — La CI de la 0.5.0 y un aviso de Clippy en Windows
+Es la lectura de la CI de la 0.5.0, y una corrección de una línea. No cambia el comportamiento, el formato del bus ni el del disco: los shards 0.5.0 y 0.5.1 se entienden entre sí.
+
+**Resultado de la ejecución de la 0.5.0** (commit `f84e8ce`, ejecución n.º 7): 6 trabajos en verde, 1 en rojo y 1 omitido a propósito (el de mutaciones, que solo se lanza a mano).
+- **Verde:** Linux y macOS (arm64) con el compilador fijado (1.97.0): **292 pruebas**, 0 fallos; el compilador mínimo declarado (1.90): 292; sin el compilador de C: 292; Rust estable más reciente (1.100.0, informativo): 292, con formato y Clippy; wgpu con llvmpipe: la escena `mixta` a 320×240 da la misma diferencia que antes (media 0,051/255, máxima 1).
+- **La tormenta de caídas corrió por fin fuera de mi máquina,** en los tres sistemas: 9 reinicios de shard (3 de ellos dobles en Linux y macOS) y 2 del directorio, 32 cuentas, 0 perdidas y 0 duplicadas, y en Linux y macOS 57 reconexiones de clientes; en Windows ningún NPC sin dueño. En Linux, además, el paso del catálogo de mutantes y el clúster sobre UDP real (8 traspasos de jugador, 0 perdidos, media de 12 ms y máxima de 50 ms por traspaso en un ejecutor compartido) pasaron.
+- **Windows: 290 pruebas pasan, 0 fallan.** Son 2 menos que en Linux porque dos pruebas solo existen en Unix (la de `SIGTERM` del CLI y una de `tsofgw-sys`). Las pruebas de procesos reales y del almacén en archivos corrieron por primera vez en Windows y macOS.
+- **Rojo: el Clippy de Windows.** `wait_for`, un método de ayuda de `crates/tsofgw-cli/tests/cli.rs`, solo lo usa la prueba de `SIGTERM`, que lleva `#[cfg(unix)]`; en Windows quedaba sin uso y `-D warnings` lo convierte en error. Mi Clippy de Linux no podía verlo.
+
+**La corrección:** `wait_for` lleva ahora `#[cfg(unix)]` como la prueba que lo usa. Se comprobó reproduciendo el fallo: en una copia del árbol sin la prueba de `SIGTERM` y con el método sin marca, Clippy da exactamente el mismo error («method `wait_for` is never used»); con la marca, limpio. Clippy 1.97 sigue limpio en Linux con y sin C.
+
+**Lo que esto no demuestra:** que la 0.5.1 pase la CI (todavía no se ha leído); el manejador de señales de Windows compila allí, pero ninguna prueba lo ejecuta; el trabajo manual de mutaciones sigue sin haberse ejecutado en Actions; todo sigue medido en ejecutores compartidos y en una sola máquina.
+
 ## 0.5.0 — Persistencia y directorio de sesiones
 Responde a lo que más dolía del clúster de la 0.4: un shard reiniciado perdía su estado, un traspaso perdido durante una partición larga podía perder a un jugador, y nada impedía que una cuenta estuviera en dos shards a la vez. Se empezó **después de leer la CI de la 0.4.3** (en verde), así que lo nuevo se apoya en algo confirmado fuera de mi máquina; **lo nuevo de la 0.5.0 todavía no ha corrido en la CI**.
 

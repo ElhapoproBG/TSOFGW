@@ -807,7 +807,9 @@ impl Proc {
         fs::read_to_string(&self.log).unwrap_or_default()
     }
 
-    /// Espera a que el texto aparezca en el registro.
+    /// Espera a que el texto aparezca en el registro. Solo la usa la prueba de SIGTERM (unix):
+    /// sin esta marca, Clippy en Windows la daría por código muerto.
+    #[cfg(unix)]
     fn wait_for(&self, needle: &str, secs: u64) -> bool {
         let end = Instant::now() + Duration::from_secs(secs);
         while Instant::now() < end {
