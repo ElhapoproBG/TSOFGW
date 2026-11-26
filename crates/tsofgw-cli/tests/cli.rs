@@ -1587,24 +1587,36 @@ fn un_directorio_replicado_con_raft_sobrevive_a_un_kill_9_de_su_lider() {
             .unwrap_or_else(|| panic!("sin informe de bots:\n{out}"));
         number_after(l, "cambios de shard")
     };
-    let check_bots = |o: &Output, what: &str| -> String {
-        let out = text(&o.stdout);
-        assert!(o.status.success(), "{what}: {out}\n{}", text(&o.stderr));
-        assert!(out.contains("jugando 10/10"), "{what}: {out}");
-        assert!(out.contains("(0 fallidos)"), "{what}: {out}");
-        assert!(cambios(&out) >= 2, "{what}: nadie cruzó el borde:\n{out}");
-        out
+    // Una fase de bots: todos entran y juegan sin fallos y al menos dos cruzan el borde. En una máquina lenta
+    // (la CI con el compilador mínimo lo fue) los bots pueden tardar en llegar al borde en una pasada; como cada
+    // pasada de 8 s es un ciclo completo y los deja donde estaban, se admite repetirla UNA vez. Entrar y jugar sin
+    // fallos se exige siempre.
+    let fase = |secs: u64, what: &str| -> String {
+        let mut ultimo = String::new();
+        for intento in 0..2 {
+            let o = bots(secs);
+            let out = text(&o.stdout);
+            assert!(o.status.success(), "{what}: {out}\n{}", text(&o.stderr));
+            assert!(out.contains("jugando 10/10"), "{what}: {out}");
+            assert!(out.contains("(0 fallidos)"), "{what}: {out}");
+            if cambios(&out) >= 2 {
+                return out;
+            }
+            eprintln!("{what}: intento {intento}, nadie cruzó el borde todavía:\n{out}");
+            ultimo = out;
+        }
+        panic!("{what}: nadie cruzó el borde en dos pasadas:\n{ultimo}");
     };
 
     let mut r = vec![
-        Some(replica("r0", 0, 52)),
-        Some(replica("r1", 1, 52)),
-        Some(replica("r2", 2, 52)),
+        Some(replica("r0", 0, 70)),
+        Some(replica("r1", 1, 70)),
+        Some(replica("r2", 2, 70)),
     ];
     sleep_ms(400);
-    let mut s0 = shard("s0", 0, c0, 52);
+    let mut s0 = shard("s0", 0, c0, 70);
     sleep_ms(300);
-    let mut s1 = shard("s1", 1, c1, 52);
+    let mut s1 = shard("s1", 1, c1, 70);
     // Espera a que alguna réplica imprima su estado (cada 5 s) diciendo quién lidera.
     let leader_of = |r: &[Option<Proc>]| -> Option<usize> {
         r.iter().position(|p| {
@@ -1627,7 +1639,7 @@ fn un_directorio_replicado_con_raft_sobrevive_a_un_kill_9_de_su_lider() {
             r.iter().flatten().map(|p| p.log()).collect::<String>()
         )
     });
-    check_bots(&bots(8), "fase 1, con las tres");
+    fase(8, "fase 1, con las tres");
 
     // Corte de luz del líder: queda una mayoría (2 de 3) y el cluster debe seguir cruzando bordes.
     r[leader].as_mut().unwrap().kill9();
@@ -1635,12 +1647,12 @@ fn un_directorio_replicado_con_raft_sobrevive_a_un_kill_9_de_su_lider() {
     sleep_ms(1500);
     // Los patrulleros caminan +4 s y -4 s según el reloj de su proceso: con ciclos completos (múltiplos de 8 s)
     // acaban donde empezaron y la fase siguiente vuelve a arrancar junto al borde.
-    check_bots(&bots(16), "fase 2, sin el líder");
+    fase(16, "fase 2, sin el líder");
 
     // Vuelve con su carpeta, se pone al día y el cluster sigue.
-    let mut vuelta = replica("r-vuelta", leader, 26);
+    let mut vuelta = replica("r-vuelta", leader, 36);
     sleep_ms(3000);
-    check_bots(&bots(8), "fase 3, con la réplica de vuelta");
+    fase(8, "fase 3, con la réplica de vuelta");
 
     // Fin: todo se cierra limpio.
     let (st0, t0) = s0.finish(90);

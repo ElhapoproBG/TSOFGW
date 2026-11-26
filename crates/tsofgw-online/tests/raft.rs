@@ -909,7 +909,11 @@ fn un_lider_nuevo_no_confirma_entradas_de_terminos_viejos_contando_replicas() {
             index: 1,
         },
     );
-    assert_eq!(r.commit_index(), 0, "se confirmó una entrada de término viejo");
+    assert_eq!(
+        r.commit_index(),
+        0,
+        "se confirmó una entrada de término viejo"
+    );
     assert!(r.take_events().is_empty());
     // Cuando la réplica tiene también la del término actual, se confirma todo.
     r.step(
@@ -1006,8 +1010,8 @@ fn un_seguidor_rechaza_entradas_si_su_diario_no_coincide_en_el_punto_anterior() 
     assert_eq!(r.term_at(2), Some(1));
     let resp = r.take_outbox();
     assert!(
-        resp.iter().any(|(to, m)| *to == 1
-            && matches!(m, Msg::AppendReply { success: false, .. })),
+        resp.iter()
+            .any(|(to, m)| *to == 1 && matches!(m, Msg::AppendReply { success: false, .. })),
         "debía rechazar: {resp:?}"
     );
 }

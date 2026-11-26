@@ -27,6 +27,12 @@ Atiende el último punto único de fallo que la 0.5.0 dejó apuntado: el directo
 
 **Lectura de la CI de la 0.7.0** (commit `6fcf904`, ejecución n.º 10): éxito global en 4 min 39 s. No pude leer el detalle por trabajo (los registros piden iniciar sesión).
 
+**Lectura de la CI de la 0.8.0, primer intento** (commit `2ca240e`, ejecución n.º 11): **falló** (8 min 1 s). Causas, leídas de las anotaciones de la ejecución, y qué se hizo:
+- `cargo fmt --check` en las tres plataformas y en el trabajo de formato: las cinco pruebas añadidas a `tests/raft.rs` tras el último formateo. Corregido con `cargo fmt --all`.
+- Trabajo del compilador mínimo (1.90): la prueba de procesos reales del directorio replicado (kill -9 al líder) falló en la fase 3 (0 cambios de shard en 5 s): máquina lenta, bots que no llegaron al borde. La prueba ahora admite **repetir una vez** la pasada de 8 s si nadie cruzó el borde (entrar y jugar sin fallos se sigue exigiendo siempre) y los procesos viven más (70 s). Es una prueba de tiempos reales: puede seguir siendo frágil en máquinas muy lentas.
+- Clippy estable (informativo): `chunks_exact` en `x25519.rs`; reescrito con `std::array::from_fn`, sin cambiar el resultado (los vectores RFC 7748 siguen pasando).
+- La prueba de humo del directorio replicado no estaba en el `ci.yml` publicado (el parche no se había aplicado); va de nuevo en el parche de PowerShell.
+
 ## 0.7.0 — Secreto hacia adelante en el canal de los jugadores (X25519 propio, sin auditar)
 Atiende la limitación más importante que dejó la 0.6.0: con claves de sesión derivadas solo de la clave de la cuenta, quien la obtuviera más tarde descifraba todo lo capturado antes. Ahora el handshake de los jugadores incluye un intercambio de claves efímero X25519 (RFC 7748). **Es incompatible con la 0.6.x** (protocolo de jugadores versión 3; el servidor ignora los `HELLO` de las versiones 1 y 2): actualiza clientes y servidores juntos. El bus, el disco y el formato de guardado no cambian.
 

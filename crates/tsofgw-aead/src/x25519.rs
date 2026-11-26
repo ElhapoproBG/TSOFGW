@@ -21,10 +21,8 @@ impl Fe {
     const ONE: Fe = Fe([1, 0, 0, 0, 0]);
 
     fn from_bytes(b: &[u8; 32]) -> Fe {
-        let mut w = [0u64; 4];
-        for (i, c) in b.chunks_exact(8).enumerate() {
-            w[i] = u64::from_le_bytes(c.try_into().unwrap());
-        }
+        let mut w: [u64; 4] =
+            std::array::from_fn(|i| u64::from_le_bytes(b[i * 8..i * 8 + 8].try_into().unwrap()));
         w[3] &= 0x7fff_ffff_ffff_ffff; // el bit 255 se ignora (RFC 7748 §5)
         Fe([
             w[0] & MASK51,
