@@ -3,8 +3,8 @@
 use tsofgw_pack::{ct_eq, HmacKey};
 
 use crate::crypto::{
-    accept_mac, auth_proof, derive_session, Credentials, ReplayWindow, SessionKeys, COOKIE_LEN,
-    NONCE_LEN,
+    accept_mac, auth_proof, derive_session, Credentials, Ephemeral, ReplayWindow, SessionInputs,
+    SessionKeys, COOKIE_LEN, EPH_LEN, NONCE_LEN,
 };
 use crate::entropy::Entropy;
 use crate::frag::{Push, Reassembler};
@@ -76,6 +76,8 @@ pub struct SecureClient<L: Link> {
     cfg: ClientConfig,
     entropy: Box<dyn Entropy>,
     nonce: [u8; NONCE_LEN],
+    /// Claves efímeras de este intento (se renuevan con el nonce).
+    eph: Ephemeral,
     state: State,
     started: Option<u64>,
     live: Option<Live>,
@@ -93,6 +95,7 @@ impl<L: Link> SecureClient<L> {
     ) -> Self {
         let mut nonce = [0u8; NONCE_LEN];
         entropy.fill(&mut nonce);
+        let eph = Ephemeral::generate(&mut *entropy);
         let pkey = HmacKey::new(creds.key_bytes());
         SecureClient {
             link,
@@ -102,6 +105,7 @@ impl<L: Link> SecureClient<L> {
             cfg,
             entropy,
             nonce,
+            eph,
             state: State::Idle,
             started: None,
             live: None,
@@ -180,6 +184,7 @@ impl<L: Link> SecureClient<L> {
                 } else if now.saturating_sub(since) > 4 * self.cfg.retry_ms {
                     // Probablemente la cookie caducó: se empieza de nuevo con un nonce nuevo.
                     self.entropy.fill(&mut self.nonce);
+                    self.eph = Ephemeral::generate(&mut *self.entropy);
                     self.state = State::Hello { last_sent: None };
                 } else if now.saturating_sub(last_sent) >= self.cfg.retry_ms {
                     self.send_auth(&cookie);
@@ -213,8 +218,20 @@ impl<L: Link> SecureClient<L> {
     }
 
     fn send_auth(&mut self, cookie: &[u8; COOKIE_LEN]) {
-        let proof = auth_proof(&self.pkey, self.creds.player_id, &self.nonce, cookie);
-        let p = wire::auth(self.creds.player_id, &self.nonce, cookie, &proof);
+        let proof = auth_proof(
+            &self.pkey,
+            self.creds.player_id,
+            &self.nonce,
+            cookie,
+            &self.eph.public,
+        );
+        let p = wire::auth(
+            self.creds.player_id,
+            &self.nonce,
+            cookie,
+            &self.eph.public,
+            &proof,
+        );
         self.send_raw(&p);
     }
 
@@ -237,17 +254,41 @@ impl<L: Link> SecureClient<L> {
                 }
                 let session = u32::from_le_bytes(wire::array(&pkt[1..5]));
                 let server_nonce: [u8; NONCE_LEN] = wire::array(&pkt[5..21]);
-                let mac: [u8; 16] = wire::array(&pkt[21..37]);
+                let server_eph: [u8; EPH_LEN] = wire::array(&pkt[21..53]);
+                let mac: [u8; 16] = wire::array(&pkt[53..69]);
                 if !ct_eq(
-                    &accept_mac(&self.pkey, &self.nonce, &server_nonce, session),
+                    &accept_mac(
+                        &self.pkey,
+                        &self.nonce,
+                        &server_nonce,
+                        session,
+                        &self.eph.public,
+                        &server_eph,
+                    ),
                     &mac,
                 ) {
                     self.stats.bad_auth += 1;
                     return;
                 }
+                // La respuesta es auténtica (la firmó quien conoce la clave de la cuenta); aun así, un
+                // punto de orden pequeño no aportaría nada al secreto: se descarta.
+                let Some(dh) = self.eph.agree(&server_eph) else {
+                    self.stats.bad_auth += 1;
+                    return;
+                };
                 self.live = Some(Live {
                     session,
-                    keys: derive_session(&self.pkey, &self.nonce, &server_nonce, session),
+                    keys: derive_session(
+                        &self.pkey,
+                        &SessionInputs {
+                            client_nonce: &self.nonce,
+                            server_nonce: &server_nonce,
+                            session_id: session,
+                            client_eph: &self.eph.public,
+                            server_eph: &server_eph,
+                            dh: &dh,
+                        },
+                    ),
                     send_counter: 0,
                     next_msg_id: 0,
                     replay: ReplayWindow::default(),

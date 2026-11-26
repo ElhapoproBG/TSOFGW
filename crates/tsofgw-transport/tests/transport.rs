@@ -772,7 +772,7 @@ fn quien_conoce_la_cuenta_pero_no_su_clave_no_forja_ni_lee_nada() {
 }
 
 #[test]
-fn un_hello_de_la_version_anterior_se_ignora() {
+fn un_hello_de_una_version_anterior_se_ignora() {
     let net = SimNet::new(SimConfig::default());
     let mut server = SecureServer::new(
         net.endpoint(),
@@ -786,19 +786,223 @@ fn un_hello_de_la_version_anterior_se_ignora() {
     assert_eq!(hello[1], wire::PROTOCOL_VERSION);
     assert_eq!(
         wire::PROTOCOL_VERSION,
-        2,
-        "los paquetes cifrados son la versión 2"
+        3,
+        "la versión 3 trae claves efímeras (secreto hacia adelante)"
     );
-    hello[1] = 1;
-    let antes = net.stats().sent;
-    atacante.send(server.link().addr(), &hello);
-    server.poll(1, &mut ev);
-    assert_eq!(
-        net.stats().sent,
-        antes + 1,
-        "solo el HELLO: no hubo respuesta"
-    );
+    for vieja in [1u8, 2] {
+        hello[1] = vieja;
+        let antes = net.stats().sent;
+        atacante.send(server.link().addr(), &hello);
+        server.poll(1, &mut ev);
+        assert_eq!(
+            net.stats().sent,
+            antes + 1,
+            "solo el HELLO: no hubo respuesta a la versión {vieja}"
+        );
+    }
     assert_eq!(server.session_count(), 0);
+}
+
+/// Hace el HELLO a mano y devuelve la cookie con la que el servidor responde.
+fn pedir_cookie(
+    net: &SimNet,
+    server: &mut SecureServer<SimLink>,
+    atacante: &mut SimLink,
+    nonce: &[u8; 16],
+    now: u64,
+) -> [u8; 16] {
+    let mut ev = Vec::new();
+    net.start_log();
+    atacante.send(server.link().addr(), &wire::hello(nonce));
+    server.poll(now, &mut ev);
+    let reply = net
+        .take_log()
+        .into_iter()
+        .find(|(from, _, _)| *from == server.link().addr())
+        .expect("el servidor responde con un CHALLENGE")
+        .2;
+    assert_eq!(reply[0], wire::CHALLENGE);
+    wire::array(&reply[1..17])
+}
+
+fn prueba_auth(
+    creds: &Credentials,
+    nonce: &[u8; 16],
+    cookie: &[u8; 16],
+    eph: &[u8; 32],
+) -> [u8; 32] {
+    tsofgw_pack::HmacKey::new(creds.key_bytes()).mac(&[
+        b"tsofgw/auth/v2",
+        &creds.player_id.to_le_bytes(),
+        nonce,
+        cookie,
+        eph,
+    ])
+}
+
+#[test]
+fn el_auth_lleva_una_efimera_autenticada_y_el_accept_la_suya() {
+    let net = SimNet::new(SimConfig::default());
+    let mut server = SecureServer::new(
+        net.endpoint(),
+        authority(),
+        ServerConfig::default(),
+        Box::new(DeterministicEntropy(1)),
+    );
+    let creds = authority().issue(7);
+    let mut a = net.endpoint();
+    let mut ev = Vec::new();
+    let eph = tsofgw_aead::x25519::public_key(&[0x42; 32]);
+
+    // 1. Con la clave de la cuenta y una efímera de verdad: se acepta, y el ACCEPT trae la del servidor.
+    let nonce = [1u8; 16];
+    let cookie = pedir_cookie(&net, &mut server, &mut a, &nonce, 1);
+    net.start_log();
+    a.send(
+        server.link().addr(),
+        &wire::auth(
+            7,
+            &nonce,
+            &cookie,
+            &eph,
+            &prueba_auth(&creds, &nonce, &cookie, &eph),
+        ),
+    );
+    server.poll(2, &mut ev);
+    assert_eq!(server.session_count(), 1);
+    let accept = net
+        .take_log()
+        .into_iter()
+        .find(|(from, _, _)| *from == server.link().addr())
+        .unwrap()
+        .2;
+    assert_eq!(accept.len(), wire::ACCEPT_LEN);
+    let spub1: [u8; 32] = wire::array(&accept[21..53]);
+    assert_ne!(spub1, [0u8; 32]);
+
+    // 2. Otra sesión de la misma cuenta: la efímera del servidor es otra (nunca se reutiliza).
+    let nonce2 = [2u8; 16];
+    let cookie2 = pedir_cookie(&net, &mut server, &mut a, &nonce2, 3);
+    net.start_log();
+    a.send(
+        server.link().addr(),
+        &wire::auth(
+            7,
+            &nonce2,
+            &cookie2,
+            &eph,
+            &prueba_auth(&creds, &nonce2, &cookie2, &eph),
+        ),
+    );
+    server.poll(4, &mut ev);
+    let accept2 = net
+        .take_log()
+        .into_iter()
+        .find(|(from, _, _)| *from == server.link().addr())
+        .unwrap()
+        .2;
+    let spub2: [u8; 32] = wire::array(&accept2[21..53]);
+    assert_ne!(spub1, spub2, "una efímera nueva por sesión");
+}
+
+#[test]
+fn una_efimera_cambiada_o_de_orden_pequeno_no_abre_sesion() {
+    let net = SimNet::new(SimConfig::default());
+    let mut server = SecureServer::new(
+        net.endpoint(),
+        authority(),
+        ServerConfig::default(),
+        Box::new(DeterministicEntropy(1)),
+    );
+    let creds = authority().issue(7);
+    let mut a = net.endpoint();
+    let mut ev = Vec::new();
+    let eph = tsofgw_aead::x25519::public_key(&[0x42; 32]);
+    let otra = tsofgw_aead::x25519::public_key(&[0x43; 32]);
+
+    // Un intruso cambia la efímera de un AUTH legítimo: la prueba ya no cuadra.
+    let nonce = [1u8; 16];
+    let cookie = pedir_cookie(&net, &mut server, &mut a, &nonce, 1);
+    let buena = prueba_auth(&creds, &nonce, &cookie, &eph);
+    a.send(
+        server.link().addr(),
+        &wire::auth(7, &nonce, &cookie, &otra, &buena),
+    );
+    server.poll(2, &mut ev);
+    assert_eq!(server.session_count(), 0);
+    assert_eq!(server.stats().bad_auth, 1);
+
+    // Un cliente con la clave correcta pero una «efímera» de orden pequeño (todo ceros): el secreto
+    // compartido sería todo ceros; se rechaza y no queda sesión ni estado.
+    let cero = [0u8; 32];
+    let nonce = [2u8; 16];
+    let cookie = pedir_cookie(&net, &mut server, &mut a, &nonce, 3);
+    let prueba = prueba_auth(&creds, &nonce, &cookie, &cero);
+    a.send(
+        server.link().addr(),
+        &wire::auth(7, &nonce, &cookie, &cero, &prueba),
+    );
+    server.poll(4, &mut ev);
+    assert_eq!(server.session_count(), 0);
+    assert_eq!(server.stats().bad_auth, 2);
+}
+
+/// Un «servidor» a mano que contesta al cliente con una efímera elegida por el test. Devuelve si el
+/// cliente llegó a conectarse y cuántas respuestas rechazó.
+fn cliente_ante_un_servidor_falso(spub: [u8; 32]) -> (bool, u64) {
+    let net = SimNet::new(SimConfig::default());
+    let mut falso = net.endpoint();
+    let creds = authority().issue(3);
+    let mut cliente = SecureClient::new(
+        net.endpoint(),
+        falso.addr(),
+        creds.clone(),
+        ClientConfig::default(),
+        Box::new(DeterministicEntropy(8)),
+    );
+    let mut ev = Vec::new();
+    net.start_log();
+    cliente.poll(1, &mut ev); // HELLO
+    let (cli_addr, _, hello) = net.take_log().into_iter().next().unwrap();
+    assert_eq!(hello[0], wire::HELLO);
+    net.start_log();
+    falso.send(cli_addr, &wire::challenge(&[5u8; 16]));
+    cliente.poll(2, &mut ev); // AUTH
+    let auth = net
+        .take_log()
+        .into_iter()
+        .find(|(from, _, _)| *from == cli_addr)
+        .unwrap()
+        .2;
+    assert_eq!(auth.len(), wire::AUTH_LEN);
+    let nonce: [u8; 16] = wire::array(&auth[9..25]);
+    let cpub: [u8; 32] = wire::array(&auth[41..73]);
+    let (snonce, sid) = ([6u8; 16], 77u32);
+    let mac_full = tsofgw_pack::HmacKey::new(creds.key_bytes()).mac(&[
+        b"tsofgw/accept/v2",
+        &nonce,
+        &snonce,
+        &sid.to_le_bytes(),
+        &cpub,
+        &spub,
+    ]);
+    let mac: [u8; 16] = wire::array(&mac_full[..16]);
+    falso.send(cli_addr, &wire::accept(sid, &snonce, &spub, &mac));
+    cliente.poll(3, &mut ev);
+    (cliente.is_connected(), cliente.stats().bad_auth)
+}
+
+#[test]
+fn el_cliente_rechaza_una_efimera_de_orden_pequeno_aunque_el_accept_sea_autentico() {
+    // Control: con una efímera de verdad, el ACCEPT construido a mano es válido y el cliente conecta.
+    let buena = tsofgw_aead::x25519::public_key(&[0x77; 32]);
+    assert_eq!(cliente_ante_un_servidor_falso(buena), (true, 0));
+    // Con un punto de orden pequeño (u = 0 o u = 1) el secreto compartido sería todo ceros: no conecta.
+    let mut uno = [0u8; 32];
+    uno[0] = 1;
+    for malo in [[0u8; 32], uno] {
+        assert_eq!(cliente_ante_un_servidor_falso(malo), (false, 1));
+    }
 }
 
 #[test]

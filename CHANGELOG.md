@@ -1,5 +1,29 @@
 # Cambios
 
+## 0.7.0 — Secreto hacia adelante en el canal de los jugadores (X25519 propio, sin auditar)
+Atiende la limitación más importante que dejó la 0.6.0: con claves de sesión derivadas solo de la clave de la cuenta, quien la obtuviera más tarde descifraba todo lo capturado antes. Ahora el handshake de los jugadores incluye un intercambio de claves efímero X25519 (RFC 7748). **Es incompatible con la 0.6.x** (protocolo de jugadores versión 3; el servidor ignora los `HELLO` de las versiones 1 y 2): actualiza clientes y servidores juntos. El bus, el disco y el formato de guardado no cambian.
+
+**Lo nuevo**
+- **`tsofgw_aead::x25519`:** campo módulo 2^255−19 con 5 miembros de 51 bits, escalera de Montgomery con intercambio condicional por máscara, `x25519`, `public_key` y `shared_secret` (rechaza un resultado todo ceros). Código propio, **sin auditar y sin medir su tiempo constante**.
+- **Handshake v3:** `AUTH` (105 B) lleva la efímera pública del cliente y `ACCEPT` (69 B) la del servidor; ambas entran en la prueba y en el MAC (HMAC con la clave de la cuenta, `auth/v2` y `accept/v2`). Las claves de sesión (`session/v3`) salen de la clave de la cuenta, los nonces, el identificador, las dos efímeras y el secreto DH. Las privadas efímeras se descartan al calcularlo; el servidor ni las guarda en la sesión.
+- Se rechaza un secreto todo ceros (punto de orden pequeño) en el servidor y en el cliente. `ACCEPT` sigue siendo menor que `AUTH` (sin amplificación) y el servidor hace la cuenta de Diffie-Hellman **después** de verificar la prueba, así que un chorro de `AUTH` falsos no gasta CPU en X25519.
+- **Corrección de la 0.6.0 que habría roto la CI:** el archivo de vectores generado no estaba protegido de `rustfmt`; al crecer, `cargo fmt` lo habría reescrito y el paso «los vectores regenerados deben ser idénticos» habría fallado. Ahora lleva `#[rustfmt::skip]`.
+
+**Cómo se probó**
+- RFC 7748: §5.2 (2 vectores), la prueba iterada de 1000 vueltas, §6.1 (Alice y Bob), puntos de orden pequeño y el bit alto de `u`. **Contra OpenSSL: 572 vectores** (escalares y puntos extremos y aleatorios), regenerados en la CI.
+- Transporte: el `AUTH` lleva una efímera autenticada y el `ACCEPT` la suya, distinta en cada sesión; una efímera cambiada o de orden pequeño no abre sesión; un cliente rechaza un `ACCEPT` auténtico con efímera de orden pequeño (con prueba de control de que el mismo `ACCEPT` con una efímera buena sí conecta); las claves de sesión cambian si cambia el secreto DH o cualquiera de las dos efímeras; un `HELLO` de las versiones 1 y 2 se ignora.
+- **Mutaciones:** 9 mutantes nuevos (D1–D9; 44 en total). Al principio sobrevivía D9 (el cliente aceptaba una efímera de orden pequeño): faltaba una prueba con un «servidor» a mano que firme bien un `ACCEPT` malicioso; añadida, los 9 se detectan.
+- 331 pruebas pasan con y sin el compilador de C; Clippy y formato limpios.
+- **Coste:** 98 µs por operación X25519 (2 núcleos de un sandbox); un handshake cuesta dos en el servidor, unos 0,2 ms.
+
+**Lo que NO da**
+- **Auditoría.** Mi posición hasta la 0.6 era no escribir criptografía asimétrica a mano sin una biblioteca auditada; sin red no hay forma de traerla, y la 0.7.0 la escribe aislada en `tsofgw-aead` y comprobada contra RFC y OpenSSL, para poder sustituirla. Es una decisión revisable: en cuanto se pueda, cámbiese por una biblioteca auditada.
+- **El bus sigue sin secreto hacia adelante** (claves estáticas derivadas de la de clúster; hacerlo efímero pide identidad por shard).
+- Un intruso activo con la clave de la cuenta (o la maestra) sigue suplantando en sesiones nuevas: el secreto hacia adelante protege el pasado.
+- El handshake sigue mostrando el número de cuenta; el disco sigue sin cifrar.
+
+**Lectura de la CI de la 0.6.0** (commit `8261ae1`, ejecución n.º 9): éxito global en 3 min 57 s. No pude leer el detalle por trabajo (los registros piden iniciar sesión).
+
 ## 0.6.0 — La red va cifrada (con criptografía propia, sin auditar)
 Cierra el punto 3 de la lista de deuda: hasta la 0.5 los dos canales de red (jugadores y bus entre shards) iban autenticados pero **en claro**. Desde ahora van cifrados con ChaCha20-Poly1305 (RFC 8439). **Es incompatible con la 0.5.x**: cambian el protocolo de jugadores (versión 2; un HELLO de la versión anterior se ignora) y el datagrama del bus (versión 2; cabecera de 34 B y `MAX_PEER_MSG` = 1150). Actualiza servidores y clientes a la vez. El formato del disco no cambia.
 

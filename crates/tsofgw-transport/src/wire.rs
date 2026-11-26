@@ -3,8 +3,8 @@
 //! ```text
 //! HELLO      0x01 | versión(1) | nonce_cliente(16) | relleno hasta 64 bytes
 //! CHALLENGE  0x02 | cookie(16)
-//! AUTH       0x03 | player_id(8) | nonce_cliente(16) | cookie(16) | prueba(32)
-//! ACCEPT     0x04 | session_id(4) | nonce_servidor(16) | mac(16)
+//! AUTH       0x03 | player_id(8) | nonce_cliente(16) | cookie(16) | efímera_cliente(32) | prueba(32)
+//! ACCEPT     0x04 | session_id(4) | nonce_servidor(16) | efímera_servidor(32) | mac(16)
 //! DATA       0x10 | session_id(4) | contador(8) | msg_id(2) idx(1) total(1) | carga CIFRADA | etiqueta(16)
 //! DISCONNECT 0x11 | session_id(4) | contador(8) | etiqueta(16)
 //! ```
@@ -16,13 +16,14 @@
 //! Ninguna respuesta del servidor antes de AUTH supera en tamaño a lo que la provocó, para que no sirva
 //! de amplificador en ataques con dirección falsificada.
 
-use crate::crypto::{nonce_for, COOKIE_LEN, NONCE_LEN, TAG_LEN};
+use crate::crypto::{nonce_for, COOKIE_LEN, EPH_LEN, NONCE_LEN, TAG_LEN};
 use crate::frag::MAX_FRAGMENTS;
 use tsofgw_aead::{open_in_place, seal_in_place};
 
-/// Versión 2: DATA y DISCONNECT cifrados (0.6.0). Un cliente o servidor de la versión 1 no se entiende
-/// con uno de la 2: el servidor ignora el HELLO de otra versión.
-pub const PROTOCOL_VERSION: u8 = 2;
+/// Versión 3: claves efímeras X25519 en AUTH y ACCEPT, con secreto hacia adelante (0.7.0). La 2 cifraba
+/// DATA y DISCONNECT (0.6.0). Versiones distintas no se entienden: el servidor ignora el HELLO de otra
+/// versión.
+pub const PROTOCOL_VERSION: u8 = 3;
 pub const HELLO: u8 = 0x01;
 pub const CHALLENGE: u8 = 0x02;
 pub const AUTH: u8 = 0x03;
@@ -33,8 +34,8 @@ pub const DISCONNECT: u8 = 0x11;
 /// Tamaño máximo de un datagrama que enviamos (cabe en el MTU habitual de 1280 de IPv6 con margen).
 pub const MAX_DATAGRAM: usize = 1200;
 pub const HELLO_LEN: usize = 64;
-pub const AUTH_LEN: usize = 1 + 8 + NONCE_LEN + COOKIE_LEN + 32;
-pub const ACCEPT_LEN: usize = 1 + 4 + NONCE_LEN + 16;
+pub const AUTH_LEN: usize = 1 + 8 + NONCE_LEN + COOKIE_LEN + EPH_LEN + 32;
+pub const ACCEPT_LEN: usize = 1 + 4 + NONCE_LEN + EPH_LEN + 16;
 pub const DATA_HEADER: usize = 1 + 4 + 8;
 pub const FRAG_HEADER: usize = 4;
 pub const MAX_FRAGMENT_PAYLOAD: usize = MAX_DATAGRAM - DATA_HEADER - FRAG_HEADER - TAG_LEN;
@@ -67,6 +68,7 @@ pub fn auth(
     player_id: u64,
     nonce: &[u8; NONCE_LEN],
     cookie: &[u8; COOKIE_LEN],
+    client_eph: &[u8; EPH_LEN],
     proof: &[u8; 32],
 ) -> Vec<u8> {
     let mut p = Vec::with_capacity(AUTH_LEN);
@@ -74,15 +76,22 @@ pub fn auth(
     p.extend_from_slice(&player_id.to_le_bytes());
     p.extend_from_slice(nonce);
     p.extend_from_slice(cookie);
+    p.extend_from_slice(client_eph);
     p.extend_from_slice(proof);
     p
 }
 
-pub fn accept(session: u32, server_nonce: &[u8; NONCE_LEN], mac: &[u8; 16]) -> Vec<u8> {
+pub fn accept(
+    session: u32,
+    server_nonce: &[u8; NONCE_LEN],
+    server_eph: &[u8; EPH_LEN],
+    mac: &[u8; 16],
+) -> Vec<u8> {
     let mut p = Vec::with_capacity(ACCEPT_LEN);
     p.push(ACCEPT);
     p.extend_from_slice(&session.to_le_bytes());
     p.extend_from_slice(server_nonce);
+    p.extend_from_slice(server_eph);
     p.extend_from_slice(mac);
     p
 }

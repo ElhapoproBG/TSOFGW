@@ -5,6 +5,9 @@
 //!   qué cuenta es el cliente y el cliente sabe que habla con un servidor que conoce su clave.
 //! * **Confidencialidad, integridad y autenticidad por paquete** (desde la 0.6, ChaCha20-Poly1305 de
 //!   `tsofgw-aead`, una clave por sentido y sesión; la cabecera va autenticada y la carga cifrada).
+//! * **Secreto hacia adelante** (desde la 0.7, X25519 efímero en AUTH/ACCEPT): las claves de sesión dependen de
+//!   un secreto de Diffie-Hellman cuya parte privada se descarta; una clave de cuenta filtrada más tarde no
+//!   descifra lo capturado antes.
 //! * **Anti-replay**: ventana de 128 contadores por sentido.
 //! * **Resistencia a suplantación de origen**: HELLO → CHALLENGE con *cookie* atada a la dirección; el
 //!   servidor no guarda nada hasta verificar AUTH, y ninguna respuesta es mayor que lo que la provoca.
@@ -14,9 +17,10 @@
 //! # Qué NO garantiza (todavía)
 //! * **Una implementación de cifrado auditada**: `tsofgw-aead` es código propio, comprobado contra los
 //!   vectores del RFC 8439 y contra OpenSSL, pero nadie lo ha auditado (documento 11).
-//! * **Secreto hacia adelante** ni credenciales asimétricas: las claves de sesión salen de la clave de la
-//!   cuenta y de dos nonces, así que una clave filtrada descifra lo capturado, y la clave maestra de la
-//!   autoridad permite suplantar cualquier cuenta. Es un esquema para desarrollo y redes privadas.
+//! * **Credenciales asimétricas**: la clave maestra de la autoridad permite suplantar cualquier cuenta, y quien
+//!   tenga la clave de una cuenta puede hacerse pasar por ella en sesiones nuevas. El **secreto hacia adelante**
+//!   (0.7.0, X25519 efímero) protege lo ya capturado, no el presente. Es un esquema para desarrollo y redes
+//!   privadas.
 //! * **Ocultar metadatos**: el handshake va en claro (el número de cuenta se ve), y el tamaño y el ritmo
 //!   de los paquetes también.
 //! * **Migración de dirección** (cambio de IP/puerto): el cliente debe reconectar.

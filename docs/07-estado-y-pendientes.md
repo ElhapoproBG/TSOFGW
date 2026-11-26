@@ -1,4 +1,4 @@
-# Estado verificado y pendientes (versión 0.6.0)
+# Estado verificado y pendientes (versión 0.7.0)
 
 Este documento separa lo que está probado de lo que no, para no confundir intención con realidad.
 
@@ -29,7 +29,7 @@ Este documento separa lo que está probado de lo que no, para no confundir inten
 - **Ventana y presentación en pantalla:** no hay; el render actual es fuera de pantalla.
 - **Sandbox de módulos:** los permisos se declaran, se verifican al cargar y se auditan, pero no hay aislamiento en tiempo de ejecución (WebAssembly pendiente).
 - **Firmas de distribución pública:** solo HMAC con clave compartida (útil para pruebas y redes privadas). Hacen falta firmas asimétricas (Ed25519) con una dependencia auditada; no se implementó criptografía asimétrica propia a propósito.
-- **Red:** el transporte de jugadores y el bus van **cifrados desde la 0.6.0, con criptografía propia sin auditar y sin secreto hacia adelante** (documento 11); credenciales por clave compartida (sin Ed25519); sin migración de dirección ni control de congestión. Medido solo en simulación y bucle local (la ruta de Windows para obtener aleatoriedad, `BCryptGenRandom`, compila y pasa sus pruebas en la CI de Windows).
+- **Red:** el transporte de jugadores y el bus van **cifrados desde la 0.6.0**; desde la 0.7.0 el canal de jugadores tiene **secreto hacia adelante** (X25519 efímero) y el bus no. **Toda la criptografía es propia y sin auditar** (documento 11); credenciales por clave compartida (sin Ed25519); sin migración de dirección ni control de congestión. Medido solo en simulación y bucle local (la ruta de Windows para obtener aleatoriedad, `BCryptGenRandom`, compila y pasa sus pruebas en la CI de Windows).
 - **Clúster:** reparto estático en rejilla, sin equilibrado dinámico; quien tenga la clave de clúster puede suplantar a cualquier shard y al directorio; el bus necesita relojes sincronizados (±30 s); probado en una sola máquina, no en varias ni con latencias de internet; los clientes no se reconectan solos tras una caída (los bancos de pruebas sí); sin pruebas de apagar un shard en caliente con jugadores reales.
 - **Persistencia y directorio (0.5.0):** lo que se guarda está **autenticado, no cifrado**; **no se detecta que devuelvan una copia vieja** de una carpeta; un daño en los últimos 8 MiB del diario se toma por una escritura a medias; el directorio es **un solo proceso** (sin réplica, arrendamientos ni sustitución automática); las lápidas crecen y no se podan; el almacén vive en memoria y un checkpoint bloquea el tick; la ventana de repeticiones de NPC es finita; el coste del disco real no está medido en un disco de producción (las latencias de traspaso del simulador no incluyen `fsync`); el manejador de señales de Windows lo compila el compilador de Windows en la CI, pero **ninguna prueba lo ejecuta** (una prueba no puede mandar Ctrl-C a un proceso hijo); el trabajo manual de mutaciones en Actions no se ha ejecutado nunca allí. Detalle en el documento 10, sección 11.
 - **Escala del servidor:** con 2 hilos en 2 núcleos el tick medio con 500 jugadores densos baja de 22,7 ms a 14,8 ms (1,5×); el escalado con más núcleos (y en hardware real) no está medido. La simulación de NPC sigue en un solo hilo.
@@ -39,6 +39,8 @@ Este documento separa lo que está probado de lo que no, para no confundir inten
 
 ## Corrección registrada
 La primera versión del módulo en C (`hash.c`) tenía la constante inicial de FNV-1a con un dígito de menos, así que no producía FNV-1a real. Se detectó al añadir vectores de referencia públicos y se corrigió en 0.1.0. Ese hash es solo un identificador rápido y no criptográfico; para integridad y seguridad se usa SHA-256.
+
+**0.6.0 → 0.7.0.** Al añadir X25519 la prueba de mutaciones encontró otro hueco (D9: el cliente aceptaba una efímera de orden pequeño de un servidor que firmase bien el `ACCEPT`), y la comprobación de formato encontró que el archivo de vectores de la 0.6.0 no estaba protegido de `rustfmt` y habría roto la CI al crecer. La CI de la 0.6.0 quedó en éxito (ejecución n.º 9).
 
 **0.5.1 → 0.6.0.** Al cifrar, la prueba de mutaciones encontró un hueco real: ninguna prueba ejercitaba la reducción final de Poly1305 (h ≥ 2^130−5), y un mutante sobrevivió hasta que se añadieron vectores fabricados comprobados contra OpenSSL (documento 11, sección 8). La CI de la 0.5.1 quedó en verde (ejecución n.º 8, 7 trabajos; Windows 290 pruebas).
 

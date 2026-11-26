@@ -45,6 +45,8 @@ WI = "crates/tsofgw-transport/src/wire.rs"
 CR = "crates/tsofgw-transport/src/crypto.rs"
 TS = "crates/tsofgw-transport/src/server.rs"
 UB = "crates/tsofgw-online/src/udp_bus.rs"
+XD = "crates/tsofgw-aead/src/x25519.rs"
+TCL = "crates/tsofgw-transport/src/client.rs"
 
 # Pruebas que ve cada familia de mutantes.
 PRUEBAS_ONLINE = ["-p", "tsofgw-online", "--test", "persist"]
@@ -312,6 +314,70 @@ MUTANTES = [
         "    open_in_place(\n        sender_key,\n        &nonce_of(p.head.boot, p.head.counter),\n        aad,\n        &mut buf,\n        tag,\n    )\n    .then_some(buf)",
         "    let _ = open_in_place(\n        sender_key,\n        &nonce_of(p.head.boot, p.head.counter),\n        aad,\n        &mut buf,\n        tag,\n    );\n    Some(buf)",
         PRUEBAS_BUS,
+    ),
+    # ------------------------------------------------------------------ secreto hacia adelante (0.7.0)
+    Mutante(
+        "D1", "X25519 no fija el bit 254 del escalar (recorte incompleto)",
+        XD,
+        "    s[31] |= 64;\n",
+        "",
+        PRUEBAS_AEAD,
+    ),
+    Mutante(
+        "D2", "la escalera de Montgomery no arrastra el intercambio condicional entre iteraciones",
+        XD,
+        "        swap = kt;\n",
+        "        swap = 0;\n",
+        PRUEBAS_AEAD,
+    ),
+    Mutante(
+        "D3", "X25519 no hace la reducción completa final (valores entre p y 2^255 salen sin reducir)",
+        XD,
+        "        h[0] += 19 * q;\n",
+        "        h[0] += 0 * q;\n",
+        PRUEBAS_AEAD,
+    ),
+    Mutante(
+        "D4", "shared_secret acepta el resultado todo ceros (punto de orden pequeño)",
+        XD,
+        "    if acc == 0 {\n        None",
+        "    if false {\n        None",
+        PRUEBAS_AEAD,
+    ),
+    Mutante(
+        "D5", "las claves de sesión no dependen del secreto de Diffie-Hellman (sin secreto hacia adelante)",
+        CR,
+        "        i.server_eph,\n        i.dh,\n    ]);",
+        "        i.server_eph,\n    ]);",
+        PRUEBAS_TRANSPORT,
+    ),
+    Mutante(
+        "D6", "las claves de sesión no dependen de la efímera del servidor",
+        CR,
+        "        i.client_eph,\n        i.server_eph,\n        i.dh,",
+        "        i.client_eph,\n        i.dh,",
+        PRUEBAS_TRANSPORT,
+    ),
+    Mutante(
+        "D7", "la prueba de AUTH no cubre la efímera del cliente (un intruso podría cambiarla)",
+        CR,
+        "        cookie,\n        client_eph,\n    ])\n}",
+        "        cookie,\n    ])\n}",
+        PRUEBAS_TRANSPORT,
+    ),
+    Mutante(
+        "D8", "el servidor acepta una efímera de orden pequeño (secreto compartido todo ceros)",
+        TS,
+        "        let Some(dh) = eph.agree(&client_eph) else {\n            self.stats.bad_auth += 1;\n            return;\n        };",
+        "        let dh = eph.agree(&client_eph).unwrap_or([0u8; 32]);",
+        PRUEBAS_TRANSPORT,
+    ),
+    Mutante(
+        "D9", "el cliente acepta una efímera de orden pequeño del servidor",
+        TCL,
+        "                let Some(dh) = self.eph.agree(&server_eph) else {\n                    self.stats.bad_auth += 1;\n                    return;\n                };",
+        "                let dh = self.eph.agree(&server_eph).unwrap_or([0u8; 32]);",
+        PRUEBAS_TRANSPORT,
     ),
 ]
 

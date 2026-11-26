@@ -15,6 +15,7 @@ import random
 from pathlib import Path
 
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms
+from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
 from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 from cryptography.hazmat.primitives.poly1305 import Poly1305
 
@@ -65,6 +66,23 @@ for ctr in [0, 1, 2, 255, 0xFFFFFFFF, 0x80000000]:
     enc = Cipher(algorithms.ChaCha20(k, ctr.to_bytes(4, "little") + n), mode=None).encryptor()
     blocks.append((k, ctr, n, enc.update(bytes(64))))
 
+# --- X25519: claves privadas aleatorias y extremas contra claves públicas aleatorias y de borde.
+# (escalar, u, resultado). Se omiten los puntos de orden pequeño: OpenSSL se niega a calcularlos.
+xdh = []
+scalars = [bytes(32), bytes([0xFF] * 32), bytes([0xF8] + [0] * 30 + [0x40]), bytes([0x07] + [0xFF] * 30 + [0x7F])]
+scalars += [rb(32) for _ in range(40)]
+us = [bytes([9] + [0] * 31), bytes([0xFF] * 31 + [0x7F]), bytes([2] + [0] * 31), bytes([0xEC] + [0xFF] * 30 + [0x7F])]
+us += [rb(32) for _ in range(30)]
+for i, k in enumerate(scalars):
+    for j, u in enumerate(us):
+        if (i + j) % 3 and i >= 4:
+            continue
+        try:
+            r = X25519PrivateKey.from_private_bytes(k).exchange(X25519PublicKey.from_public_bytes(u))
+        except ValueError:
+            continue  # resultado todo ceros: lo rechaza OpenSSL (y `shared_secret` también)
+        xdh.append((k, u, r))
+
 
 def arr(name, ty, items):
     out = f"pub const {name}: &[{ty}] = &[\n"
@@ -83,6 +101,8 @@ out += "\n/// (clave de un solo uso, mensaje, etiqueta)\n"
 out += arr("POLY1305", "(&str, &str, &str)", [f'("{h(k)}", "{h(m)}", "{h(t)}")' for k, m, t in poly])
 out += "\n/// (clave, contador de bloque, nonce, bloque de 64 bytes)\n"
 out += arr("BLOCKS", "(&str, u32, &str, &str)", [f'("{h(k)}", {c}, "{h(n)}", "{h(b)}")' for k, c, n, b in blocks])
+out += "\n/// (escalar, u, X25519(escalar, u)) sin los resultados todo ceros\n"
+out += arr("X25519", "(&str, &str, &str)", [f'("{h(k)}", "{h(u)}", "{h(r)}")' for k, u, r in xdh])
 dest = Path(__file__).resolve().parent.parent / "crates/tsofgw-aead/tests/vectores/mod.rs"
 dest.write_text(out, encoding="utf-8")
-print(f"{len(aead)} AEAD, {len(poly)} Poly1305, {len(blocks)} bloques -> {dest}")
+print(f"{len(aead)} AEAD, {len(poly)} Poly1305, {len(blocks)} bloques, {len(xdh)} X25519 -> {dest}")

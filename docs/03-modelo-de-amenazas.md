@@ -24,7 +24,8 @@ Cubre A5 en el lado del servidor y añade amenazas de red; detalle en el documen
 - **Escucha pasiva (0.6.0):** la carga de cada paquete va cifrada con una clave distinta por sentido y sesión; un espía interpuesto sobre UDP real no lee nada. Ve el número de cuenta del handshake, el tamaño y el ritmo. Detalle y límites en el documento 11.
 - **Cliente tramposo:** el servidor es autoritativo, el cliente solo envía intenciones, la velocidad la impone la simulación y un sistema de créditos limita los inputs por tick; los mensajes malformados llevan a expulsión.
 - **Inundación:** límite de paquetes por segundo y por sesión, de sesiones y de sesiones pendientes.
-- **No cubierto aún:** secreto hacia adelante (el cifrado de la 0.6 es propio y sin auditar y sus claves salen de una clave compartida), credenciales asimétricas, ataques volumétricos de red (eso se mitiga fuera del motor), trampas que no alteran el protocolo (por ejemplo, ayudas de puntería) y atestación del cliente.
+- **Captura hoy, clave filtrada mañana (0.7.0):** el canal de los jugadores tiene secreto hacia adelante (X25519 efímero en el handshake, claves de sesión que dependen del secreto de Diffie-Hellman).
+- **No cubierto aún:** que el cifrado y X25519 son propios y sin auditar, y el intruso activo que ya tenga la clave de la cuenta, credenciales asimétricas, ataques volumétricos de red (eso se mitiga fuera del motor), trampas que no alteran el protocolo (por ejemplo, ayudas de puntería) y atestación del cliente.
 
 ## Clúster de shards (0.4.0)
 Añade un segundo canal de red, el **bus entre shards**, y con él nuevas amenazas; detalle en el documento 09.
@@ -32,7 +33,7 @@ Añade un segundo canal de red, el **bus entre shards**, y con él nuevas amenaz
 - **Shard mal configurado o con otro mundo:** cada datagrama lleva una huella de la configuración que debe coincidir (rejilla, tick, radios, NPC, semilla); si no coincide se rechaza y se cuenta aparte.
 - **Cliente que intenta aprovechar un traspaso:** el estado del jugador lo envía el shard de origen, nunca el cliente; el destino solo adopta un `HANDOVER` del mismo shard que lo preparó, para esa cuenta, y después de que el cliente se autenticara con su propia clave. La autoridad cambia en un único mensaje.
 - **Reinicio de un shard con capturas antiguas:** el contador del bus parte del reloj, así que sigue creciendo tras un reinicio y las capturas previas no se aceptan.
-- **Escucha pasiva del bus (0.6.0):** cifrado, con un espía interpuesto entre dos shards reales que no lee nada. Sigue sin secreto hacia adelante.
+- **Escucha pasiva del bus (0.6.0):** cifrado, con un espía interpuesto entre dos shards reales que no lee nada. **Sigue sin secreto hacia adelante** (claves estáticas).
 - **No cubierto aún:** **la clave de clúster es un punto único de confianza** (quien la tenga descifra el bus y puede suplantar a cualquier shard y, desde la 0.5.0, al directorio de sesiones). El directorio de sesiones y la persistencia que faltaban aquí llegaron en la 0.5.0 (sección siguiente).
 
 ## Persistencia y directorio de sesiones (0.5.0)

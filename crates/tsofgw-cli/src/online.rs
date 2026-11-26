@@ -194,8 +194,8 @@ pub(crate) fn exposure_warning(listening: &[(&str, SocketAddr)]) -> Option<Strin
     }
     Some(format!(
         "ADVERTENCIA: escuchando fuera del bucle local ({}). TSOFGW {} NO está pensado para exponerse a internet: \
-         el cifrado de la red (jugadores y bus entre shards) es propio y nadie lo ha auditado, no hay secreto hacia \
-         adelante, quien tenga la clave de clúster descifra el bus y puede suplantar a cualquier shard, y el directorio \
+         el cifrado de la red (jugadores y bus entre shards) es propio y nadie lo ha auditado, el bus no tiene secreto \
+         hacia adelante, quien tenga la clave de clúster descifra el bus y puede suplantar a cualquier shard, y el directorio \
          de sesiones (si lo usas) es un solo proceso sin réplica. Úsalo en una red privada o de confianza; detalles en \
          SECURITY.md.",
         exposed.join(", "),

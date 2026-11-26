@@ -4,6 +4,8 @@
 //! tamaños, mensajes de todo `0xFF` y claves extremas de Poly1305 (las que fuerzan las reducciones
 //! finales) y contadores de bloque de ChaCha20 extremos.
 
+// Archivo generado: rustfmt no lo toca, para que la CI pueda regenerarlo y compararlo byte a byte.
+#[rustfmt::skip]
 mod vectores;
 
 use tsofgw_aead::*;
@@ -60,5 +62,16 @@ fn bloques_de_chacha20_coinciden_con_openssl_incluso_con_contadores_extremos() {
             &hex(b)[..],
             "bloque {i}"
         );
+    }
+}
+
+#[test]
+fn x25519_coincide_con_openssl() {
+    use tsofgw_aead::x25519::{shared_secret, x25519};
+    assert!(vectores::X25519.len() >= 200, "faltan vectores");
+    for (i, (k, u, r)) in vectores::X25519.iter().enumerate() {
+        let (k, u, r) = (arr::<32>(k), arr::<32>(u), arr::<32>(r));
+        assert_eq!(x25519(&k, &u), r, "vector {i}");
+        assert_eq!(shared_secret(&k, &u), Some(r), "vector {i}");
     }
 }

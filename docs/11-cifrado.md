@@ -1,21 +1,24 @@
-# Cifrado de la red (versión 0.6.0)
+# Cifrado de la red (versión 0.7.0)
 
 Hasta la 0.5 los paquetes de los jugadores y los del bus entre shards iban **autenticados pero en claro**: nadie
 podía alterarlos sin que se notara, pero cualquiera que mirase la red los leía. Desde la 0.6.0 los dos canales
-van **cifrados y autenticados** con ChaCha20-Poly1305 (RFC 8439).
+van **cifrados y autenticados** con ChaCha20-Poly1305 (RFC 8439). La 0.7.0 añade **secreto hacia adelante** al canal
+de los jugadores con un intercambio de claves efímero X25519 (sección 3b); **el bus no lo tiene** (sección 4).
 
 > **Esto no hace a TSOFGW apto para exponerse a internet.** Cierra un agujero (la lectura pasiva del tráfico) y deja
 > abiertos otros, listados en la sección 6. El cifrado es **código propio, sin auditar**: léase la sección 2.
 
 ## 1. Qué garantiza y qué no
 
-| | Con la 0.6.0 |
+| | Con la 0.7.0 |
 |---|---|
 | Leer el tráfico de los jugadores o del bus | **No se puede** sin la clave de la cuenta o la de clúster: la carga va cifrada |
 | Alterar, repetir, reflejar o redirigir un paquete | Se detecta (la cabecera entera va autenticada) |
 | Saber que dos máquinas hablan, cuántos paquetes, de qué tamaño y a qué ritmo | **Sí se puede**: el tamaño y el ritmo no se ocultan |
 | Saber qué cuenta se conecta | **Sí se puede**: el número de cuenta viaja en claro en el `AUTH` del handshake (autenticado, no cifrado) |
-| Descifrar capturas antiguas si más tarde se filtra una clave | **Sí se puede**: no hay secreto hacia adelante (las claves de sesión salen de una clave compartida y de dos nonces) |
+| Descifrar capturas **de jugadores** antiguas si más tarde se filtra la clave de la cuenta o la maestra | **No se puede** (0.7.0): las claves de sesión incluyen un secreto de Diffie-Hellman efímero cuya parte privada se descarta al calcularlo. Hay que haber guardado además las claves efímeras o romper X25519 |
+| Descifrar capturas **del bus** antiguas si más tarde se filtra la clave de clúster | **Sí se puede**: el bus usa claves estáticas derivadas de la de clúster, sin intercambio efímero |
+| Suplantar a un cliente o a un servidor **durante** la sesión con la clave de la cuenta en la mano | **Sí se puede** (un intruso activo con la clave hace su propio handshake): el secreto hacia adelante protege el pasado, no el presente |
 | Que la clave de clúster siga siendo confianza total | **Sigue siéndolo**: quien la tenga descifra todo el bus y habla como cualquier shard o como el directorio |
 | Cifrado en reposo (disco) | **No**: lo guardado sigue autenticado, no cifrado |
 
@@ -76,11 +79,30 @@ DISCONNECT 0x11 | sesión(4) | contador(8) | etiqueta(16)
 - **Datos asociados.** La cabecera completa (tipo, sesión, contador, `msg_id`, `idx`, `total`): visible, pero autenticada.
   Mover un paquete a otra sesión o cambiarle el contador para esquivar el anti-replay lo invalida.
 - **El tamaño no crece.** La etiqueta de 16 bytes ocupa el mismo sitio que la del HMAC anterior.
-- **Sin vuelta atrás.** El protocolo pasa a la **versión 2** y no hay modo sin cifrar. Un cliente de la 0.5 no se
+- **Sin vuelta atrás.** El protocolo pasó a la **versión 2** en la 0.6.0 (la 0.7.0 lo subió a la 3) y no hay modo sin cifrar. Un cliente de la 0.5 no se
   entiende con un servidor de la 0.6 (el servidor ignora su `HELLO`, que lleva la versión 1): no puede forzarse un
   paquete en claro. Hay que actualizar clientes y servidores juntos.
 - **El handshake no se cifra.** `HELLO`, `CHALLENGE`, `AUTH` y `ACCEPT` siguen autenticados con HMAC-SHA256 y en claro:
   el número de cuenta es visible.
+
+## 3b. Secreto hacia adelante (0.7.0)
+
+```text
+AUTH   0x03 | cuenta(8) | nonce_c(16) | cookie(16) | efímera_c(32) | prueba(32)      (105 B)
+ACCEPT 0x04 | sesión(4) | nonce_s(16) | efímera_s(32) | mac(16)                       (69 B)
+```
+- **Qué pasa.** Cada intento de conexión del cliente genera una clave efímera X25519 y manda la pública en `AUTH`; el
+  servidor genera otra por sesión y manda la suya en `ACCEPT`. Las dos públicas entran en la prueba de `AUTH` y en el MAC
+  de `ACCEPT` (HMAC con la clave de la cuenta, etiquetas `tsofgw/auth/v2` y `tsofgw/accept/v2`), así que un intruso no
+  puede cambiarlas sin que se note.
+- **Claves de sesión.** `HMAC(clave de la cuenta, "tsofgw/session/v3" ‖ nonces ‖ sesión ‖ efímera_c ‖ efímera_s ‖ DH)`,
+  y de ahí las dos claves AEAD. Quien conozca la clave de la cuenta pero no el secreto DH **no llega a las claves**.
+- **Qué se descarta.** Las privadas efímeras viven solo hasta calcular el secreto compartido (el servidor no las guarda en
+  la sesión). Se rechaza un secreto todo ceros (punto de orden pequeño) en los dos lados.
+- **Sin amplificación.** `ACCEPT` (69 B) sigue siendo menor que el `AUTH` que lo provoca (105 B), y el servidor hace la
+  cuenta de Diffie-Hellman **después** de comprobar la prueba de `AUTH`: inundar de `AUTH` falsos no gasta CPU en X25519.
+- **Coste.** 98 µs por operación X25519 en un sandbox de 2 núcleos; un handshake cuesta dos en el servidor (≈ 0,2 ms).
+- **Protocolo versión 3.** El servidor ignora los `HELLO` de las versiones 1 y 2. Actualiza clientes y servidores juntos.
 
 ## 4. Bus entre shards
 
@@ -123,8 +145,14 @@ BUS 0x20 | versión(1)=2 | desde(2) | hacia(2) | arranque(4) | contador(8) | rel
 
 ## 6. Qué sigue abierto
 
-- **Sin secreto hacia adelante**: haría falta un intercambio de claves efímero (X25519). No lo he escrito: es criptografía
-  asimétrica y mi regla desde el principio es no implementarla a mano sin una biblioteca auditada.
+- **El bus sigue sin secreto hacia adelante.** Sus claves son estáticas (derivadas de la de clúster): quien la obtenga
+  descifra lo que capturó. Hacerlo efímero exige una identidad por shard (hoy todos comparten la clave), que es otro paso.
+- **X25519 es código propio.** Mi posición hasta la 0.6 era no escribir criptografía asimétrica a mano mientras no hubiera una
+  biblioteca auditada a mano; sin red no la hay, y lo que decidí fue **escribirla aislada en `tsofgw-aead`, con los vectores
+  del RFC 7748 (incluida la prueba de 1000 iteraciones) y 572 vectores generados con OpenSSL**, para poder sustituirla. Sigue
+  **sin auditar y sin medir su tiempo constante**. Es una decisión a revisar: en cuanto se pueda, sustitúyase por una
+  biblioteca auditada (`x25519-dalek` o `ring`).
+- **Un intruso activo con la clave de la cuenta** (o la maestra) sigue suplantando a esa cuenta en sesiones nuevas.
 - **Credenciales por clave compartida**: la clave maestra suplanta a cualquier cuenta; la clave de clúster, a cualquier shard
   y al directorio, y **descifra todo el bus**.
 - **Metadatos visibles**: la cuenta que se conecta, el tamaño y el ritmo de los paquetes, qué shards hablan.
@@ -135,9 +163,10 @@ BUS 0x20 | versión(1)=2 | desde(2) | hacia(2) | arranque(4) | contador(8) | rel
 
 ## 7. Dónde cambia el código
 
-`crates/tsofgw-aead` (nuevo), `tsofgw-transport` (`crypto.rs`: claves de sesión AEAD; `wire.rs`: `build_data`, `open_data`,
-`build_disconnect`, `verify_disconnect`; protocolo versión 2), `tsofgw-online/src/udp_bus.rs` (`BusKey`, `Header`,
-`seal`/`open`, sal de arranque; `BUS_VERSION` 2), `ci/generar_vectores_aead.py`, y 12 mutantes nuevos en `ci/mutaciones.py`.
+`crates/tsofgw-aead` (nuevo; desde la 0.7.0 con `x25519.rs`), `tsofgw-transport` (`crypto.rs`: claves de sesión AEAD, `Ephemeral`,
+`SessionInputs`; `wire.rs`: `build_data`, `open_data`, `build_disconnect`, `verify_disconnect`, `AUTH` y `ACCEPT` con efímeras;
+protocolo versión 3), `tsofgw-online/src/udp_bus.rs` (`BusKey`, `Header`,
+`seal`/`open`, sal de arranque; `BUS_VERSION` 2), `ci/generar_vectores_aead.py`, y 12 mutantes (C1–C12, 0.6.0) y 9 más (D1–D9, 0.7.0) en `ci/mutaciones.py`.
 
 ## 8. Un hallazgo de la prueba de las pruebas
 

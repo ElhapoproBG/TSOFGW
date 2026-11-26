@@ -19,13 +19,13 @@ Esta capa (introducida en 0.3.0 y ampliada en 0.4.0 y 0.5.0) convierte los bloqu
 - **Autenticación mutua.** Cada cuenta tiene una clave derivada de una clave maestra (`Authority::issue`). El cliente demuestra que la posee y el servidor demuestra que también la conoce.
 - **Integridad y autenticidad por paquete:** HMAC-SHA256 truncado a 128 bits, con una clave distinta por sentido y por sesión.
 - **Anti-replay:** ventana de 128 contadores; un paquete capturado y reenviado no se ejecuta dos veces.
-- **Resistencia a suplantación de origen y a amplificación:** el servidor responde a HELLO con una *cookie* atada a la dirección de origen y no reserva nada hasta recibir un AUTH válido. Ninguna respuesta previa a AUTH es mayor que lo que la provoca (HELLO ≥ 64 B, CHALLENGE 17 B, ACCEPT 37 B < AUTH 73 B).
+- **Resistencia a suplantación de origen y a amplificación:** el servidor responde a HELLO con una *cookie* atada a la dirección de origen y no reserva nada hasta recibir un AUTH válido. Ninguna respuesta previa a AUTH es mayor que lo que la provoca (HELLO ≥ 64 B, CHALLENGE 17 B, ACCEPT 69 B < AUTH 105 B desde la 0.7.0).
 - **Una cuenta, una sesión.** Si la misma cuenta se conecta otra vez, la sesión nueva reemplaza a la vieja, pero solo cuando la nueva envía su primer paquete válido; repetir un AUTH capturado no expulsa a nadie.
 - **Fragmentación** de mensajes hasta ~18 KB (16 fragmentos de ≤ 1200 B) con reensamblado acotado en memoria y caducidad.
 - Timeouts, paquetes de mantenimiento, límite de paquetes por segundo y por sesión, límite de sesiones.
 
 **No garantiza (todavía)**
-- **Secreto hacia adelante y confianza en el cifrado:** desde la 0.6 la carga de cada paquete va cifrada con ChaCha20-Poly1305 (documento 11), pero es una implementación propia **sin auditar**, y las claves de sesión salen de la clave de la cuenta y dos nonces: si esa clave se filtra, se descifran las capturas. El handshake va en claro (la cuenta es visible).
+- **Confianza en el cifrado:** desde la 0.6 la carga de cada paquete va cifrada con ChaCha20-Poly1305 y desde la 0.7 las claves de sesión incluyen un secreto X25519 efímero (secreto hacia adelante, documento 11), pero ambos son implementaciones propias **sin auditar**. El handshake va en claro (la cuenta es visible).
 - **Credenciales asimétricas:** quien tenga la clave maestra puede suplantar a cualquier cuenta. Es un esquema para desarrollo y redes privadas.
 - **Migración de dirección:** si cambia la IP o el puerto del cliente, debe reconectar.
 - **Entrega fiable ni orden:** es UDP con autenticidad. La capa de juego lo tolera (inputs redundantes, snapshots delta con línea base confirmada).
@@ -146,7 +146,7 @@ El trabajo total se conserva (la suma casi no cambia: el costo de los fantasmas 
 - **Cliente congelado tras cambiar de shard (0.4.0):** al pasar a un shard con la cuenta de ticks atrasada, el cliente descartaba todos sus snapshots como «viejos». Lo encontró una prueba endurecida a propósito (documento 09, sección 8).
 
 ## 8. Pendiente
-- Sustituir el cifrado propio por una biblioteca auditada, intercambio de claves efímero (secreto hacia adelante) y credenciales asimétricas (Ed25519) emitidas por la autoridad.
+- Sustituir la criptografía propia por una biblioteca auditada, identidad por shard con secreto hacia adelante en el bus y credenciales asimétricas (Ed25519) emitidas por la autoridad.
 - **Simulación de NPC en paralelo** (hoy solo la replicación usa varios hilos) y medir el escalado con más de 2 núcleos.
 - **Migración de dirección** del cliente y control de congestión.
 - **Reconexión automática de los clientes** tras una caída de un shard (hoy solo la hacen los bancos de pruebas) y **checkpoints incrementales** para mundos grandes (documento 10, sección 11).

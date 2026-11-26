@@ -4,6 +4,13 @@
 //! cada paquete van cifrados y autenticados. El handshake (HELLO, CHALLENGE, AUTH, ACCEPT) sigue yendo
 //! en claro y autenticado con HMAC-SHA256: el número de cuenta es visible para quien escuche.
 //!
+//! Desde la 0.7.0 la sesión tiene **secreto hacia adelante**: cada lado genera una clave **efímera**
+//! X25519 por intento de conexión, la manda en AUTH / ACCEPT (autenticada con la clave de la cuenta) y
+//! las claves de sesión salen del secreto de Diffie-Hellman además de la clave de la cuenta. La clave
+//! privada efímera se descarta al calcular el secreto, así que quien obtenga **más tarde** la clave de
+//! la cuenta (o la maestra) no puede descifrar lo que capturó antes. Quien la tenga **durante** la
+//! sesión y se interponga activamente sí puede suplantar: eso no lo evita este esquema.
+//!
 //! Esquema (clave compartida por cuenta, **para desarrollo y redes privadas**):
 //! * La *autoridad* (servicio de cuentas) tiene una clave maestra y emite a cada cuenta una clave
 //!   `HMAC(maestra, "tsofgw/player-key/v1" ‖ id)`. El servidor de juego deriva la misma clave al vuelo,
@@ -16,6 +23,33 @@ use tsofgw_pack::HmacKey;
 pub const NONCE_LEN: usize = 16;
 pub const COOKIE_LEN: usize = 16;
 pub const TAG_LEN: usize = tsofgw_aead::TAG_LEN;
+pub const EPH_LEN: usize = tsofgw_aead::x25519::X25519_LEN;
+
+/// Par de claves efímeras X25519 (la privada solo vive hasta calcular el secreto compartido).
+pub(crate) struct Ephemeral {
+    secret: [u8; EPH_LEN],
+    pub public: [u8; EPH_LEN],
+}
+
+impl Ephemeral {
+    pub fn generate(entropy: &mut dyn crate::entropy::Entropy) -> Self {
+        let mut secret = [0u8; EPH_LEN];
+        entropy.fill(&mut secret);
+        let public = tsofgw_aead::x25519::public_key(&secret);
+        Ephemeral { secret, public }
+    }
+
+    /// Secreto compartido con la pública del otro lado; `None` si el punto es de orden pequeño.
+    pub fn agree(&self, peer: &[u8; EPH_LEN]) -> Option<[u8; 32]> {
+        tsofgw_aead::x25519::shared_secret(&self.secret, peer)
+    }
+}
+
+impl std::fmt::Debug for Ephemeral {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Ephemeral {{ <oculta> }}")
+    }
+}
 
 /// Clave de una cuenta. Su `Debug` no muestra la clave.
 #[derive(Clone)]
@@ -75,8 +109,15 @@ pub(crate) fn auth_proof(
     player_id: u64,
     nonce: &[u8; NONCE_LEN],
     cookie: &[u8; COOKIE_LEN],
+    client_eph: &[u8; EPH_LEN],
 ) -> [u8; 32] {
-    key.mac(&[b"tsofgw/auth/v1", &player_id.to_le_bytes(), nonce, cookie])
+    key.mac(&[
+        b"tsofgw/auth/v2",
+        &player_id.to_le_bytes(),
+        nonce,
+        cookie,
+        client_eph,
+    ])
 }
 
 pub(crate) fn accept_mac(
@@ -84,12 +125,16 @@ pub(crate) fn accept_mac(
     client_nonce: &[u8; NONCE_LEN],
     server_nonce: &[u8; NONCE_LEN],
     session_id: u32,
+    client_eph: &[u8; EPH_LEN],
+    server_eph: &[u8; EPH_LEN],
 ) -> [u8; 16] {
     let full = key.mac(&[
-        b"tsofgw/accept/v1",
+        b"tsofgw/accept/v2",
         client_nonce,
         server_nonce,
         &session_id.to_le_bytes(),
+        client_eph,
+        server_eph,
     ]);
     let mut out = [0u8; 16];
     out.copy_from_slice(&full[..16]);
@@ -112,17 +157,26 @@ impl std::fmt::Debug for SessionKeys {
     }
 }
 
-pub(crate) fn derive_session(
-    key: &HmacKey,
-    client_nonce: &[u8; NONCE_LEN],
-    server_nonce: &[u8; NONCE_LEN],
-    session_id: u32,
-) -> SessionKeys {
+/// Todo lo que entra en las claves de sesión: la clave de la cuenta, los dos nonces, el identificador, las
+/// dos claves efímeras públicas y el secreto de Diffie-Hellman.
+pub(crate) struct SessionInputs<'a> {
+    pub client_nonce: &'a [u8; NONCE_LEN],
+    pub server_nonce: &'a [u8; NONCE_LEN],
+    pub session_id: u32,
+    pub client_eph: &'a [u8; EPH_LEN],
+    pub server_eph: &'a [u8; EPH_LEN],
+    pub dh: &'a [u8; 32],
+}
+
+pub(crate) fn derive_session(key: &HmacKey, i: &SessionInputs<'_>) -> SessionKeys {
     let master = key.mac(&[
-        b"tsofgw/session/v2",
-        client_nonce,
-        server_nonce,
-        &session_id.to_le_bytes(),
+        b"tsofgw/session/v3",
+        i.client_nonce,
+        i.server_nonce,
+        &i.session_id.to_le_bytes(),
+        i.client_eph,
+        i.server_eph,
+        i.dh,
     ]);
     let master = HmacKey::new(&master);
     SessionKeys {
@@ -218,22 +272,68 @@ mod tests {
         assert!(!format!("{:?}", a.issue(1)).contains("key_bytes"));
     }
 
+    fn claves(
+        k: &HmacKey,
+        cn: [u8; 16],
+        sn: [u8; 16],
+        id: u32,
+        ce: [u8; 32],
+        se: [u8; 32],
+        dh: [u8; 32],
+    ) -> SessionKeys {
+        derive_session(
+            k,
+            &SessionInputs {
+                client_nonce: &cn,
+                server_nonce: &sn,
+                session_id: id,
+                client_eph: &ce,
+                server_eph: &se,
+                dh: &dh,
+            },
+        )
+    }
+
     #[test]
     fn direcciones_de_sesion_son_independientes() {
         let k = HmacKey::new(b"k");
-        let (cn, sn) = ([1u8; 16], [2u8; 16]);
-        let s = derive_session(&k, &cn, &sn, 7);
+        let (cn, sn, ce, se, dh) = ([1u8; 16], [2u8; 16], [4u8; 32], [5u8; 32], [6u8; 32]);
+        let s = claves(&k, cn, sn, 7, ce, se, dh);
         assert_ne!(s.c2s, s.s2c);
-        let s2 = derive_session(&k, &cn, &sn, 8);
+        let s2 = claves(&k, cn, sn, 8, ce, se, dh);
         assert_ne!(s.c2s, s2.c2s);
         assert_ne!(s.s2c, s2.s2c);
         // Otros nonces o otra clave de cuenta: otras claves de sesión.
-        let s3 = derive_session(&k, &[3u8; 16], &sn, 7);
+        let s3 = claves(&k, [3u8; 16], sn, 7, ce, se, dh);
         assert_ne!(s.c2s, s3.c2s);
-        let s4 = derive_session(&HmacKey::new(b"k2"), &cn, &sn, 7);
+        let s4 = claves(&HmacKey::new(b"k2"), cn, sn, 7, ce, se, dh);
         assert_ne!(s.c2s, s4.c2s);
         // Y son deterministas: las dos puntas llegan a lo mismo.
-        let again = derive_session(&k, &cn, &sn, 7);
+        let again = claves(&k, cn, sn, 7, ce, se, dh);
         assert_eq!((s.c2s, s.s2c), (again.c2s, again.s2c));
+    }
+
+    #[test]
+    fn el_secreto_efimero_y_las_claves_efimeras_cambian_las_claves_de_sesion() {
+        let k = HmacKey::new(b"k");
+        let (cn, sn, ce, se, dh) = ([1u8; 16], [2u8; 16], [4u8; 32], [5u8; 32], [6u8; 32]);
+        let base = claves(&k, cn, sn, 7, ce, se, dh);
+        // Mismo todo salvo el secreto de DH: quien tiene la clave de la cuenta pero no el DH no llega.
+        assert_ne!(base.c2s, claves(&k, cn, sn, 7, ce, se, [7u8; 32]).c2s);
+        assert_ne!(base.s2c, claves(&k, cn, sn, 7, ce, se, [7u8; 32]).s2c);
+        assert_ne!(base.c2s, claves(&k, cn, sn, 7, [8u8; 32], se, dh).c2s);
+        assert_ne!(base.c2s, claves(&k, cn, sn, 7, ce, [8u8; 32], dh).c2s);
+    }
+
+    #[test]
+    fn dos_efimeras_distintas_acuerdan_lo_mismo_y_se_rechaza_el_punto_pequeno() {
+        use crate::entropy::DeterministicEntropy;
+        let mut e = DeterministicEntropy(5);
+        let (a, b) = (Ephemeral::generate(&mut e), Ephemeral::generate(&mut e));
+        assert_ne!(a.public, b.public);
+        assert_eq!(a.agree(&b.public), b.agree(&a.public));
+        assert!(a.agree(&b.public).is_some());
+        assert!(a.agree(&[0u8; 32]).is_none());
+        assert!(!format!("{a:?}").contains("secret"));
     }
 }

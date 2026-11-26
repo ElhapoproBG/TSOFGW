@@ -5,8 +5,8 @@ use std::collections::HashMap;
 use tsofgw_pack::{ct_eq, HmacKey};
 
 use crate::crypto::{
-    accept_mac, auth_proof, derive_session, Authority, ReplayWindow, SessionKeys, COOKIE_LEN,
-    NONCE_LEN,
+    accept_mac, auth_proof, derive_session, Authority, Ephemeral, ReplayWindow, SessionInputs,
+    SessionKeys, COOKIE_LEN, EPH_LEN, NONCE_LEN,
 };
 use crate::entropy::Entropy;
 use crate::frag::{Push, Reassembler};
@@ -225,7 +225,8 @@ impl<L: Link> SecureServer<L> {
         let player_id = u64::from_le_bytes(wire::array(&pkt[1..9]));
         let nonce: [u8; NONCE_LEN] = wire::array(&pkt[9..25]);
         let cookie: [u8; COOKIE_LEN] = wire::array(&pkt[25..41]);
-        let proof: [u8; 32] = wire::array(&pkt[41..73]);
+        let client_eph: [u8; EPH_LEN] = wire::array(&pkt[41..73]);
+        let proof: [u8; 32] = wire::array(&pkt[73..105]);
 
         let ok_cookie = ct_eq(&self.cookie(&self.cookie_current, &from, &nonce), &cookie)
             | ct_eq(&self.cookie(&self.cookie_previous, &from, &nonce), &cookie);
@@ -248,28 +249,49 @@ impl<L: Link> SecureServer<L> {
             return;
         }
         let pkey = self.authority.player_hmac(player_id);
-        if !ct_eq(&auth_proof(&pkey, player_id, &nonce, &cookie), &proof) {
+        if !ct_eq(
+            &auth_proof(&pkey, player_id, &nonce, &cookie, &client_eph),
+            &proof,
+        ) {
             self.stats.bad_auth += 1;
             return;
         }
 
         let mut server_nonce = [0u8; NONCE_LEN];
         self.entropy.fill(&mut server_nonce);
+        // Claves efímeras de esta sesión. Si el cliente mandó un punto de orden pequeño, el secreto sería
+        // todo ceros: se rechaza (la prueba ya demostró que conoce la clave de la cuenta, así que es un
+        // cliente roto o malicioso, no un intruso).
+        let eph = Ephemeral::generate(&mut *self.entropy);
+        let Some(dh) = eph.agree(&client_eph) else {
+            self.stats.bad_auth += 1;
+            return;
+        };
         let mut id = self.next_session;
         while id == 0 || self.sessions.contains_key(&id) {
             id = id.wrapping_add(1);
         }
         self.next_session = id.wrapping_add(1);
 
-        let mac = accept_mac(&pkey, &nonce, &server_nonce, id);
-        let accept_packet = wire::accept(id, &server_nonce, &mac);
+        let mac = accept_mac(&pkey, &nonce, &server_nonce, id, &client_eph, &eph.public);
+        let accept_packet = wire::accept(id, &server_nonce, &eph.public, &mac);
         self.sessions.insert(
             id,
             Session {
                 addr: from,
                 player_id,
                 client_nonce: nonce,
-                keys: derive_session(&pkey, &nonce, &server_nonce, id),
+                keys: derive_session(
+                    &pkey,
+                    &SessionInputs {
+                        client_nonce: &nonce,
+                        server_nonce: &server_nonce,
+                        session_id: id,
+                        client_eph: &client_eph,
+                        server_eph: &eph.public,
+                        dh: &dh,
+                    },
+                ),
                 accept_packet: accept_packet.clone(),
                 confirmed: false,
                 created: now,

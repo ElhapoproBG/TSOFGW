@@ -1,4 +1,5 @@
-//! Cifrado autenticado **ChaCha20-Poly1305** (RFC 8439), solo con la biblioteca estándar.
+//! Cifrado autenticado **ChaCha20-Poly1305** (RFC 8439) y, en [`x25519`], acuerdo de claves **X25519**
+//! (RFC 7748), solo con la biblioteca estándar.
 //!
 //! # Por qué existe y qué NO es
 //! El transporte de jugadores y el bus entre shards necesitan confidencialidad, y en esta fase no hay
@@ -23,6 +24,8 @@
 //! sesión; en el bus, una clave por emisor y un nonce con sal aleatoria por arranque).
 
 #![forbid(unsafe_code)]
+
+pub mod x25519;
 
 pub const KEY_LEN: usize = 32;
 pub const NONCE_LEN: usize = 12;
